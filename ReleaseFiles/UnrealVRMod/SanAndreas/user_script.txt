@@ -1,0 +1,3 @@
+# GTA SA Definitive Edition: remove the extra player-to-NPC target-lock distance.
+# Default discovered in the live DE CVar table: 1.125.
+gta.TargetLockMult 0

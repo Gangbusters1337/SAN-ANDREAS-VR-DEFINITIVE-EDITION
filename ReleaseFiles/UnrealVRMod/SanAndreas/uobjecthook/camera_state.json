@@ -1,0 +1,16 @@
+{
+    "offset": {
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0
+    },
+    "path": [
+        "Player Controller",
+        "Properties",
+        "Children",
+        "BP_Player_Character_C BP_Player_Character_C_2147392284",
+        "Components",
+        "GTAPoseableComponent head"
+    ],
+    "type": "camera"
+}

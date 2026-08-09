@@ -1,0 +1,20 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Player Controller",
+        "Properties",
+        "Children",
+        "BP_Player_Character_C BP_Player_Character_C_2147455942",
+        "Properties",
+        "torso",
+        "Properties",
+        "AttachChildren",
+        "SceneComponent Root",
+        "Properties",
+        "AttachChildren",
+        "StaticMeshComponent WeaponMesh"
+    ],
+    "properties": [],
+    "type": "properties"
+}

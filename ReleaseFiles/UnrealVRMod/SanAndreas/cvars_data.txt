@@ -1,0 +1,9 @@
+Engine_r.AmbientOcclusionLevels=0
+Engine_r.DepthOfFieldQuality=0
+Renderer_r.Tonemapper.Sharpen=0.500000
+Renderer_r.TonemapperGamma=0.000000
+Renderer_r.MaxAnisotropy=16
+Renderer_r.MipMapLODBias=-0.500000
+Renderer_r.Streaming.Boost=2.500000
+Renderer_r.Streaming.PoolSize=3072
+Renderer_r.Streaming.MaxTempMemoryAllowed=512

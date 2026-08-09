@@ -1,0 +1,14 @@
+{
+    "hide": false,
+    "hide_legacy": false,
+    "path": [
+        "Player Controller",
+        "Properties",
+        "Children",
+        "BP_GTASA_Weapon_C BP_GTASA_Weapon_C_2147481102",
+        "Properties",
+        "WeaponMesh"
+    ],
+    "properties": [],
+    "type": "properties"
+}

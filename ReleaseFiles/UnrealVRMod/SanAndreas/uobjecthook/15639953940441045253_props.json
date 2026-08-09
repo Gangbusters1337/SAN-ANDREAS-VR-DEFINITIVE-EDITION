@@ -1,0 +1,14 @@
+{
+    "hide": true,
+    "hide_legacy": true,
+    "path": [
+        "Player Controller",
+        "Properties",
+        "Children",
+        "BP_Player_Character_C BP_Player_Character_C_2147480866",
+        "Components",
+        "GTAPoseableComponent head"
+    ],
+    "properties": [],
+    "type": "properties"
+}

@@ -1,0 +1,16 @@
+Core_r.ScreenPercentage=150.000000
+Renderer_r.DefaultFeature.AmbientOcclusion=0
+Renderer_r.DefaultFeature.AntiAliasing=0
+Renderer_r.LightCulling.Quality=0
+Renderer_r.TemporalAA.Algorithm=0
+Renderer_r.TemporalAA.Upsampling=0
+Renderer_r.Upscale.Quality=5
+Renderer_r.Upscale.Softness=0.000000
+Renderer_r.ViewDistanceScale=2.500000
+Renderer_r.StaticMeshLODDistanceScale=0.200000
+Renderer_r.SkeletalMeshLODBias=-1
+Renderer_foliage.LODDistanceScale=2.000000
+Renderer_grass.CullDistanceScale=1.500000
+Renderer_grass.GenerationDistance=15000.000000
+Renderer_grass.DiscardDistanceMult=3500.000000
+Renderer_r.LightMaxDrawDistanceScale=1.500000
