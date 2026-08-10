@@ -1,8 +1,10 @@
 # SAN ANDREAS VR DEFINITIVE EDITION
 
-An unofficial beta enhancement package for playing **Grand Theft Auto: San Andreas – The Definitive Edition** through Praydog's UEVR.
+Experience San Andreas in glorious high-definition VR: dramatically clearer, sharper, more immersive, and built around full motion-controller interaction. This unofficial beta enhancement package transforms **Grand Theft Auto: San Andreas – The Definitive Edition** through Praydog's UEVR.
 
-It expands Holydh's original 6DoF plugin with physical melee, calibrated controller-held weapons, two-hand rifle handling, vehicle free aim, per-vehicle camera profiles, VR-oriented controls, HUD behavior, and a settings utility.
+The included VR graphics profile is tuned for outstanding detail and strong performance, avoiding the worst visual artifacts while leaving capable PCs headroom to raise texture quality and other settings further. The HUD automatically gets out of your way, controls are designed to feel natural on motion controllers, and the world is presented with far greater clarity than a basic injected profile.
+
+This is not just head tracking. Aim pistols freely, stabilize shotguns and rifles with both hands, swing bats and melee weapons using tracked physical motion, fight bare-knuckle with either fist, and aim submachine guns freely from inside supported vehicles. Weapon rays and visible trails follow the weapon itself instead of an invisible flat-screen crosshair.
 
 ![Quest 3 control layout](Documentation/Quest3-Control-Layout.png)
 
@@ -23,6 +25,18 @@ Two separate archives are intended for GitHub Releases:
 - **Installer package** — the same payload plus a Windows installer with `Auto Detect` and `Manual Path` modes.
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives and displayed prominently on the repository page.
+
+## Why this build feels different
+
+- **Full free aim:** point and fire naturally with either hand instead of steering a conventional crosshair.
+- **Two-handed weapons:** shoulder shotguns and rifles, then use the forward hand to stabilize and direct the barrel.
+- **Physical fighting:** motion-tracked bare fists, brass knuckles, bats, and melee weapons turn close combat into a genuine VR interaction.
+- **Free aim while driving:** keep driving normally while independently aiming and firing supported submachine guns through the vehicle window.
+- **High-definition clarity:** VR-oriented texture, cvar, scope, reticle, muzzle-flash, and rendering choices deliver a much cleaner image.
+- **Performance-aware tuning:** strong visual quality without needlessly spending all available GPU headroom, with room for stronger systems to push texture quality further.
+- **Immersive interface:** an auto-hiding HUD reveals itself when useful and disappears when you want an unobstructed view of San Andreas.
+- **Intuitive Quest controls:** weapon handling, HUD gestures, vehicle firing, camera controls, phone interactions, and contextual D-pad actions are designed around motion controllers.
+- **Per-vehicle comfort:** camera offsets are remembered by vehicle model so cars, bikes, boats, and aircraft can retain their own tuned viewpoint.
 
 ## Installer
 
