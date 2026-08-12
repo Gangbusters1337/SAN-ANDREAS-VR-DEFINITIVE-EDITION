@@ -270,6 +270,12 @@ private:
 	uevr::API::UObject* magneticDetachedWeaponMesh = nullptr;
 	uevr::API::UObject* magneticIdleNativeParent = nullptr;
 	uevr::API::UObject* magneticBodyAnchorParent = nullptr;
+	uevr::API::UObject* magneticLegFrameComponent = nullptr;
+	uevr::API::FName magneticLeftThighBone{};
+	uevr::API::FName magneticRightThighBone{};
+	bool magneticLegFrameBonesResolved = false;
+	bool magneticLegFrameResolutionAttempted = false;
+	bool magneticLegFrameFallbackLogged = false;
 	uevr::API::UObject* magneticDetachedPlayerCharacter = nullptr;
 	uevr::API::FName magneticIdleNativeSocket{};
 	bool magneticIdleWeaponDetached = false;
@@ -286,6 +292,7 @@ private:
 		uint32_t gripGeneration = 0;
 	};
 	std::unordered_map<int, MagneticWaistAnchor> magneticWaistAnchors;
+	bool magneticWaistAnchorsLoaded = false;
 	int magneticLastHeldPoseHand = -1;
 	uint32_t magneticLastHeldPoseGripGeneration = 0;
 	bool explicitWeaponCyclePending = false;
@@ -296,9 +303,16 @@ private:
 	std::atomic<bool> magneticTriggerBlockedSnapshot{ false };
 	bool IsMagneticIdleSlotEligible() const;
 	bool IsControllerHeldUtility() const;
-	bool ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotation) const;
+	int ResolveMagneticHolsterVerticalAxis() const;
+	bool ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotation);
 	void SetMagneticIdleAnchor(int hand);
 	bool CaptureMagneticReleaseAnchor(int hand, bool logCapture = true);
+	bool ReadMagneticWaistAnchorsFile(const std::string& path,
+		std::unordered_map<int, MagneticWaistAnchor>& result, int& loaded) const;
+	bool WriteMagneticWaistAnchorsFile(const std::string& path,
+		const std::unordered_map<int, MagneticWaistAnchor>& values) const;
+	void LoadMagneticWaistAnchors();
+	bool SaveMagneticWaistAnchors();
 	void ConsumeCurrentGripPressGenerations();
 	bool BeginMagneticGrip(int hand, const char* reason);
 	void EnterMagneticIdleSlot(int anchorHand = -1, bool allowSavedPose = true);
@@ -597,6 +611,7 @@ public:
 	void SetGripState(bool leftGripHeld, bool rightGripHeld);
 	bool PrepareForExplicitWeaponCycle();
 	void InitializeGripCalibration();
+	void InitializeMagneticHolster();
 	uint8_t GetDualThumbCalibrationHandMask() const;
 	void SetCalibrationButtonState(bool leftButtonHeld, bool rightButtonHeld);
 	void ProcessGripCalibration();

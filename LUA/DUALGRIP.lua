@@ -102,6 +102,9 @@ local previousBikeRightPedalHeld = false
 local cycleProbe = nil
 local chordHudHeldLastFrame = false
 local controlGuideVisible = false
+local controlGuideInputArmed = false
+local controlGuideStickLatched = false
+local controlGuideToggleHeld = false
 local chordPauseHeldLastFrame = false
 local chordPausePulseUntil = nil
 local chordPauseCaptureUntil = nil
@@ -206,6 +209,14 @@ local function dispatch_control_guide(show)
         uevr.api:dispatch_custom_event("DUALGRIP.ControlGuide", value)
     elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
         uevr.params.functions.dispatch_custom_event("DUALGRIP.ControlGuide", value)
+    end
+end
+
+local function dispatch_control_guide_navigation(action)
+    if uevr and uevr.api and uevr.api.dispatch_custom_event then
+        uevr.api:dispatch_custom_event("DUALGRIP.ControlGuideNav", action)
+    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
+        uevr.params.functions.dispatch_custom_event("DUALGRIP.ControlGuideNav", action)
     end
 end
 
@@ -800,6 +811,9 @@ local function apply_chord_controls(state, buttons, now)
         buttons = clear_button(buttons, BUTTON_B)
         if not chordHudHeldLastFrame then
             controlGuideVisible = not controlGuideVisible
+            controlGuideInputArmed = false
+            controlGuideStickLatched = false
+            controlGuideToggleHeld = true
             dispatch_control_guide(controlGuideVisible)
             log_chord(controlGuideVisible and "A+X control guide opened" or "A+X control guide closed", now)
         end
@@ -808,8 +822,31 @@ local function apply_chord_controls(state, buttons, now)
     chordHudHeldLastFrame = abHeld
 
     if controlGuideVisible then
-        -- The guide occupies the full HMD view. Keep gameplay input inert while it
-        -- is open; A+X above remains the sole close gesture.
+        -- The guide owns a fixed controller-operated options panel. Require a
+        -- neutral frame after opening so the A in A+X cannot also toggle an option.
+        local guideToggleHeld = has_button(buttons, BUTTON_A)
+        local guideStickY = state.Gamepad.sThumbLY or 0
+        local guideNeutral = not guideToggleHeld and math.abs(guideStickY) < DPAD_STICK_RELEASE_THRESHOLD
+        if not controlGuideInputArmed then
+            if guideNeutral then
+                controlGuideInputArmed = true
+                controlGuideToggleHeld = false
+            end
+        else
+            if math.abs(guideStickY) < DPAD_STICK_RELEASE_THRESHOLD then
+                controlGuideStickLatched = false
+            elseif not controlGuideStickLatched then
+                dispatch_control_guide_navigation(guideStickY > 0 and "up" or "down")
+                controlGuideStickLatched = true
+            end
+            if guideToggleHeld and not controlGuideToggleHeld and not abHeld then
+                dispatch_control_guide_navigation("toggle")
+            end
+            controlGuideToggleHeld = guideToggleHeld
+        end
+
+        -- Keep gameplay input inert while the guide is open. A+X above remains
+        -- the close gesture; left-stick navigation and A toggles were consumed.
         state.Gamepad.wButtons = 0
         state.Gamepad.bLeftTrigger = 0
         state.Gamepad.bRightTrigger = 0
@@ -1651,6 +1688,9 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
                 chordHudHeldLastFrame = false
 				if controlGuideVisible then
 					controlGuideVisible = false
+					controlGuideInputArmed = false
+					controlGuideStickLatched = false
+					controlGuideToggleHeld = false
 					dispatch_control_guide(false)
 				end
             end

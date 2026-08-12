@@ -43,7 +43,7 @@ public:
 	bool enablePhoneAnswerGripTap = true;
 	bool enableLegacyDPadModulator = false;
 	bool enableChordPauseMenu = true;
-	bool enableChordHudToggle = false;
+	bool enableChordHudToggle = true;
 	bool enablePauseUiAutoShow = true;
 	bool enableHudAutoHide = true;
 	bool enableShortPressCameraSwitch = true;
@@ -93,7 +93,9 @@ public:
 	bool SetHudUiVisible(bool visible);
 	bool GetPause2dScreenMode(bool& enabled) const;
 	bool SetPause2dScreenMode(bool enabled);
+	bool RecoverPluginOwnedPause2dScreenMode();
 	std::string GetGripCalibrationFilePath() const;
+	std::string GetHolsterAnchorsFilePath() const;
 
 private:
 	struct CameraOffsetProfile {
@@ -104,6 +106,9 @@ private:
 
 	bool CheckSettingsModificationAndUpdate(const std::string& filePath, bool uevr);
 	std::string GetConfigFilePath(bool uevr);
+	std::string GetPause2dOwnershipMarkerPath() const;
+	bool WritePause2dOwnershipMarker() const;
+	void ClearPause2dOwnershipMarker() const;
 	std::string uevrSettingsFileName = "config.txt";
 	std::string pluginSettingsFileName = "UEVR_GTASADE_config.txt";
 	std::string pluginStatusFileName = "UEVR_GTASADE_status.txt";
@@ -145,6 +150,7 @@ private:
 	bool uevr_LerpPitch = false;
 	bool uevr_LerpRoll = false;
 	bool uevr_LerpYaw = false;
+	int uevr_MovementOrientation = 0;
 	CameraOffsetProfile uevr_CameraOffset{};
 
 	bool onFoot_DecoupledPitch = false;

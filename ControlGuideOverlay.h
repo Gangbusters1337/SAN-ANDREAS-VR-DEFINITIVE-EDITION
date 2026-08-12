@@ -12,6 +12,7 @@
 class ControlGuideOverlay {
 public:
 	void SetVisible(bool visible);
+	void SetOptionsState(int movementOrientation, bool hudAutoHide, uint32_t selectedOption);
 	bool IsVisible() const;
 	void OnDeviceReset();
 	void RenderDx12(ID3D12GraphicsCommandList* commandList, ID3D12Resource* renderTarget,
@@ -21,16 +22,22 @@ public:
 
 private:
 	bool LoadImage();
+	bool ComposeOptionsPanel();
 	bool InitializeDx12(ID3D12Device* device, DXGI_FORMAT targetFormat);
 	void ReleaseDx12();
 	bool InitializeDx11(ID3D11Device* device);
 	void ReleaseDx11();
 
 	std::atomic<bool> visible{ false };
+	std::atomic<uint32_t> dx11WarmupFrames{ 0 };
 	std::mutex stateMutex;
 	std::vector<uint8_t> pixels;
+	std::vector<uint8_t> basePixels;
 	uint32_t imageWidth = 0;
 	uint32_t imageHeight = 0;
+	int movementOrientation = 0;
+	bool hudAutoHide = true;
+	uint32_t selectedOption = 0;
 	bool imageLoadAttempted = false;
 	bool textureUploaded = false;
 	ID3D12Device* activeDevice = nullptr;

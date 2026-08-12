@@ -36,7 +36,9 @@ private:
 	bool thumbRestModifierActive = false;
 	std::atomic<bool> thumbRestTouchActive{ false };
 	std::atomic<bool> thumbRestDpadUsed{ false };
-	enum class ThumbRestHapticRequest : uint8_t { None = 0, TimedReveal, PinOn, AutoHide };
+	std::atomic<bool> thumbRestActionRebindRequested{ false };
+	ULONGLONG thumbRestActionRefreshAt = 0;
+	enum class ThumbRestHapticRequest : uint8_t { None = 0, PinOn, AutoHide };
 	std::atomic<uint8_t> pendingThumbRestHaptic{ static_cast<uint8_t>(ThumbRestHapticRequest::None) };
 	bool thumbRestTouchWasActiveInput = false;
 	bool dualThumbRestRawActive = false;
@@ -116,10 +118,6 @@ private:
 		const char* pattern = "unknown";
 		switch (request)
 		{
-		case ThumbRestHapticRequest::TimedReveal:
-			pattern = "timed-reveal";
-			dispatched = PulseLeftThumbRestHaptic(0.055f, 125.0f, 0.38f);
-			break;
 		case ThumbRestHapticRequest::PinOn:
 			pattern = "pin-long";
 			dispatched = PulseLeftThumbRestHaptic(0.24f, 105.0f, 0.65f);
@@ -175,7 +173,33 @@ private:
 			return false;
 		}
 
-		if (thumbRestDpadAction == nullptr) {
+		const ULONGLONG nowTick = GetTickCount64();
+		const bool forceRebind = thumbRestActionRebindRequested.exchange(
+			false, std::memory_order_acq_rel);
+		if (forceRebind)
+		{
+			thumbRestDpadAction = nullptr;
+			rightThumbRestCalibrationAction = nullptr;
+			thumbRestDpadResolvedPath = nullptr;
+			rightThumbRestCalibrationResolvedPath = nullptr;
+			thumbRestDpadProbeState = -1;
+			thumbRestModifierActive = false;
+			thumbRestTouchActive.store(false, std::memory_order_release);
+			thumbRestDpadUsed.store(false, std::memory_order_release);
+			thumbRestTouchWasActiveInput = false;
+			dualThumbRestRawActive = false;
+			dualThumbRestCalibrationActive = false;
+			thumbRestDpadLastDirection = 0;
+			thumbRestDpadPulseDirection = 0;
+			thumbRestDpadPulseSamplesRemaining = 0;
+			API::get()->log_info("%s", "[ThumbRestHud] action bindings invalidated reason=device-reset");
+		}
+
+		const bool refreshBindings = forceRebind || nowTick >= thumbRestActionRefreshAt;
+		if (refreshBindings)
+			thumbRestActionRefreshAt = nowTick + 1000;
+
+		if (thumbRestDpadAction == nullptr || refreshBindings) {
 			static constexpr const char* leftPaths[] = {
 				"/actions/default/in/ThumbRestTouchLeft",
 				"/actions/default/in/ThumbrestTouchLeft",
@@ -183,13 +207,15 @@ private:
 			};
 			for (const char* path : leftPaths) {
 				if (auto candidate = vr->get_action_handle(path); candidate != nullptr) {
+					if (thumbRestDpadAction != nullptr && candidate != thumbRestDpadAction)
+						API::get()->log_info("%s", "[ThumbRestHud] left action handle rebound");
 					thumbRestDpadAction = candidate;
 					thumbRestDpadResolvedPath = path;
 					break;
 				}
 			}
 		}
-		if (rightThumbRestCalibrationAction == nullptr) {
+		if (rightThumbRestCalibrationAction == nullptr || refreshBindings) {
 			static constexpr const char* rightPaths[] = {
 				"/actions/default/in/ThumbRestTouchRight",
 				"/actions/default/in/ThumbrestTouchRight",
@@ -197,6 +223,9 @@ private:
 			};
 			for (const char* path : rightPaths) {
 				if (auto candidate = vr->get_action_handle(path); candidate != nullptr) {
+					if (rightThumbRestCalibrationAction != nullptr
+						&& candidate != rightThumbRestCalibrationAction)
+						API::get()->log_info("%s", "[ThumbRestHud] right action handle rebound");
 					rightThumbRestCalibrationAction = candidate;
 					rightThumbRestCalibrationResolvedPath = path;
 					break;
@@ -501,6 +530,10 @@ public:
 
 	void on_device_reset() override {
 		controlGuideOverlay.OnDeviceReset();
+		// UEVR can recreate its OpenXR action set without unloading this plugin.
+		// Re-resolve cached action handles from the XInput callback before the next
+		// query instead of retaining a non-null handle that can no longer report.
+		thumbRestActionRebindRequested.store(true, std::memory_order_release);
 	}
 
 	void on_post_render_vr_framework_dx12(ID3D12GraphicsCommandList* commandList,
@@ -596,6 +629,15 @@ public:
 	}
 
 	void on_dllmain_detach() override {
+		if (controlGuideNativeHudSuppressed)
+			API::get()->execute_command(L"gta.hud.setvis 1");
+		if (controlGuideHudForcedVisible && !controlGuideHudWasVisible)
+			SetHudVisibility(false, "restore hidden HUD after control guide detach");
+		if (pauseUi2dScreenAutoEnabled || resultScreen2dAutoEnabled)
+			settingsManager.SetPause2dScreenMode(false);
+		controlGuideHudForcedVisible = false;
+		controlGuideHudWasVisible = false;
+		controlGuideNativeHudSuppressed = false;
 		controlGuideOverlay.SetVisible(false);
 		controlGuideOverlay.OnDeviceReset();
 		thumbRestModifierActive = false;
@@ -623,6 +665,9 @@ public:
 	void on_initialize() override {
 		API::get()->log_info("%s", "VR cpp mod initializing - Codex combat assist build");
 		settingsManager.InitSettingsManager();
+		pause2dStartupRecoveryPending = !settingsManager.RecoverPluginOwnedPause2dScreenMode();
+		if (pause2dStartupRecoveryPending)
+			API::get()->log_info("%s", "[PauseUI] interrupted-session 2D recovery queued until runtime ready");
 		API::get()->log_info("[ManualReload] startup saved=%s active=%s",
 			settingsManager.enableManualReloadMode ? "true" : "false",
 			settingsManager.activeManualReloadMode ? "true" : "false");
@@ -646,6 +691,7 @@ public:
 			memoryManager.ApplyManualReloadCapturePatch();
 		Utilities::InitHelperClasses();
 		weaponManager.InitializeGripCalibration();
+		weaponManager.InitializeMagneticHolster();
 		if (settingsManager.enableBulletTraceHidden)
 			weaponManager.HideBulletTrace();
 	}
@@ -655,10 +701,55 @@ public:
 			return;
 
 		const std::string eventName(event_name);
+		if (eventName == "DUALGRIP.ControlGuideNav")
+		{
+			if (!controlGuideOverlay.IsVisible())
+				return;
+			const std::string action(event_data);
+			if (action == "up")
+				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 2;
+			else if (action == "down")
+				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 2;
+			else if (action == "toggle")
+				ToggleControlGuideOption(controlGuideSelectedOption);
+			else
+				return;
+			RefreshControlGuideOptions();
+			API::get()->log_info("[ControlGuide] navigation action=%s selected=%d",
+				action.c_str(), controlGuideSelectedOption);
+			return;
+		}
 		if (eventName == "DUALGRIP.ControlGuide")
 		{
 			const bool show = std::string(event_data) == "show";
+			if (show && !controlGuideOverlay.IsVisible())
+			{
+				controlGuideHudWasVisible = hudUiVisible;
+				controlGuideHudForcedVisible = !controlGuideHudWasVisible
+					&& SetHudVisibility(true, "enable UEVR UI composition for control guide");
+			}
+			if (show)
+			{
+				RefreshControlGuideOptions();
+				// UEVR's UI composition must remain enabled for the custom guide texture,
+				// but GTA's own HUD otherwise renders over it. This title exposes a
+				// dedicated HUD visibility command (documented in its live cvar dump), so
+				// suppress only the native HUD and leave the UEVR compositor active.
+				controlGuideNativeHudRequest.store(1, std::memory_order_release);
+			}
 			controlGuideOverlay.SetVisible(show);
+			// The old floating ImGui window depended on the main UEVR menu and could
+			// be moved/collapsed outside its clipped UI target. The guide now owns a
+			// fixed controller-operated panel, so keep that legacy window closed.
+			API::get()->dispatch_lua_event("controlGuideOptionsVisible", "false");
+			if (!show)
+			{
+				controlGuideNativeHudRequest.store(-1, std::memory_order_release);
+				if (controlGuideHudForcedVisible && !controlGuideHudWasVisible)
+					SetHudVisibility(false, "restore hidden HUD after control guide");
+				controlGuideHudForcedVisible = false;
+				controlGuideHudWasVisible = false;
+			}
 			API::get()->log_info("[ControlGuide] visible=%s source=A+X",
 				show ? "true" : "false");
 			return;
@@ -999,6 +1090,7 @@ public:
 			: InteractionPerfClock::time_point{};
 
 		FetchRequiredValuesFromMemory();
+		ProcessControlGuideNativeHudRequest();
 		UpdateAircraftCameraReveal();
 		RetryStartupHudVisibility();
 		UpdatePhoneRingingState();
@@ -1276,6 +1368,7 @@ public:
 	bool hudUiVisible = false;
 	bool hudUiStateInitialized = false;
 	bool startupHudVisibilityRetryPending = false;
+	bool pause2dStartupRecoveryPending = true;
 	bool hudUiAutoRevealedForPause = false;
 	bool thumbRestHudRevealOwned = false;
 	bool thumbRestHudContextWasEligible = false;
@@ -1295,6 +1388,11 @@ public:
 	bool lastHudAutoHideEnabled = true;
 	float hudAutoHideRemaining = 0.0f;
 	bool hudUiPinned = false;
+	bool controlGuideHudWasVisible = false;
+	bool controlGuideHudForcedVisible = false;
+	bool controlGuideNativeHudSuppressed = false;
+	std::atomic<int> controlGuideNativeHudRequest{ 0 };
+	int controlGuideSelectedOption = 0;
 	ULONGLONG hudPinnedRuntimeCheckAt = 0;
 	int hudPinnedObservedPluginState = -1;
 	int hudPinnedObservedCameraMode = -1;
@@ -1386,8 +1484,83 @@ public:
 		return true;
 	}
 
+	int ReadControlGuideMovementOrientation() const
+	{
+		if (API::get()->param()->vr == nullptr || !API::VR::is_runtime_ready())
+			return 0;
+		try
+		{
+			return API::VR::get_mod_value<int>("VR_MovementOrientation");
+		}
+		catch (...)
+		{
+			API::get()->log_warn("%s", "[ControlGuide] movement orientation was unreadable");
+		}
+		return 0;
+	}
+
+	void RefreshControlGuideOptions()
+	{
+		controlGuideOverlay.SetOptionsState(ReadControlGuideMovementOrientation(),
+			settingsManager.enableHudAutoHide,
+			static_cast<uint32_t>(controlGuideSelectedOption));
+	}
+
+	void ProcessControlGuideNativeHudRequest()
+	{
+		const int request = controlGuideNativeHudRequest.exchange(0, std::memory_order_acq_rel);
+		if (request > 0 && !controlGuideNativeHudSuppressed && playerManager.isInControl)
+		{
+			API::get()->execute_command(L"gta.hud.setvis 0");
+			controlGuideNativeHudSuppressed = true;
+			API::get()->log_info("%s", "[ControlGuide] native GTA HUD suppressed");
+		}
+		else if (request < 0 && controlGuideNativeHudSuppressed)
+		{
+			API::get()->execute_command(L"gta.hud.setvis 1");
+			controlGuideNativeHudSuppressed = false;
+			API::get()->log_info("%s", "[ControlGuide] native GTA HUD restored");
+		}
+	}
+
+	void ToggleControlGuideOption(int option)
+	{
+		if (option < 0 || option > 1)
+			return;
+		if (option == 0)
+		{
+			if (API::get()->param()->vr == nullptr || !API::VR::is_runtime_ready())
+				return;
+			try
+			{
+				const int current = ReadControlGuideMovementOrientation();
+				API::VR::set_mod_value("VR_MovementOrientation", current == 1 ? 0 : 1);
+				API::VR::save_config();
+			}
+			catch (...)
+			{
+				API::get()->log_warn("[ControlGuide] quick option toggle failed option=%d", option);
+			}
+			return;
+		}
+
+		const bool enabled = !settingsManager.enableHudAutoHide;
+		bool liveApply = false;
+		if (!settingsManager.SetFeatureFlagFromUi("EnableHudAutoHide", enabled, liveApply))
+			return;
+		lastHudAutoHideEnabled = enabled;
+		if (enabled && hudUiVisible && !hudUiAutoRevealedForPause && !hudUiPinned)
+			ResetHudAutoHideTimer();
+		else
+			CancelHudAutoHideTimer();
+		settingsManager.DispatchFeatureFlagsToLua();
+	}
+
 	void RetryStartupHudVisibility()
 	{
+		if (pause2dStartupRecoveryPending)
+			pause2dStartupRecoveryPending = !settingsManager.RecoverPluginOwnedPause2dScreenMode();
+
 		if (!startupHudVisibilityRetryPending)
 			return;
 
@@ -1541,10 +1714,36 @@ public:
 		{
 			thumbRestSingleTapPending = false;
 			thumbRestSingleTapDeadline = 0;
-			RelinquishThumbRestHudContextWithoutRestore("single tap");
-			ShowHudForAutoHide("left thumb-rest tap");
-			pendingThumbRestHaptic.store(
-				static_cast<uint8_t>(ThumbRestHapticRequest::TimedReveal), std::memory_order_release);
+
+			// Touch-down temporarily reveals a hidden HUD so D-pad interactions are
+			// visible immediately. A completed tap adopts that reveal and starts the
+			// normal timer. If the HUD was already visible, the same tap hides it
+			// without changing the user's pin/auto-hide mode. The touch-edge haptic
+			// already acknowledged this gesture, so do not queue a second vibration.
+			const bool contextualRevealFromHidden = thumbRestHudRevealOwned
+				&& !thumbRestHudWasVisible;
+			const bool pauseOwned = hudUiAutoRevealedForPause || pauseUi2dScreenAutoEnabled
+				|| pauseUiExplicitRequestExpiresAt != 0;
+			if (contextualRevealFromHidden || !hudUiVisible)
+			{
+				RelinquishThumbRestHudContextWithoutRestore("single tap show");
+				ShowHudForAutoHide("left thumb-rest tap show");
+				API::get()->log_info("%s", "[ThumbRestHud] single tap action=show-timed");
+			}
+			else if (!hudUiPinned && !pauseOwned)
+			{
+				RestoreThumbRestHudContext("single tap hide cleanup");
+				SetHudVisibility(false, "left thumb-rest tap hide");
+				CancelHudAutoHideTimer();
+				API::get()->log_info("%s", "[ThumbRestHud] single tap action=hide");
+			}
+			else
+			{
+				RestoreThumbRestHudContext("single tap protected owner");
+				API::get()->log_info(
+					"[ThumbRestHud] single tap action=unchanged pinned=%s pauseOwned=%s",
+					hudUiPinned ? "true" : "false", pauseOwned ? "true" : "false");
+			}
 		}
 	}
 
@@ -1937,9 +2136,8 @@ public:
 
 			bool screen2dWasEnabled = false;
 			resultScreen2dAutoEnabled = settingsManager.GetPause2dScreenMode(screen2dWasEnabled)
-				&& !screen2dWasEnabled;
-			if (resultScreen2dAutoEnabled)
-				settingsManager.SetPause2dScreenMode(true);
+				&& !screen2dWasEnabled
+				&& settingsManager.SetPause2dScreenMode(true);
 			API::get()->log_info(
 				"[PauseUITrace] result presentation entered camera=%d hudOwned=%s 2dOwned=%s runtimeHud=%s runtime2d=%s",
 				static_cast<int>(cameraController.currentCameraMode),
@@ -1997,9 +2195,8 @@ public:
 				bool screen2dWasEnabled = false;
 				if (use2dFallback && settingsManager.GetPause2dScreenMode(screen2dWasEnabled))
 				{
-					pauseUi2dScreenAutoEnabled = !screen2dWasEnabled;
-					if (pauseUi2dScreenAutoEnabled)
-						settingsManager.SetPause2dScreenMode(true);
+					pauseUi2dScreenAutoEnabled = !screen2dWasEnabled
+						&& settingsManager.SetPause2dScreenMode(true);
 					API::get()->log_info("[PauseUITrace] 2D fallback previous=%s runtime=%s",
 						screen2dWasEnabled ? "true" : "false", ReadPause2dRuntimeValue().c_str());
 				}

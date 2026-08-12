@@ -57,7 +57,7 @@ local static_mesh_component_c = nil
 local cameraManager_c = nil
 local weapon_c = nil
 local cylinder_static_mesh = nil
-local emissive_material_amplifier = 2.0 
+local emissive_material_amplifier = 2.0
 
 -- Instance variables
 local scope_actor = nil
@@ -173,7 +173,7 @@ local function init_static_objects()
 
     zero_color = StructObject.new(flinearColor_c)
     if not zero_color then return false end
-    
+
     zero_transform = StructObject.new(ftransform_c)
     if not zero_transform then return false end
     zero_transform.Rotation.W = 1.0
@@ -204,7 +204,7 @@ local function reset_static_objects()
     static_mesh_component_c = nil
     cameraManager_c = nil
 
-    
+
     reusable_hit_result = nil
     zero_color = nil
     zero_transform = nil
@@ -220,7 +220,7 @@ end
 
 local function destroy_actor(actor)
     if actor ~= nil and UEVR_UObjectHook.exists(actor) then
-        pcall(function() 
+        pcall(function()
             if actor.K2_DestroyActor ~= nil then
                 actor:K2_DestroyActor()
             end
@@ -283,7 +283,7 @@ end
 
 local function get_equipped_weapon(playerController, expected_weapon_id)
     if not playerController then return nil end
-   
+
     local playerControllerChildren = playerController.Children
     local fallback_mesh = nil
     for i, child in ipairs(playerControllerChildren) do
@@ -364,8 +364,8 @@ local function spawn_scope_plane(world, owner, pos, rt, isSniper)
         print("Failed to find plane mesh")
         return
     end
-    
-    
+
+
     local_scope_mesh:SetStaticMesh(scopePlane)
     local_scope_mesh:SetVisibility(false)
     local_scope_mesh:SetCollisionEnabled(0)
@@ -381,7 +381,7 @@ local function spawn_scope_plane(world, owner, pos, rt, isSniper)
     local red_dot_dynamic_material = local_red_dot_mesh:CreateAndSetMaterialInstanceDynamicFromMaterial(0, wanted_mat)
 
     scope_dynamic_material:SetTextureParameterValue(KismetStringLibrary:Conv_StringToName("LinearColor"), rt)
-    
+
     local color = StructObject.new(flinearColor_c)
     color.R = emissive_material_amplifier
     color.G = emissive_material_amplifier
@@ -496,7 +496,7 @@ end
 
 local function attach_components_to_weapon(weapon_mesh, isSniper)
     if not weapon_mesh then return end
-    
+
     local rotation
     if isSniper then
         rotation = KismetMathLibrary:FindLookAtRotation(temp_vec3:set(5.94806 , -2.75068, 13.2024),temp_vec3f:set(30.6871 , -0.22823, 15.6848))
@@ -518,7 +518,7 @@ local function attach_components_to_weapon(weapon_mesh, isSniper)
         )
 
         if isSniper then
-            
+
             scene_capture_component_mesh:K2_SetRelativeRotation(rotation, false, reusable_hit_result, false)
             scene_capture_component_mesh:K2_SetRelativeLocation(temp_vec3:set(30.6871 , -0.22823, 15.6848), false, reusable_hit_result, false)
             scene_capture_component_mesh:SetVisibility(false)
@@ -544,7 +544,7 @@ local function attach_components_to_weapon(weapon_mesh, isSniper)
             scene_capture_component:SetVisibility(false)
         end
     end
-    
+
     -- Attach plane to weapon
     if scope_plane_component then
         if weapon_mesh == nil then
@@ -583,7 +583,7 @@ local function attach_components_to_weapon(weapon_mesh, isSniper)
             scope_plane_component:K2_SetRelativeLocation(temp_vec3:set(4.1, -12.494, 1.537), false, reusable_hit_result, false)
             scope_plane_component:SetWorldScale3D(temp_vec3:set(0.06, 0.106, 0))
         end
-       
+
         scope_plane_component:SetVisibility(false)
         red_dot_plane_component:SetVisibility(false)
         print("Scope attached")

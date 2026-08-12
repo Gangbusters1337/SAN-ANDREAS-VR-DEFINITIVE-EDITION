@@ -1,8 +1,10 @@
 local panel_registered = false
 local panel_attempted = false
-local floating_visible = true
+local floating_visible = false
+local quick_options_visible = false
 local logged_imgui_missing = false
 local aim_calibration_result = "No accepted shots yet"
+local quick_movement_orientation = 0
 
 local sections = {
     {
@@ -30,6 +32,8 @@ local sections = {
         flags = {
             { key = "EnableDualGripAimFire", label = "Side-matched grip aim and trigger fire [Recommended]" },
             { key = "EnableAlternateWeaponHandsVisibility", label = "Hide idle weapon and aiming hands [Recommended]" },
+            { key = "EnableTwoHandStabilization", label = "Two-hand weapon stabilization" },
+            { key = "EnableGripCalibration", label = "Weapon hand-placement calibration" },
             { key = "EnableGripWeaponCycle", label = "Tap left grip to cycle weapons [Recommended]" },
             { key = "EnableManualReloadMode", label = "Tap right grip to reload (restart/reinject) [Experimental]" },
             { key = "EnablePhoneAnswerGripTap", label = "Tap right grip to answer ringing phone [Recommended]" },
@@ -50,10 +54,10 @@ local sections = {
     },
     {
         title = "EXPERIMENTAL",
-        flags = {
-            { key = "EnableCameraProfiles", label = "Automatic camera profiles [Experimental]" },
-            { key = "EnableBodyVisibility", label = "VR body visibility updates [Experimental]" },
-            { key = "EnableAimCalibrationProbe", label = "Native aim calibration probe [Experimental]" },
+		flags = {
+			{ key = "EnableCameraProfiles", label = "Automatic camera profiles [Experimental]" },
+			{ key = "EnableBodyVisibility", label = "VR body visibility updates [Experimental]" },
+			{ key = "EnableAimCalibrationProbe", label = "Native aim calibration probe [Experimental]" },
         },
     },
 }
@@ -70,11 +74,13 @@ local values = {
     EnableAimAlignment = true,
     EnableDualGripAimFire = true,
     EnableAlternateWeaponHandsVisibility = true,
+    EnableTwoHandStabilization = false,
+    EnableGripCalibration = false,
     EnableGripWeaponCycle = false,
     EnableManualReloadMode = false,
     EnablePhoneAnswerGripTap = true,
     EnableChordPauseMenu = true,
-    EnableChordHudToggle = false,
+	EnableChordHudToggle = true,
     EnablePauseUiAutoShow = true,
     EnableHudAutoHide = true,
     EnableFirstPersonCameraLock = true,
@@ -82,7 +88,7 @@ local values = {
     EnableAircraftNativeControls = true,
     EnableShowUiAtStartup = true,
     EnableCameraProfiles = true,
-    EnableBodyVisibility = true,
+	EnableBodyVisibility = true,
     EnableBulletTraceHidden = true,
     EnableAimCalibrationProbe = false,
 }
@@ -137,6 +143,65 @@ local function dispatch_flag(name, enabled)
     log("Could not dispatch " .. payload)
 end
 
+local function clean_vr_value(value)
+    if type(value) ~= "string" then
+        return tostring(value or "")
+    end
+    return value:match("^[^%z]+") or value
+end
+
+local function read_vr_int(name, default_value)
+    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.get_mod_value) then
+        return default_value
+    end
+    local ok, value = pcall(function()
+        return uevr.params.vr.get_mod_value(name)
+    end)
+    if not ok then
+        return default_value
+    end
+    return tonumber(clean_vr_value(value)) or default_value
+end
+
+local function read_vr_bool(name, default_value)
+    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.get_mod_value) then
+        return default_value
+    end
+    local ok, value = pcall(function()
+        return uevr.params.vr.get_mod_value(name)
+    end)
+    if not ok then
+        return default_value
+    end
+    local text = string.lower(clean_vr_value(value))
+    if text == "true" or text == "1" then return true end
+    if text == "false" or text == "0" then return false end
+    return default_value
+end
+
+local function write_vr_option(name, value)
+    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.set_mod_value) then
+        log("UEVR option unavailable: " .. name)
+        return false
+    end
+    local ok, err = pcall(function()
+        uevr.params.vr.set_mod_value(name, tostring(value))
+        if uevr.params.vr.save_config then
+            uevr.params.vr.save_config()
+        end
+    end)
+    if not ok then
+        log("UEVR option failed " .. name .. ": " .. tostring(err))
+        return false
+    end
+    log(name .. " = " .. tostring(value))
+    return true
+end
+
+local function refresh_quick_options()
+    quick_movement_orientation = read_vr_int("VR_MovementOrientation", quick_movement_orientation)
+end
+
 local function dispatch_reset_aim_calibration()
     if uevr and uevr.api and uevr.api.dispatch_custom_event then
         uevr.api:dispatch_custom_event("GTASADE.ResetAimCalibration", "reset")
@@ -178,6 +243,31 @@ local function draw_panel_body()
 
 end
 
+local function draw_quick_options()
+    imgui.text("SAVR COMFORT & CONTROLS")
+    imgui.text("Independent preferences are safer than a hidden standing/seated preset.")
+    imgui.spacing()
+
+    local changed, enabled = imgui.checkbox("Movement Orientation: Head/HMD (off = Game)",
+        quick_movement_orientation == 1)
+    if changed then
+        quick_movement_orientation = enabled and 1 or 0
+        write_vr_option("VR_MovementOrientation", quick_movement_orientation)
+    end
+
+    imgui.spacing()
+    draw_flag({ key = "EnableHudAutoHide", label = "Auto-hide HUD after 20 seconds" })
+    draw_flag({ key = "EnableManualReloadMode", label = "Manual reload (restart / reinject)" })
+    draw_flag({ key = "EnableTwoHandStabilization", label = "Two-hand weapon stabilization" })
+    draw_flag({ key = "EnableGripCalibration", label = "Weapon hand-placement calibration" })
+    imgui.spacing()
+
+    if imgui.button("Show all SAVR settings") then
+        floating_visible = true
+    end
+    imgui.text("A + X closes the guide and this window.")
+end
+
 local function try_register_panel()
     if panel_attempted then
         return
@@ -210,6 +300,11 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
         parse_payload(event_string)
     elseif event_name == "aimCalibrationResult" then
         aim_calibration_result = event_string or "No accepted shots yet"
+    elseif event_name == "controlGuideOptionsVisible" then
+        quick_options_visible = parse_bool(event_string)
+        if quick_options_visible then
+            refresh_quick_options()
+        end
     end
 end)
 
@@ -226,8 +321,16 @@ uevr.sdk.callbacks.on_frame(function()
         return
     end
 
-    if panel_registered then
-        return
+    if quick_options_visible then
+        if imgui.set_next_window_pos then
+            imgui.set_next_window_pos({ 1190, 150 }, 4)
+        end
+        imgui.set_next_window_size({ 650, 570 }, 4)
+        local quick_open = imgui.begin_window("SAVR COMFORT & CONTROLS", true, 0)
+        if quick_open then
+            draw_quick_options()
+        end
+        imgui.end_window()
     end
 
     if floating_visible then
@@ -241,7 +344,7 @@ uevr.sdk.callbacks.on_frame(function()
 
         draw_panel_body()
         imgui.end_window()
-    else
+    elseif not panel_registered then
         imgui.set_next_window_size({ 170, 58 }, 4)
         local launcher_open = imgui.begin_window("SA Settings", true, 0)
         if launcher_open and imgui.button("Show settings") then

@@ -121,10 +121,10 @@ $FlagDefinitions = @(
     },
     [pscustomobject]@{
         Key = "EnableChordHudToggle"
-        Label = "Legacy A + X HUD chord"
+		Label = "A + X control guide"
         Section = "VR Controls"
-        Help = "Legacy fallback replaced by left thumb-rest tap, double-tap, and hold gestures."
-        Default = $false
+		Help = "On foot, press physical Right A and Left X together to open or close the full VR control guide."
+		Default = $true
         ApplyMode = "LiveOnConfigReload"
     },
     [pscustomobject]@{
@@ -403,7 +403,7 @@ EnableDualGripAimFire=true
 EnableAlternateWeaponHandsVisibility=true
 EnableGripWeaponCycle=false
 EnableChordPauseMenu=true
-EnableChordHudToggle=false
+EnableChordHudToggle=true
 EnablePauseUiAutoShow=true
 EnableHudAutoHide=true
 EnableFirstPersonCameraLock=true

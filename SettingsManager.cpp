@@ -120,6 +120,8 @@ void SettingsManager::FetchUevrSettings(bool writeToPlugin)
 	uevr_LerpPitch = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraPitch", true);
 	uevr_LerpRoll = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraRoll", true);
 	uevr_LerpYaw = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraYaw", false);
+	uevr_MovementOrientation = std::clamp(
+		SettingsManager::GetIntValueFromFile(uevrConfigFilePath, "VR_MovementOrientation", 0), 0, 2);
 
 	if (writeToPlugin)
 		WriteChangedSettingsToPluginConfigFile();
@@ -166,7 +168,7 @@ void SettingsManager::FetchPluginSettings()
 	enablePhoneAnswerGripTap = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnablePhoneAnswerGripTap", true);
 	enableLegacyDPadModulator = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableLegacyDPadModulator", false);
 	enableChordPauseMenu = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableChordPauseMenu", true);
-	enableChordHudToggle = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableChordHudToggle", false);
+	enableChordHudToggle = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableChordHudToggle", true);
 	enablePauseUiAutoShow = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnablePauseUiAutoShow", true);
 	enableHudAutoHide = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableHudAutoHide", true);
 	enableShortPressCameraSwitch = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableShortPressCameraSwitch", true);
@@ -363,10 +365,68 @@ bool SettingsManager::SetPause2dScreenMode(bool enabled)
 	if (uevr::API::get()->param()->vr == nullptr || !uevr::API::VR::is_runtime_ready())
 		return false;
 
+	// A persistent ownership marker makes this transient override crash-safe.
+	// It is written only when the plugin turns 2D mode on, never for a user's
+	// pre-existing 2D preference.
+	if (enabled && !WritePause2dOwnershipMarker())
+	{
+		uevr::API::get()->log_error("%s",
+			"[PauseUI] refusing temporary 2D mode because ownership marker could not be written");
+		return false;
+	}
+
 	// This is intentionally live-only. Pause/failure screens temporarily use
 	// UEVR's complete frame compositor, then restore the user's profile state.
 	uevr::API::VR::set_mod_value("VR_2DScreenMode", enabled);
+	if (!enabled)
+		ClearPause2dOwnershipMarker();
 	return true;
+}
+
+bool SettingsManager::RecoverPluginOwnedPause2dScreenMode()
+{
+	const std::string markerPath = GetPause2dOwnershipMarkerPath();
+	if (markerPath.empty() || GetFileAttributesA(markerPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+		return true;
+
+	if (uevr::API::get()->param()->vr == nullptr || !uevr::API::VR::is_runtime_ready())
+		return false;
+
+	uevr::API::VR::set_mod_value("VR_2DScreenMode", false);
+	ClearPause2dOwnershipMarker();
+	uevr::API::get()->log_warn("%s",
+		"[PauseUI] recovered plugin-owned temporary 2D mode after interrupted session");
+	return true;
+}
+
+std::string SettingsManager::GetPause2dOwnershipMarkerPath() const
+{
+	if (pluginConfigFilePath.empty())
+		return {};
+	const size_t fileNamePos = pluginConfigFilePath.find_last_of("\\/");
+	if (fileNamePos == std::string::npos)
+		return "SAVR_pause_2d_owned.flag";
+	return pluginConfigFilePath.substr(0, fileNamePos + 1) + "SAVR_pause_2d_owned.flag";
+}
+
+bool SettingsManager::WritePause2dOwnershipMarker() const
+{
+	const std::string markerPath = GetPause2dOwnershipMarkerPath();
+	if (markerPath.empty())
+		return false;
+	std::ofstream marker(markerPath, std::ios::binary | std::ios::trunc);
+	if (!marker)
+		return false;
+	marker << "plugin-owned temporary VR_2DScreenMode=true\n";
+	marker.flush();
+	return marker.good();
+}
+
+void SettingsManager::ClearPause2dOwnershipMarker() const
+{
+	const std::string markerPath = GetPause2dOwnershipMarkerPath();
+	if (!markerPath.empty())
+		std::remove(markerPath.c_str());
 }
 
 bool SettingsManager::SetFeatureFlagFromUi(const std::string& name, bool value, bool& liveApply)
@@ -933,7 +993,7 @@ void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings mo
 		break;
 	case OnFoot:
 		queueBool("VR_DecoupledPitch", onFoot_DecoupledPitch);
-		queueInt("VR_MovementOrientation", 0);
+		queueInt("VR_MovementOrientation", uevr_MovementOrientation);
 		queueBool("VR_LerpCameraPitch", onFoot_LerpPitch);
 		queueBool("VR_LerpCameraRoll", onFoot_LerpRoll);
 		queueBool("VR_LerpCameraYaw", onFoot_LerpYaw);
@@ -1147,7 +1207,7 @@ bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& file
 			"EnableGripWeaponCycle=true\n"
 			"EnablePhoneAnswerGripTap=true\n"
 			"EnableChordPauseMenu=true\n"
-			"EnableChordHudToggle=false\n"
+			"EnableChordHudToggle=true\n"
 			"EnablePauseUiAutoShow=true\n"
 			"EnableHudAutoHide=true\n"
 			"EnableFirstPersonCameraLock=true\n"
@@ -1589,6 +1649,16 @@ std::string SettingsManager::GetGripCalibrationFilePath() const
 	if (fileNamePos == std::string::npos)
 		return "UEVR_GTASADE_grip_calibration.txt";
 	return pluginConfigFilePath.substr(0, fileNamePos + 1) + "UEVR_GTASADE_grip_calibration.txt";
+}
+
+std::string SettingsManager::GetHolsterAnchorsFilePath() const
+{
+	if (pluginConfigFilePath.empty())
+		return {};
+	const size_t fileNamePos = pluginConfigFilePath.find_last_of("\\/");
+	if (fileNamePos == std::string::npos)
+		return "UEVR_GTASADE_holster_anchors.txt";
+	return pluginConfigFilePath.substr(0, fileNamePos + 1) + "UEVR_GTASADE_holster_anchors.txt";
 }
 
 std::string SettingsManager::GetConfigFilePath(bool uevr)

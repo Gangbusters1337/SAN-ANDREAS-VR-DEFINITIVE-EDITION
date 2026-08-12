@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <initializer_list>
 #include <limits>
 #include <sstream>
 #include <glm/ext/matrix_transform.hpp>
@@ -157,6 +158,121 @@ namespace
 		basis[1] = glm::fvec4(right, 0.0f);
 		basis[2] = glm::fvec4(up, 0.0f);
 		return glm::normalize(glm::quat_cast(basis));
+	}
+
+	bool NormalizeHolsterPose(bool longGun, int verticalAxis, int hand, glm::fvec3& position,
+		glm::fvec3& forward, glm::fvec3& right, glm::fvec3& up)
+	{
+		verticalAxis = std::clamp(verticalAxis, 0, 2);
+		bool changed = false;
+		// ReadMagneticBodyFrame explicitly constructs local +X as anatomical forward
+		// and local +Y as anatomical right from CJ's thigh positions. Keep the waist
+		// symmetric around Y=0. The previous
+		// one-sample -15.4 cm "belt centre" and reversed hand tie-breaker sent left-
+		// hand releases to the right/buckle slot and collapsed most poses together.
+		const float sideSign = std::isfinite(position.y) && std::abs(position.y) >= 5.0f
+			? (position.y < 0.0f ? -1.0f : 1.0f)
+			: (hand == 0 ? -1.0f : 1.0f);
+		const glm::fvec3 targetPosition = longGun
+			? glm::fvec3(8.0f, sideSign * 22.0f, -68.0f)
+			: glm::fvec3(10.0f, sideSign * 19.0f, -62.0f);
+		const float releaseDistance = IsFiniteVector(position)
+			? glm::length(position - targetPosition) : 1000.0f;
+		const float targetHeight = targetPosition.z;
+		if (std::abs(position.z - targetHeight) > 0.01f)
+		{
+			position.z = targetHeight;
+			changed = true;
+		}
+
+		const float minimumSide = longGun ? 21.0f : 18.0f;
+		const float maximumSide = longGun ? 30.0f : 26.0f;
+		const float sourceSide = std::isfinite(position.y)
+			? std::abs(position.y)
+			: std::abs(targetPosition.y);
+		const float desiredSide = std::clamp(sourceSide, minimumSide, maximumSide);
+		const float desiredLocalY = sideSign * desiredSide;
+		if (!std::isfinite(position.y) || std::abs(position.y - desiredLocalY) > 0.01f)
+		{
+			position.y = desiredLocalY;
+			changed = true;
+		}
+		// Preserve front-half placement while preventing belt-buckle and rear-body
+		// intersections. These bounds contain the first-release hip anchors and the
+		// previously accepted dynamic front-waist samples.
+		const float clampedForward = std::clamp(position.x,
+			longGun ? 2.0f : 4.0f, longGun ? 22.0f : 26.0f);
+		if (!std::isfinite(position.x) || std::abs(position.x - clampedForward) > 0.01f)
+		{
+			position.x = std::isfinite(clampedForward) ? clampedForward : targetPosition.x;
+			changed = true;
+		}
+
+		forward = NormalizeOrZero(forward);
+		right = NormalizeOrZero(right);
+		up = NormalizeOrZero(up);
+		// Preserve exact orientation only when the release is both genuinely
+		// nose-down and close to its side slot. Farther drops require a steeper
+		// barrel, preventing chest-height/extended-arm poses from being saved.
+		const float distanceFactor = std::clamp(releaseDistance / 55.0f, 0.0f, 1.0f);
+		const float requiredDown = longGun
+			? -(0.80f + 0.15f * distanceFactor)
+			: -(0.72f + 0.20f * distanceFactor);
+		const glm::fvec3 principalAxis = verticalAxis == 2 ? up
+			: verticalAxis == 1 ? right : forward;
+		if (principalAxis.z <= requiredDown)
+			return changed;
+
+		glm::fvec2 heading(principalAxis.x, principalAxis.y);
+		if (!std::isfinite(glm::length(heading)) || glm::length(heading) < 0.1f)
+			heading = glm::fvec2(1.0f, 0.0f);
+		else
+			heading = glm::normalize(heading);
+		const float horizontalForward = longGun || verticalAxis != 0 ? 0.12f : 0.32f;
+		const glm::fvec3 axisDown = glm::normalize(glm::fvec3(
+			heading.x * horizontalForward, heading.y * horizontalForward, -1.0f));
+		if (verticalAxis == 0)
+		{
+			forward = axisDown;
+			right -= forward * glm::dot(right, forward);
+			if (glm::length(right) < 0.1f)
+			{
+				right = glm::fvec3(0.0f, 1.0f, 0.0f);
+				right -= forward * glm::dot(right, forward);
+			}
+			if (glm::length(right) < 0.1f)
+			{
+				right = glm::fvec3(1.0f, 0.0f, 0.0f);
+				right -= forward * glm::dot(right, forward);
+			}
+			right = NormalizeOrZero(right);
+			up = NormalizeOrZero(glm::cross(forward, right));
+		}
+		else if (verticalAxis == 1)
+		{
+			right = axisDown;
+			forward -= right * glm::dot(forward, right);
+			if (glm::length(forward) < 0.1f)
+			{
+				forward = glm::fvec3(1.0f, 0.0f, 0.0f);
+				forward -= right * glm::dot(forward, right);
+			}
+			forward = NormalizeOrZero(forward);
+			up = NormalizeOrZero(glm::cross(forward, right));
+		}
+		else
+		{
+			up = axisDown;
+			right -= up * glm::dot(right, up);
+			if (glm::length(right) < 0.1f)
+			{
+				right = glm::fvec3(0.0f, -1.0f, 0.0f);
+				right -= up * glm::dot(right, up);
+			}
+			right = NormalizeOrZero(right);
+			forward = NormalizeOrZero(glm::cross(right, up));
+		}
+		return true;
 	}
 
 	struct ParameterMakeRotationFromAxes
@@ -429,6 +545,18 @@ namespace
 				return true;
 			}
 		}
+		return false;
+	}
+
+	bool ResolveFirstBone(uevr::API::UObject* component,
+		std::initializer_list<const wchar_t*> wantedNames, ResolvedBone& result)
+	{
+		for (const auto* wantedName : wantedNames)
+		{
+			if (ResolveBone(component, wantedName, result))
+				return true;
+		}
+		result = ResolvedBone{};
 		return false;
 	}
 
@@ -5706,14 +5834,40 @@ bool WeaponManager::IsControllerHeldUtility() const
 	return currentWeaponEquipped == SprayCan;
 }
 
-bool WeaponManager::ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotation) const
+int WeaponManager::ResolveMagneticHolsterVerticalAxis() const
 {
-	// A released weapon is body inventory: preserve its arbitrary release pose in
-	// CJ's lower-body/actor frame so turning the legs carries the holster with it.
-	// The constant model heading offset is harmless because capture and playback
-	// use the same basis. Camera yaw is fallback-only and cannot independently
-	// rotate an otherwise stationary holster.
-	glm::fvec3 forward(0.0f);
+	// Firearms are authored along local X and retain the proven barrel-down path.
+	// GTA's held melee meshes are not consistent with that convention; use their
+	// measured longest local bounds axis so bats, clubs, cues, shovels and similar
+	// weapons hang lengthwise instead of lying flat against the waist.
+	if (currentWeaponEquipped < GolfClub || currentWeaponEquipped > Cane
+		|| firstWeaponMesh == nullptr || !uevr::API::UObjectHook::exists(firstWeaponMesh))
+		return 0;
+	auto componentClass = firstWeaponMesh->get_class();
+	if (componentClass == nullptr || componentClass->find_function(L"GetLocalBounds") == nullptr)
+		return 0;
+	ParameterGetLocalBounds bounds{};
+	firstWeaponMesh->call_function(L"GetLocalBounds", &bounds);
+	if (!IsFiniteVector(bounds.min) || !IsFiniteVector(bounds.max))
+		return 0;
+	const glm::fvec3 spans = glm::abs(bounds.max - bounds.min);
+	if (!IsFiniteVector(spans) || (std::max)({ spans.x, spans.y, spans.z }) < 5.0f)
+		return 0;
+	if (spans.y > spans.x && spans.y >= spans.z)
+		return 1;
+	if (spans.z > spans.x && spans.z > spans.y)
+		return 2;
+	return 0;
+}
+
+bool WeaponManager::ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotation)
+{
+	// A released weapon is lower-body inventory. Build the horizontal frame from
+	// the animated left/right thigh positions so HMD, camera and aim yaw can never
+	// redefine where CJ's hips are. The old actor-forward frame had a fixed model
+	// heading offset: runtime drops showed anatomical left/right primarily in its
+	// local X coordinate while normalization assumed local Y, producing the
+	// persistent belt-buckle/opposite-side placement.
 	auto actor = playerManager->playerActor != nullptr
 		? playerManager->playerActor : playerManager->playerCharacter;
 	origin = glm::fvec3(0.0f);
@@ -5727,12 +5881,6 @@ bool WeaponManager::ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotati
 			actor->call_function(L"K2_GetActorLocation", &locationParams);
 			origin = locationParams.vec3Value + playerManager->defaultPlayerHeadLocalPositionUE;
 		}
-		if (actorClass->find_function(L"GetActorForwardVector") != nullptr)
-		{
-			Utilities::ParameterSingleVector3 forwardParams{};
-			actor->call_function(L"GetActorForwardVector", &forwardParams);
-			forward = forwardParams.vec3Value;
-		}
 	}
 	if (!IsFiniteVector(origin) || glm::length(origin) < 1.0f)
 		origin = playerManager->actualPlayerHeadPositionUE;
@@ -5740,21 +5888,106 @@ bool WeaponManager::ReadMagneticBodyFrame(glm::fvec3& origin, glm::fquat& rotati
 		origin = playerManager->actualPlayerPositionUE;
 	if (!IsFiniteVector(origin) || glm::length(origin) < 1.0f)
 		return false;
-	if (!IsFiniteVector(forward) || glm::length(glm::fvec2(forward.x, forward.y)) <= 0.001f)
+
+	uevr::API::UObject* legComponent = nullptr;
+	if (playerManager->playerCharacter != nullptr
+		&& uevr::API::UObjectHook::exists(playerManager->playerCharacter)
+		&& playerManager->playerCharacter->get_class() != nullptr
+		&& playerManager->playerCharacter->get_class()->find_property(L"Trousers") != nullptr)
 	{
-		forward = cameraController->forwardVectorUE;
-		if ((!IsFiniteVector(forward) || glm::length(glm::fvec2(forward.x, forward.y)) <= 0.001f)
-			&& magneticStableBodyRotationValid && IsFiniteQuaternion(magneticStableBodyRotation))
-			forward = magneticStableBodyRotation * glm::fvec3(1.0f, 0.0f, 0.0f);
+		legComponent = playerManager->playerCharacter->get_property<uevr::API::UObject*>(L"Trousers");
 	}
-	if (!IsFiniteVector(forward) || glm::length(glm::fvec2(forward.x, forward.y)) <= 0.001f)
-		return false;
-	forward.z = 0.0f;
-	forward = NormalizeOrZero(forward);
-	if (glm::length(forward) <= 0.0001f)
-		return false;
+	if (legComponent == nullptr || !uevr::API::UObjectHook::exists(legComponent))
+		legComponent = playerManager->lowerBodyVisibilityProperty;
+	if (legComponent != magneticLegFrameComponent)
+	{
+		magneticLegFrameComponent = legComponent;
+		magneticLeftThighBone = {};
+		magneticRightThighBone = {};
+		magneticLegFrameBonesResolved = false;
+		magneticLegFrameResolutionAttempted = false;
+		magneticLegFrameFallbackLogged = false;
+	}
+
 	const glm::fvec3 up(0.0f, 0.0f, 1.0f);
-	const glm::fvec3 right = NormalizeOrZero(glm::cross(up, forward));
+	glm::fvec3 forward(0.0f);
+	glm::fvec3 right(0.0f);
+	if (legComponent != nullptr && uevr::API::UObjectHook::exists(legComponent))
+	{
+		if (!magneticLegFrameResolutionAttempted)
+		{
+			magneticLegFrameResolutionAttempted = true;
+			ResolvedBone leftThigh{};
+			ResolvedBone rightThigh{};
+			magneticLegFrameBonesResolved =
+				ResolveFirstBone(legComponent,
+					{ L"L_Thigh", L"L_UpperLeg", L"LeftUpLeg", L"thigh_l", L"Bip01 L Thigh" },
+					leftThigh)
+				&& ResolveFirstBone(legComponent,
+					{ L"R_Thigh", L"R_UpperLeg", L"RightUpLeg", L"thigh_r", L"Bip01 R Thigh" },
+					rightThigh);
+			if (magneticLegFrameBonesResolved)
+			{
+				magneticLeftThighBone = leftThigh.name;
+				magneticRightThighBone = rightThigh.name;
+				uevr::API::get()->log_info(
+					"[MagneticWeapon] leg frame resolved component=%ls left=%ls right=%ls",
+					legComponent->get_full_name().c_str(), leftThigh.text.c_str(), rightThigh.text.c_str());
+			}
+			else
+			{
+				uevr::API::get()->log_warn(
+					"[MagneticWeapon] leg frame unresolved component=%ls; using corrected actor fallback",
+					legComponent->get_full_name().c_str());
+			}
+		}
+
+		if (magneticLegFrameBonesResolved)
+		{
+			glm::fvec3 leftThighPosition{};
+			glm::fvec3 rightThighPosition{};
+			glm::fquat unusedRotation{};
+			if (ReadBoneWorldTransform(legComponent, magneticLeftThighBone,
+					leftThighPosition, unusedRotation)
+				&& ReadBoneWorldTransform(legComponent, magneticRightThighBone,
+					rightThighPosition, unusedRotation))
+			{
+				right = rightThighPosition - leftThighPosition;
+				right.z = 0.0f;
+				right = NormalizeOrZero(right);
+				forward = NormalizeOrZero(glm::cross(right, up));
+			}
+		}
+	}
+
+	if (glm::length(forward) <= 0.0001f || glm::length(right) <= 0.0001f)
+	{
+		// GTA's actor forward is offset a quarter-turn from the visible lower-body
+		// axes in this model. Correct that fixed offset, but never consult camera or
+		// HMD yaw. This path is only a compatibility fallback for missing leg bones.
+		glm::fvec3 actorForward(0.0f);
+		if (actor != nullptr && uevr::API::UObjectHook::exists(actor)
+			&& actor->get_class() != nullptr
+			&& actor->get_class()->find_function(L"GetActorForwardVector") != nullptr)
+		{
+			Utilities::ParameterSingleVector3 forwardParams{};
+			actor->call_function(L"GetActorForwardVector", &forwardParams);
+			actorForward = forwardParams.vec3Value;
+		}
+		actorForward.z = 0.0f;
+		actorForward = NormalizeOrZero(actorForward);
+		if (glm::length(actorForward) <= 0.0001f)
+			return false;
+		right = actorForward;
+		forward = NormalizeOrZero(glm::cross(right, up));
+		if (!magneticLegFrameFallbackLogged)
+		{
+			magneticLegFrameFallbackLogged = true;
+			uevr::API::get()->log_info(
+				"[MagneticWeapon] leg frame source=actor-corrected camera=false hmd=false");
+		}
+	}
+
 	rotation = RotationFromWeaponBasis(forward, right, up);
 	return IsFiniteQuaternion(rotation) && glm::length(rotation) > 0.5f;
 }
@@ -5766,18 +5999,18 @@ void WeaponManager::SetMagneticIdleAnchor(int hand)
 		: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1);
 	const float side = anchorHand == 0 ? -1.0f : 1.0f;
 	const bool longGun = IsTwoHandLongGun();
+	const int verticalAxis = ResolveMagneticHolsterVerticalAxis();
 
 	// Close body-local hip anchors. Weapon X is its barrel axis: sidearms point
 	// down with a modest forward cant; long guns hang almost vertically.
 	magneticIdleLocalPosition = longGun
 		? glm::fvec3(8.0f, side * 22.0f, -68.0f)
 		: glm::fvec3(10.0f, side * 19.0f, -62.0f);
-	magneticIdleLocalForward = longGun
-		? glm::normalize(glm::fvec3(0.08f, 0.0f, -1.0f))
-		: glm::normalize(glm::fvec3(0.28f, 0.0f, -1.0f));
+	magneticIdleLocalForward = glm::fvec3(1.0f, 0.0f, 0.0f);
 	magneticIdleLocalRight = glm::fvec3(0.0f, 1.0f, 0.0f);
-	magneticIdleLocalUp = NormalizeOrZero(glm::cross(
-		magneticIdleLocalForward, magneticIdleLocalRight));
+	magneticIdleLocalUp = glm::fvec3(0.0f, 0.0f, 1.0f);
+	NormalizeHolsterPose(longGun, verticalAxis, anchorHand, magneticIdleLocalPosition,
+		magneticIdleLocalForward, magneticIdleLocalRight, magneticIdleLocalUp);
 	magneticIdleAnchorHand = anchorHand;
 	magneticIdleAnchorBucket = longGun ? 1 : 0;
 	magneticCustomAnchorValid = false;
@@ -5785,6 +6018,143 @@ void WeaponManager::SetMagneticIdleAnchor(int hand)
 	magneticBodyFrameRebaseAt = 0;
 	magneticLastHeldPoseHand = -1;
 	magneticLastHeldPoseGripGeneration = 0;
+}
+
+bool WeaponManager::ReadMagneticWaistAnchorsFile(const std::string& path,
+	std::unordered_map<int, MagneticWaistAnchor>& result, int& loaded) const
+{
+	result.clear();
+	loaded = 0;
+	std::ifstream input(path);
+	if (!input.is_open())
+		return false;
+
+	std::string line;
+	while (std::getline(input, line))
+	{
+		if (line.empty() || line[0] == '#')
+			continue;
+		std::istringstream stream(line);
+		std::string marker;
+		int version = 0;
+		int weaponId = -1;
+		MagneticWaistAnchor anchor{};
+		if (!(stream >> marker >> version >> weaponId >> anchor.hand
+			>> anchor.position.x >> anchor.position.y >> anchor.position.z
+			>> anchor.forward.x >> anchor.forward.y >> anchor.forward.z
+			>> anchor.right.x >> anchor.right.y >> anchor.right.z
+			>> anchor.up.x >> anchor.up.y >> anchor.up.z)
+			|| marker != "entry" || version != 3
+			|| weaponId < static_cast<int>(BrassKnuckles)
+			|| weaponId > static_cast<int>(Parachute)
+			|| (anchor.hand != 0 && anchor.hand != 1)
+			|| !IsFiniteVector(anchor.position) || !IsFiniteVector(anchor.forward)
+			|| !IsFiniteVector(anchor.right) || !IsFiniteVector(anchor.up)
+			|| glm::length(anchor.forward) < 0.5f || glm::length(anchor.right) < 0.5f
+			|| glm::length(anchor.up) < 0.5f)
+			continue;
+		anchor.forward = NormalizeOrZero(anchor.forward);
+		anchor.right = NormalizeOrZero(anchor.right);
+		anchor.up = NormalizeOrZero(anchor.up);
+		anchor.gripGeneration = 0;
+		result[weaponId] = anchor;
+		++loaded;
+	}
+	return input.eof() || input.good();
+}
+
+bool WeaponManager::WriteMagneticWaistAnchorsFile(const std::string& path,
+	const std::unordered_map<int, MagneticWaistAnchor>& values) const
+{
+	std::ofstream output(path, std::ios::trunc);
+	if (!output.is_open())
+		return false;
+	output << "# UEVR GTA SA DE magnetic holster anchors v3\n";
+	output << "# entry 3 weaponId hand posX posY posZ forwardX forwardY forwardZ rightX rightY rightZ upX upY upZ\n";
+	output.setf(std::ios::fixed);
+	output.precision(6);
+	std::vector<int> weaponIds;
+	weaponIds.reserve(values.size());
+	for (const auto& [weaponId, unused] : values)
+		weaponIds.push_back(weaponId);
+	std::sort(weaponIds.begin(), weaponIds.end());
+	for (const int weaponId : weaponIds)
+	{
+		const auto& anchor = values.at(weaponId);
+		output << "entry 3 " << weaponId << ' ' << anchor.hand << ' '
+			<< anchor.position.x << ' ' << anchor.position.y << ' ' << anchor.position.z << ' '
+			<< anchor.forward.x << ' ' << anchor.forward.y << ' ' << anchor.forward.z << ' '
+			<< anchor.right.x << ' ' << anchor.right.y << ' ' << anchor.right.z << ' '
+			<< anchor.up.x << ' ' << anchor.up.y << ' ' << anchor.up.z << "\n";
+	}
+	output.flush();
+	return output.good();
+}
+
+void WeaponManager::LoadMagneticWaistAnchors()
+{
+	if (magneticWaistAnchorsLoaded)
+		return;
+	magneticWaistAnchorsLoaded = true;
+	const std::string path = settingsManager->GetHolsterAnchorsFilePath();
+	if (path.empty())
+		return;
+	std::unordered_map<int, MagneticWaistAnchor> loadedValues;
+	int loaded = 0;
+	if (!ReadMagneticWaistAnchorsFile(path, loadedValues, loaded))
+	{
+		uevr::API::get()->log_info("[MagneticWeapon] anchor file=%s entries=0", path.c_str());
+		return;
+	}
+	magneticWaistAnchors = std::move(loadedValues);
+	uevr::API::get()->log_info("[MagneticWeapon] anchor file=%s schema=v3 entries=%d",
+		path.c_str(), loaded);
+}
+
+bool WeaponManager::SaveMagneticWaistAnchors()
+{
+	const std::string path = settingsManager->GetHolsterAnchorsFilePath();
+	if (path.empty())
+		return false;
+	const std::filesystem::path target(path);
+	const std::filesystem::path temporary = target.wstring() + L".tmp";
+	std::error_code error;
+	std::filesystem::remove(temporary, error);
+	if (!WriteMagneticWaistAnchorsFile(temporary.string(), magneticWaistAnchors))
+	{
+		uevr::API::get()->log_warn("[MagneticWeapon] anchor save failed stage=temp-write file=%s",
+			path.c_str());
+		std::filesystem::remove(temporary, error);
+		return false;
+	}
+	std::unordered_map<int, MagneticWaistAnchor> roundTrip;
+	int roundTripLoaded = 0;
+	if (!ReadMagneticWaistAnchorsFile(temporary.string(), roundTrip, roundTripLoaded)
+		|| roundTrip.size() != magneticWaistAnchors.size())
+	{
+		uevr::API::get()->log_warn("[MagneticWeapon] anchor save failed stage=temp-validation file=%s",
+			path.c_str());
+		std::filesystem::remove(temporary, error);
+		return false;
+	}
+	if (!MoveFileExW(temporary.c_str(), target.c_str(),
+		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+	{
+		const DWORD moveError = GetLastError();
+		uevr::API::get()->log_warn(
+			"[MagneticWeapon] anchor save failed stage=atomic-replace error=%lu file=%s",
+			static_cast<unsigned long>(moveError), path.c_str());
+		std::filesystem::remove(temporary, error);
+		return false;
+	}
+	uevr::API::get()->log_info("[MagneticWeapon] anchor save committed schema=v3 entries=%d",
+		roundTripLoaded);
+	return true;
+}
+
+void WeaponManager::InitializeMagneticHolster()
+{
+	LoadMagneticWaistAnchors();
 }
 
 bool WeaponManager::CaptureMagneticReleaseAnchor(int hand, bool logCapture)
@@ -5824,14 +6194,16 @@ bool WeaponManager::CaptureMagneticReleaseAnchor(int hand, bool logCapture)
 		return false;
 	}
 	const float horizontalRadius = glm::length(glm::fvec2(localPosition.x, localPosition.y));
-	// The empirical front/body-half release samples include negative local X
-	// values down to roughly -34 cm. Keep a small margin for controller timing,
-	// but retain a bounded forward extent so discontinuous/rear samples are not
-	// accepted as a holster pose.
-	const bool waistPlacement = localPosition.z >= -110.0f && localPosition.z <= 5.0f
-		&& localPosition.x >= -40.0f && localPosition.x <= 85.0f
+	// Use the broad body volume from the last known-good free-placement path.
+	// Actor heading can temporarily disagree with HMD heading after an aiming
+	// stance, so front-of-player samples have legitimately appeared on either
+	// side of local X. The final position is projected to the waist plane below.
+	const bool waistPlacement = localPosition.z >= -165.0f && localPosition.z <= 40.0f
+		&& localPosition.x >= -100.0f && localPosition.x <= 85.0f
+		&& std::abs(localPosition.y) <= 105.0f
 		&& std::isfinite(horizontalRadius)
-		&& horizontalRadius >= 8.0f && horizontalRadius <= 90.0f;
+		&& horizontalRadius >= 8.0f && horizontalRadius <= 110.0f
+		&& glm::length(localPosition) <= 210.0f;
 	if (!waistPlacement)
 	{
 		if (logCapture)
@@ -5845,10 +6217,22 @@ bool WeaponManager::CaptureMagneticReleaseAnchor(int hand, bool logCapture)
 	}
 	const uint32_t generation = hand >= 0 && hand <= 1
 		? gripPressGeneration[static_cast<size_t>(hand)].load(std::memory_order_acquire) : 0;
-	magneticIdleLocalPosition = localPosition;
-	magneticIdleLocalForward = localForward;
-	magneticIdleLocalRight = localRight;
-	magneticIdleLocalUp = localUp;
+	// Preserve where the user released the weapon around the horizontal waist
+	// arc and preserve its exact orientation, but always lower it to the same
+	// class-specific waist plane as the stable fallback. This replaces the old
+	// presentation-only -15 cm offset, which left chest-height drops suspended
+	// and was recaptured on the next pickup, accumulating another 15 cm each time.
+	glm::fvec3 waistPosition = localPosition;
+	glm::fvec3 waistForward = localForward;
+	glm::fvec3 waistRight = localRight;
+	glm::fvec3 waistUp = localUp;
+	const int verticalAxis = ResolveMagneticHolsterVerticalAxis();
+	const bool normalizedHolster = NormalizeHolsterPose(IsTwoHandLongGun(), verticalAxis, hand, waistPosition,
+		waistForward, waistRight, waistUp);
+	magneticIdleLocalPosition = waistPosition;
+	magneticIdleLocalForward = waistForward;
+	magneticIdleLocalRight = waistRight;
+	magneticIdleLocalUp = waistUp;
 	magneticIdleAnchorHand = hand;
 	magneticIdleAnchorBucket = IsTwoHandLongGun() ? 1 : 0;
 	magneticCustomAnchorValid = true;
@@ -5856,7 +6240,7 @@ bool WeaponManager::CaptureMagneticReleaseAnchor(int hand, bool logCapture)
 	magneticLastHeldPoseHand = hand;
 	magneticLastHeldPoseGripGeneration = generation;
 	magneticWaistAnchors[static_cast<int>(currentWeaponEquipped)] = {
-		localPosition, localForward, localRight, localUp, hand, generation };
+		waistPosition, waistForward, waistRight, waistUp, hand, generation };
 	if (logCapture)
 	{
 		if (!magneticStableBodyRotationValid)
@@ -5869,9 +6253,12 @@ bool WeaponManager::CaptureMagneticReleaseAnchor(int hand, bool logCapture)
 	}
 	if (logCapture)
 		uevr::API::get()->log_info(
-			"[MagneticWeapon] release pose captured hand=%s weapon=%d generation=%u localP=(%.1f %.1f %.1f)",
+			"[MagneticWeapon] release pose captured hand=%s weapon=%d generation=%u axis=%c rawP=(%.1f %.1f %.1f) waistP=(%.1f %.1f %.1f) normalized=%s",
 			hand == 0 ? "left" : "right", magneticCustomAnchorWeaponId, generation,
-			localPosition.x, localPosition.y, localPosition.z);
+			verticalAxis == 2 ? 'Z' : verticalAxis == 1 ? 'Y' : 'X',
+			localPosition.x, localPosition.y, localPosition.z,
+			waistPosition.x, waistPosition.y, waistPosition.z,
+			normalizedHolster ? "true" : "false");
 	return true;
 }
 
@@ -5964,6 +6351,13 @@ void WeaponManager::EnterMagneticIdleSlot(int anchorHand, bool allowSavedPose)
 			magneticIdleLocalForward = saved->second.forward;
 			magneticIdleLocalRight = saved->second.right;
 			magneticIdleLocalUp = saved->second.up;
+			NormalizeHolsterPose(IsTwoHandLongGun(), ResolveMagneticHolsterVerticalAxis(),
+				saved->second.hand, magneticIdleLocalPosition,
+				magneticIdleLocalForward, magneticIdleLocalRight, magneticIdleLocalUp);
+			saved->second.position = magneticIdleLocalPosition;
+			saved->second.forward = magneticIdleLocalForward;
+			saved->second.right = magneticIdleLocalRight;
+			saved->second.up = magneticIdleLocalUp;
 			magneticIdleAnchorHand = saved->second.hand;
 			magneticIdleAnchorBucket = IsTwoHandLongGun() ? 1 : 0;
 			magneticCustomAnchorValid = true;
@@ -6271,10 +6665,6 @@ void WeaponManager::ApplyMagneticIdlePose()
 	if (!ReadMagneticBodyFrame(bodyOrigin, rawBodyRotation))
 		return;
 	glm::fquat bodyRotation = rawBodyRotation;
-	// Keep raw saved per-weapon anchors unchanged. This presentation-only body-
-	// local drop makes released weapons sit lower without accumulating on recall
-	// or during the one-time actor-frame rebase.
-	const glm::fvec3 presentationDrop(0.0f, 0.0f, -15.0f);
 	const uint64_t now = GetTickCount64();
 	if (!magneticStableBodyRotationValid
 		|| !IsFiniteQuaternion(magneticStableBodyRotation)
@@ -6294,13 +6684,13 @@ void WeaponManager::ApplyMagneticIdlePose()
 		// Rebase once to the settled actor frame without changing the current
 		// world pose or any of the saved weapon orientation axes.
 		const glm::fvec3 worldPosition = bodyOrigin
-			+ magneticStableBodyRotation * (magneticIdleLocalPosition + presentationDrop);
+			+ magneticStableBodyRotation * magneticIdleLocalPosition;
 		const glm::fvec3 worldForward = magneticStableBodyRotation * magneticIdleLocalForward;
 		const glm::fvec3 worldRight = magneticStableBodyRotation * magneticIdleLocalRight;
 		const glm::fvec3 worldUp = magneticStableBodyRotation * magneticIdleLocalUp;
 		const glm::fquat inverseRawBodyRotation = glm::inverse(rawBodyRotation);
 		const glm::fvec3 rebasedPosition = inverseRawBodyRotation
-			* (worldPosition - bodyOrigin) - presentationDrop;
+			* (worldPosition - bodyOrigin);
 		const glm::fvec3 rebasedForward = NormalizeOrZero(inverseRawBodyRotation * worldForward);
 		const glm::fvec3 rebasedRight = NormalizeOrZero(inverseRawBodyRotation * worldRight);
 		const glm::fvec3 rebasedUp = NormalizeOrZero(inverseRawBodyRotation * worldUp);
@@ -6368,7 +6758,7 @@ void WeaponManager::ApplyMagneticIdlePose()
 	}
 
 	const glm::fvec3 worldPosition = bodyOrigin
-		+ bodyRotation * (magneticIdleLocalPosition + presentationDrop);
+		+ bodyRotation * magneticIdleLocalPosition;
 	const glm::fvec3 worldForward = NormalizeOrZero(bodyRotation * magneticIdleLocalForward);
 	const glm::fvec3 worldRight = NormalizeOrZero(bodyRotation * magneticIdleLocalRight);
 	const glm::fvec3 worldUp = NormalizeOrZero(bodyRotation * magneticIdleLocalUp);
@@ -6651,11 +7041,6 @@ void WeaponManager::ProcessMagneticIdleWeapon()
 
 	if (magneticGripHand >= 0)
 	{
-		// Continuously retain the latest validated held pose. A very short release
-		// can land between component/body-frame initialization samples; in that case
-		// the last valid held sample is safer than snapping to the fallback hip.
-		if (magneticGripAttached)
-			CaptureMagneticReleaseAnchor(magneticGripHand, false);
 		const uint8_t handBit = static_cast<uint8_t>(1U << magneticGripHand);
 		const bool released = (releasedMask & handBit) != 0
 			|| (magneticReleaseRequested && (currentMask & handBit) == 0);
@@ -6665,36 +7050,17 @@ void WeaponManager::ProcessMagneticIdleWeapon()
 			const uint32_t releaseGeneration = releaseHand >= 0 && releaseHand <= 1
 				? gripPressGeneration[static_cast<size_t>(releaseHand)].load(std::memory_order_acquire) : 0;
 			const bool capturedReleasePose = CaptureMagneticReleaseAnchor(releaseHand);
-			const bool retainedHeldPose = !capturedReleasePose
-				&& magneticCustomAnchorValid
-				&& magneticCustomAnchorWeaponId == static_cast<int>(currentWeaponEquipped)
-				&& magneticLastHeldPoseHand == releaseHand
-				&& magneticLastHeldPoseGripGeneration == releaseGeneration;
-			bool restoredWaistPose = false;
-			if (!capturedReleasePose && !retainedHeldPose)
+			if (!capturedReleasePose)
 			{
-				const int weaponId = static_cast<int>(currentWeaponEquipped);
-				const auto saved = magneticWaistAnchors.find(weaponId);
-				if (saved != magneticWaistAnchors.end()
-					&& releaseGeneration != 0
-					&& saved->second.hand == releaseHand
-					&& saved->second.gripGeneration == releaseGeneration)
-				{
-					magneticIdleLocalPosition = saved->second.position;
-					magneticIdleLocalForward = saved->second.forward;
-					magneticIdleLocalRight = saved->second.right;
-					magneticIdleLocalUp = saved->second.up;
-					magneticIdleAnchorHand = saved->second.hand;
-					magneticIdleAnchorBucket = IsTwoHandLongGun() ? 1 : 0;
-					magneticCustomAnchorValid = true;
-					magneticCustomAnchorWeaponId = weaponId;
-					magneticLastHeldPoseHand = releaseHand;
-					magneticLastHeldPoseGripGeneration = releaseGeneration;
-					restoredWaistPose = true;
-				}
+				// A rejected final sample must not reuse a near-hand pose captured while
+				// the weapon was still held. Fall back for this release; the persistent
+				// per-weapon map remains available on a later, deliberate reacquire.
+				magneticCustomAnchorValid = false;
+				magneticCustomAnchorWeaponId = -1;
+				magneticLastHeldPoseHand = -1;
+				magneticLastHeldPoseGripGeneration = 0;
 			}
-			const bool hasGenerationMatchedPose = capturedReleasePose
-				|| retainedHeldPose || restoredWaistPose;
+			const bool hasGenerationMatchedPose = capturedReleasePose;
 			if (hasGenerationMatchedPose && magneticBodyFrameRebaseAt == 0)
 			{
 				const bool stableBodyValid = magneticStableBodyRotationValid
@@ -6716,10 +7082,12 @@ void WeaponManager::ProcessMagneticIdleWeapon()
 					&& glm::length(magneticStableBodyRotation) > 0.5f)
 					magneticBodyFrameRebaseAt = GetTickCount64() + 900;
 			}
+			if (hasGenerationMatchedPose && !SaveMagneticWaistAnchors())
+				uevr::API::get()->log_warn(
+					"[MagneticWeapon] release anchor retained in memory but persistence failed weapon=%d",
+					static_cast<int>(currentWeaponEquipped));
 			EnterMagneticIdleSlot(releaseHand, hasGenerationMatchedPose);
-			const char* releaseSource = capturedReleasePose ? "release-pose"
-				: (retainedHeldPose ? "held-generation"
-					: (restoredWaistPose ? "weapon-saved-generation" : "class-fallback"));
+			const char* releaseSource = capturedReleasePose ? "release-pose" : "class-fallback";
 			uevr::API::get()->log_info("[MagneticWeapon] released hand=%s weapon=%d generation=%u source=%s",
 				releaseHand == 0 ? "left" : "right",
 				static_cast<int>(currentWeaponEquipped), releaseGeneration, releaseSource);

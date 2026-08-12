@@ -1,12 +1,18 @@
 # SAN ANDREAS VR DEFINITIVE EDITION
 
+<p align="center">
+  <a href="Documentation/Quest3-Control-Layout.png">
+    <img src="Documentation/Quest3-Control-Layout.png" alt="San Andreas VR Quest 3 controls and quick VR options" width="100%">
+  </a>
+</p>
+
+> **PRE-RELEASE BETA v0.1** — Click the control guide above to open the full-resolution image.
+
 Experience San Andreas in glorious high-definition VR: dramatically clearer, sharper, more immersive, and built around full motion-controller interaction. This unofficial beta enhancement package transforms **Grand Theft Auto: San Andreas – The Definitive Edition** through Praydog's UEVR.
 
 The included VR graphics profile is tuned for outstanding detail and strong performance, avoiding the worst visual artifacts while leaving capable PCs headroom to raise texture quality and other settings further. The HUD automatically gets out of your way, controls are designed to feel natural on motion controllers, and the world is presented with far greater clarity than a basic injected profile.
 
 This is not just head tracking. Aim pistols freely, stabilize shotguns and rifles with both hands, swing bats and melee weapons using tracked physical motion, fight bare-knuckle with either fist, and aim submachine guns freely from inside supported vehicles. Weapon rays and visible trails follow the weapon itself instead of an invisible flat-screen crosshair.
-
-![Quest 3 control layout](Documentation/Quest3-Control-Layout.png)
 
 > Beta software: back up your existing UEVR `SanAndreas` profile. Mission scripts, unusual vehicles, and some weapon combinations may still expose edge cases.
 
@@ -19,12 +25,14 @@ This is not just head tracking. Aim pistols freely, stabilize shotguns and rifle
 
 ## Downloads
 
-Two separate archives are intended for GitHub Releases:
+Two separate archives are available from the GitHub release:
 
-- **Manual package** — transparent folder trees for users who prefer placing every file themselves.
-- **Installer package** — the same payload plus a Windows installer with `Auto Detect` and `Manual Path` modes.
+- **`San-Andreas-VR-DE-v0.1-Manual.zip`** — transparent folder trees for users who prefer placing every file themselves.
+- **`San-Andreas-VR-DE-v0.1-Installer.zip`** — the same payload plus a Windows installer with `Auto Detect` and `Manual Path` modes.
 
-The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives and displayed prominently on the repository page.
+The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
+
+See [CHANGELOG.md](CHANGELOG.md) for the v0.1 changes.
 
 ## Why this build feels different
 
@@ -46,7 +54,9 @@ The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in b
 4. Choose:
    - `1 — Auto Detect`: checks common Steam, Rockstar, Epic, and game-library locations.
    - `2 — Manual Path`: paste the GTA San Andreas DE folder containing `Gameface`.
-5. Confirm the detected paths. The installer backs up an existing UEVR profile before copying files.
+5. Confirm the detected paths. The installer backs up the existing UEVR profile and GTA settings before copying files.
+
+The installer resolves Windows' real Documents known folder, including OneDrive redirection, and installs the tested GTA VR settings with Free Aim. It backs up the existing UEVR profile, GTA settings, and every game-folder file it replaces—including the original startup movie. Use the advanced `-SkipGameSettings` switch only if you deliberately want to retain your existing GTA graphics/gameplay configuration.
 
 The installer never installs UEVR or the game.
 
@@ -90,9 +100,31 @@ GameFolder\Gameface\Content\Paks\~mods\
 
 into the GTA San Andreas Definitive Edition installation folder, preserving the `Gameface\Content\Paks\~mods` path.
 
-### 3. Optional startup guide
+### 3. Recommended GTA settings
 
-The control layout PNG is documentation, not a required runtime file. Keep it somewhere convenient or open it from the repository.
+The manual archive contains:
+
+```text
+GameSettings\GameUserSettings.ini
+```
+
+Press `Win+R`, enter `shell:Personal`, and open:
+
+```text
+Rockstar Games\GTA San Andreas Definitive Edition\Config\WindowsNoEditor\
+```
+
+Back up the existing file, then copy the packaged `GameUserSettings.ini` there. Using `shell:Personal` is important because Windows may redirect Documents into OneDrive.
+
+### 4. Startup guide and control image
+
+The package replaces the Rockstar startup stinger with a 30-second control-guide version. Manual installers should back up this file first:
+
+```text
+Gameface\Content\Movies\1080\GTA_SA_RSTAR_STINGER_FINAL_1920x1080.mp4
+```
+
+The same full-resolution layout is included under `Documentation` and in the UEVR profile for the A+X in-game guide.
 
 ## First launch
 
@@ -109,7 +141,8 @@ For questions, bug reports, feedback, or other help, send a direct message on X 
 
 ## Updating and uninstalling
 
-- Installer updates create a timestamped backup under `%APPDATA%\UnrealVRMod\_Backups`.
+- Installer updates create timestamped profile, GTA-settings, and replaced-game-file backups under `%APPDATA%\UnrealVRMod\_Backups`.
+- The installer also backs up the active GTA settings and leaves `GameUserSettings.SAVR-recommended.ini` beside the active file for quick recovery if GTA runs first-launch defaults again.
 - Personal vehicle camera and grip calibration files should be copied somewhere safe before replacing the profile.
 - To uninstall manually, restore your prior `SanAndreas` profile and remove only the two packaged PAKs from the game's `~mods` folder.
 

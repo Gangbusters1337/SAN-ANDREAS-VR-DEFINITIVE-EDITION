@@ -2,8 +2,10 @@ param(
     [ValidateSet("Auto", "Manual")][string]$Mode,
     [string]$ProfilePath,
     [string]$GamePath,
+    [string]$DocumentsPath,
     [switch]$NoPrompt,
-    [switch]$SkipShortcuts
+    [switch]$SkipShortcuts,
+    [switch]$SkipGameSettings
 )
 
 Set-StrictMode -Version Latest
@@ -103,6 +105,10 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $PayloadRoot "UnrealVRMod\SanAndreas") -PathType Container)) {
         throw "Installer payload is incomplete. Extract the full installer archive before running it."
     }
+    $recommendedGameSettings = Join-Path $PayloadRoot "GameSettings\GameUserSettings.ini"
+    if (-not (Test-Path -LiteralPath $recommendedGameSettings -PathType Leaf)) {
+        throw "Installer payload is missing the recommended GTA settings file."
+    }
     if (Get-Process SanAndreas -ErrorAction SilentlyContinue) {
         throw "SanAndreas.exe is running. Close the game and UEVR, then run the installer again."
     }
@@ -130,21 +136,31 @@ try {
     $GamePath = Normalize-GamePath $GamePath
     if (-not $GamePath) { throw "The selected GTA San Andreas DE folder is invalid." }
     $ProfilePath = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($ProfilePath))
+    if (-not $DocumentsPath) {
+        $DocumentsPath = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    }
+    if ([string]::IsNullOrWhiteSpace($DocumentsPath)) { throw "Windows did not return a Documents known-folder path." }
+    $DocumentsPath = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($DocumentsPath))
+    $gameSettingsPath = Join-Path $DocumentsPath "Rockstar Games\GTA San Andreas Definitive Edition\Config\WindowsNoEditor\GameUserSettings.ini"
 
     Write-Host ""
     Write-Host "UEVR profile: $ProfilePath"
     Write-Host "Game folder:  $GamePath"
+    Write-Host "GTA settings: $gameSettingsPath"
+    if ($SkipGameSettings) { Write-Host "Recommended GTA settings: skipped" -ForegroundColor Yellow }
     if (-not $NoPrompt) {
         $confirm = Read-Host "Install to these locations? Y/N"
         if ($confirm -notmatch '^[Yy]$') { throw "Installation cancelled by user." }
     }
 
+    $uevrRoot = Split-Path -Parent $ProfilePath
+    $backupRoot = Join-Path $uevrRoot "_Backups"
+    $backupStamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+
     if (Test-Path -LiteralPath $ProfilePath) {
         Write-Step "Backing up the existing UEVR profile"
-        $uevrRoot = Split-Path -Parent $ProfilePath
-        $backupRoot = Join-Path $uevrRoot "_Backups"
-        New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
-        $backup = Join-Path $backupRoot ("SanAndreas_{0}" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+        $backup = Join-Path $backupRoot ("SanAndreas_{0}" -f $backupStamp)
         Copy-Item -LiteralPath $ProfilePath -Destination $backup -Recurse -Force
         Write-Host "Backup: $backup" -ForegroundColor Green
     }
@@ -153,8 +169,55 @@ try {
     New-Item -ItemType Directory -Force -Path $ProfilePath | Out-Null
     Copy-Item -Path (Join-Path $PayloadRoot "UnrealVRMod\SanAndreas\*") -Destination $ProfilePath -Recurse -Force
 
-    Write-Step "Installing the game-folder texture PAKs"
-    Copy-Item -Path (Join-Path $PayloadRoot "GameFolder\*") -Destination $GamePath -Recurse -Force
+    $gamePayload = Join-Path $PayloadRoot "GameFolder"
+    $gameBackup = Join-Path $backupRoot ("GameFolder_{0}" -f $backupStamp)
+    $backedUpGameFiles = 0
+    foreach ($payloadFile in Get-ChildItem -LiteralPath $gamePayload -Recurse -File) {
+        $relative = $payloadFile.FullName.Substring($gamePayload.Length + 1)
+        $targetFile = Join-Path $GamePath $relative
+        if (Test-Path -LiteralPath $targetFile -PathType Leaf) {
+            $backupFile = Join-Path $gameBackup $relative
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $backupFile) | Out-Null
+            Copy-Item -LiteralPath $targetFile -Destination $backupFile -Force
+            $backedUpGameFiles++
+        }
+    }
+    if ($backedUpGameFiles -gt 0) {
+        Write-Host "Game-file backup: $gameBackup ($backedUpGameFiles files)" -ForegroundColor Green
+    }
+
+    Write-Step "Installing game-folder VR assets"
+    Copy-Item -Path (Join-Path $gamePayload "*") -Destination $GamePath -Recurse -Force
+    foreach ($payloadFile in Get-ChildItem -LiteralPath $gamePayload -Recurse -File) {
+        $relative = $payloadFile.FullName.Substring($gamePayload.Length + 1)
+        $targetFile = Join-Path $GamePath $relative
+        if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) {
+            throw "Game-file installation verification failed: $relative"
+        }
+        if ((Get-FileHash -LiteralPath $payloadFile.FullName -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $targetFile -Algorithm SHA256).Hash) {
+            throw "Game-file hash verification failed: $relative"
+        }
+    }
+
+    if (-not $SkipGameSettings) {
+        Write-Step "Installing the tested GTA VR settings"
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $gameSettingsPath) | Out-Null
+        if (Test-Path -LiteralPath $gameSettingsPath -PathType Leaf) {
+            $gameSettingsBackup = Join-Path $backupRoot ("GameUserSettings_{0}.ini" -f $backupStamp)
+            Copy-Item -LiteralPath $gameSettingsPath -Destination $gameSettingsBackup -Force
+            Write-Host "GTA settings backup: $gameSettingsBackup" -ForegroundColor Green
+        }
+        Copy-Item -LiteralPath $recommendedGameSettings -Destination $gameSettingsPath -Force
+        $recoveryCopy = Join-Path (Split-Path -Parent $gameSettingsPath) "GameUserSettings.SAVR-recommended.ini"
+        Copy-Item -LiteralPath $recommendedGameSettings -Destination $recoveryCopy -Force
+        if ((Get-FileHash -LiteralPath $recommendedGameSettings -Algorithm SHA256).Hash -ne
+            (Get-FileHash -LiteralPath $gameSettingsPath -Algorithm SHA256).Hash) {
+            throw "GTA settings verification failed: $gameSettingsPath"
+        }
+        Write-Host "Installed Free Aim and the tested VR graphics/gameplay settings." -ForegroundColor Green
+        Write-Host "Recovery copy: $recoveryCopy" -ForegroundColor Green
+    }
 
     $installedDll = Join-Path $ProfilePath "plugins\UEVR_GTASADE.dll"
     if (-not (Test-Path -LiteralPath $installedDll -PathType Leaf)) { throw "Plugin verification failed: $installedDll" }

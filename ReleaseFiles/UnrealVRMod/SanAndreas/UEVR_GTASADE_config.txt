@@ -13,7 +13,7 @@ LeftHandedOnlyWhileOnFoot=true
 debugMod=false
 
 [Camera Settings :] -- Can be set directly ingame from uevr menu. The plugin will auto save each camera configuration for each vehicle type here
-OnFoot_DecoupledPitch=false
+OnFoot_DecoupledPitch=true
 OnFoot_LerpPitch=true
 OnFoot_LerpRoll=true
 OnFoot_LerpYaw=false
@@ -272,7 +272,7 @@ EnableBulletDamageResistance=true
 EnableAimCalibrationProbe=false
 EnableVrScope=true
 EnableChordPauseMenu=true
-EnableChordHudToggle=false
+EnableChordHudToggle=true
 EnablePauseUiAutoShow=true
 EnableFirstPersonCameraLock=true
 VehicleCamera_559_ForwardOffset=-24.623110
@@ -382,3 +382,9 @@ VehicleCamera_437_UpOffset=-2.007228
 VehicleCamera_466_ForwardOffset=-18.184982
 VehicleCamera_466_RightOffset=-11.392817
 VehicleCamera_466_UpOffset=0.000000
+VehicleCamera_600_ForwardOffset=-8.374761
+VehicleCamera_600_RightOffset=0.000000
+VehicleCamera_600_UpOffset=-8.324564
+VehicleCamera_606_ForwardOffset=-17.182253
+VehicleCamera_606_RightOffset=-0.942286
+VehicleCamera_606_UpOffset=-2.508350

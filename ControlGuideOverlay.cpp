@@ -14,6 +14,7 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "gdi32.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -43,7 +44,28 @@ namespace {
 
 void ControlGuideOverlay::SetVisible(bool value)
 {
-	visible.store(value, std::memory_order_release);
+	const bool wasVisible = visible.exchange(value, std::memory_order_acq_rel);
+	if (value && !wasVisible)
+		dx11WarmupFrames.store(2, std::memory_order_release);
+	else if (!value)
+		dx11WarmupFrames.store(0, std::memory_order_release);
+}
+
+void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, uint32_t selected)
+{
+	std::scoped_lock lock(stateMutex);
+	selected = (std::min)(selected, 1U);
+	if (movementOrientation == orientation && hudAutoHide == autoHide
+		&& selectedOption == selected && !basePixels.empty())
+		return;
+	movementOrientation = orientation;
+	hudAutoHide = autoHide;
+	selectedOption = selected;
+	if (!basePixels.empty() && ComposeOptionsPanel())
+	{
+		ReleaseDx12();
+		ReleaseDx11();
+	}
 }
 
 bool ControlGuideOverlay::IsVisible() const
@@ -110,25 +132,138 @@ float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target { return t.Sampl
 void ControlGuideOverlay::RenderDx11(ID3D11DeviceContext* context, ID3D11Texture2D* renderTarget,
 	ID3D11RenderTargetView* renderTargetView)
 {
-	if (!IsVisible() || !context || !renderTarget || !renderTargetView) return;
+	(void)renderTargetView;
+	if (!IsVisible() || !context) return;
+	uint32_t warmup = dx11WarmupFrames.load(std::memory_order_acquire);
+	while (warmup > 0)
+	{
+		if (dx11WarmupFrames.compare_exchange_weak(
+			warmup, warmup - 1, std::memory_order_acq_rel, std::memory_order_acquire))
+			return;
+	}
 	std::scoped_lock lock(stateMutex);
 	ComPtr<ID3D11Device> device; context->GetDevice(&device);
 	if (!InitializeDx11(device.Get())) {
 		static bool logged=false; if (!logged) { logged=true; uevr::API::get()->log_error("[ControlGuide] D3D11 initialization failed"); }
 		return;
 	}
-	D3D11_TEXTURE2D_DESC td{}; renderTarget->GetDesc(&td);
+	// The post-framework callback texture is the desktop/framework surface, not
+	// necessarily the texture UEVR submits as the in-headset UI layer. Draw onto
+	// UEVR's own UI render target so the guide follows the normal VR compositor.
+	auto uiTextureHandle = uevr::API::StereoHook::get_ui_render_target();
+	auto uiTarget = uiTextureHandle != nullptr
+		? static_cast<ID3D11Texture2D*>(uiTextureHandle->get_native_resource()) : nullptr;
+	if (uiTarget == nullptr)
+	{
+		static bool loggedMissing = false;
+		if (!loggedMissing)
+		{
+			loggedMissing = true;
+			uevr::API::get()->log_error("[ControlGuide] UEVR UI render target unavailable");
+		}
+		return;
+	}
+	D3D11_TEXTURE2D_DESC td{};
+	uiTarget->GetDesc(&td);
+	const DXGI_FORMAT uiViewFormat = td.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+		? DXGI_FORMAT_B8G8R8A8_UNORM : td.Format;
+	D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+	rtvDesc.Format = uiViewFormat;
+	if (td.SampleDesc.Count > 1)
+	{
+		if (td.ArraySize > 1)
+		{
+			rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+			rtvDesc.Texture2DMSArray.FirstArraySlice = 0;
+			rtvDesc.Texture2DMSArray.ArraySize = td.ArraySize;
+		}
+		else
+			rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+	}
+	else if (td.ArraySize > 1)
+	{
+		rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+		rtvDesc.Texture2DArray.MipSlice = 0;
+		rtvDesc.Texture2DArray.FirstArraySlice = 0;
+		rtvDesc.Texture2DArray.ArraySize = td.ArraySize;
+	}
+	else
+	{
+		rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		rtvDesc.Texture2D.MipSlice = 0;
+	}
+	ComPtr<ID3D11RenderTargetView> guideRenderTargetView;
+	const HRESULT rtvResult = device->CreateRenderTargetView(
+		uiTarget, &rtvDesc, &guideRenderTargetView);
+	if (FAILED(rtvResult))
+	{
+		static bool loggedFailure = false;
+		if (!loggedFailure)
+		{
+			loggedFailure = true;
+			uevr::API::get()->log_error(
+				"[ControlGuide] typed UI RTV failed hr=0x%08X width=%u height=%u resourceFormat=%u viewFormat=%u bind=0x%X samples=%u",
+				static_cast<unsigned int>(rtvResult), td.Width, td.Height,
+				static_cast<unsigned int>(td.Format), static_cast<unsigned int>(rtvDesc.Format),
+				td.BindFlags, td.SampleDesc.Count);
+		}
+		return;
+	}
+
 	float w=(float)td.Width, h=(float)td.Height, dw=w, dh=h;
 	if (w/h > GuideAspect) dw=h*GuideAspect; else dh=w/GuideAspect;
 	D3D11_VIEWPORT vp{(w-dw)*0.5f,(h-dh)*0.5f,dw,dh,0,1};
 	D3D11_RECT sc{(LONG)vp.TopLeftX,(LONG)vp.TopLeftY,(LONG)std::ceil(vp.TopLeftX+dw),(LONG)std::ceil(vp.TopLeftY+dh)};
-	const float black[4]{0,0,0,1}; context->ClearRenderTargetView(renderTargetView, black);
-	context->OMSetRenderTargets(1, &renderTargetView, nullptr); context->RSSetViewports(1,&vp); context->RSSetScissorRects(1,&sc);
+	ComPtr<ID3D11RenderTargetView> previousRtv;
+	ComPtr<ID3D11DepthStencilView> previousDsv;
+	context->OMGetRenderTargets(1, &previousRtv, &previousDsv);
+	UINT previousViewportCount = 1;
+	D3D11_VIEWPORT previousViewport{};
+	context->RSGetViewports(&previousViewportCount, &previousViewport);
+	UINT previousScissorCount = 1;
+	D3D11_RECT previousScissor{};
+	context->RSGetScissorRects(&previousScissorCount, &previousScissor);
+	ComPtr<ID3D11InputLayout> previousInputLayout;
+	context->IAGetInputLayout(&previousInputLayout);
+	D3D11_PRIMITIVE_TOPOLOGY previousTopology{};
+	context->IAGetPrimitiveTopology(&previousTopology);
+	ComPtr<ID3D11VertexShader> previousVs;
+	context->VSGetShader(&previousVs, nullptr, nullptr);
+	ComPtr<ID3D11PixelShader> previousPs;
+	context->PSGetShader(&previousPs, nullptr, nullptr);
+	ComPtr<ID3D11ShaderResourceView> previousSrv;
+	context->PSGetShaderResources(0, 1, &previousSrv);
+	ComPtr<ID3D11SamplerState> previousSampler;
+	context->PSGetSamplers(0, 1, &previousSampler);
+
+	ID3D11RenderTargetView* guideRtv = guideRenderTargetView.Get();
+	const float black[4]{0,0,0,1}; context->ClearRenderTargetView(guideRtv, black);
+	context->OMSetRenderTargets(1, &guideRtv, nullptr); context->RSSetViewports(1,&vp); context->RSSetScissorRects(1,&sc);
 	context->IASetInputLayout(nullptr); context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	context->VSSetShader(vertexShader11.Get(),nullptr,0); context->PSSetShader(pixelShader11.Get(),nullptr,0);
 	ID3D11ShaderResourceView* srv=textureView11.Get(); ID3D11SamplerState* samp=sampler11.Get();
 	context->PSSetShaderResources(0,1,&srv); context->PSSetSamplers(0,1,&samp); context->Draw(3,0);
-	static bool logged=false; if (!logged) { logged=true; uevr::API::get()->log_info("[ControlGuide] D3D11 overlay rendered"); }
+
+	ID3D11ShaderResourceView* previousSrvRaw = previousSrv.Get();
+	ID3D11SamplerState* previousSamplerRaw = previousSampler.Get();
+	ID3D11RenderTargetView* previousRtvRaw = previousRtv.Get();
+	context->PSSetShaderResources(0, 1, &previousSrvRaw);
+	context->PSSetSamplers(0, 1, &previousSamplerRaw);
+	context->VSSetShader(previousVs.Get(), nullptr, 0);
+	context->PSSetShader(previousPs.Get(), nullptr, 0);
+	context->IASetInputLayout(previousInputLayout.Get());
+	context->IASetPrimitiveTopology(previousTopology);
+	if (previousViewportCount > 0) context->RSSetViewports(1, &previousViewport);
+	if (previousScissorCount > 0) context->RSSetScissorRects(1, &previousScissor);
+	context->OMSetRenderTargets(1, &previousRtvRaw, previousDsv.Get());
+	static bool logged=false; if (!logged) {
+		logged=true;
+		uevr::API::get()->log_info(
+			"[ControlGuide] D3D11 typed UEVR UI overlay rendered path=framework-present callbackTarget=%p uiTarget=%p width=%u height=%u array=%u resourceFormat=%u viewFormat=%u samples=%u",
+			renderTarget, uiTarget, td.Width, td.Height, td.ArraySize,
+			static_cast<unsigned int>(td.Format), static_cast<unsigned int>(uiViewFormat),
+			td.SampleDesc.Count);
+	}
 }
 
 bool ControlGuideOverlay::LoadImage()
@@ -190,9 +325,147 @@ bool ControlGuideOverlay::LoadImage()
 			static_cast<unsigned int>(result), path.c_str());
 		return false;
 	}
+	basePixels = pixels;
+	if (!ComposeOptionsPanel())
+		pixels = basePixels;
 
 	uevr::API::get()->log_info("[ControlGuide] image loaded size=%ux%u path=%ls",
 		imageWidth, imageHeight, path.c_str());
+	return true;
+}
+
+bool ControlGuideOverlay::ComposeOptionsPanel()
+{
+	if (basePixels.empty() || imageWidth == 0 || imageHeight == 0
+		|| basePixels.size() != static_cast<size_t>(imageWidth) * imageHeight * 4)
+		return false;
+
+	BITMAPINFO bitmapInfo{};
+	bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(imageWidth);
+	bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(imageHeight);
+	bitmapInfo.bmiHeader.biPlanes = 1;
+	bitmapInfo.bmiHeader.biBitCount = 32;
+	bitmapInfo.bmiHeader.biCompression = BI_RGB;
+	void* dibBits = nullptr;
+	HDC dc = CreateCompatibleDC(nullptr);
+	HBITMAP bitmap = dc != nullptr
+		? CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, &dibBits, nullptr, 0) : nullptr;
+	if (dc == nullptr || bitmap == nullptr || dibBits == nullptr)
+	{
+		if (bitmap != nullptr) DeleteObject(bitmap);
+		if (dc != nullptr) DeleteDC(dc);
+		return false;
+	}
+
+	auto* bgra = static_cast<uint8_t*>(dibBits);
+	for (size_t pixel = 0; pixel < static_cast<size_t>(imageWidth) * imageHeight; ++pixel)
+	{
+		bgra[pixel * 4 + 0] = basePixels[pixel * 4 + 2];
+		bgra[pixel * 4 + 1] = basePixels[pixel * 4 + 1];
+		bgra[pixel * 4 + 2] = basePixels[pixel * 4 + 0];
+		bgra[pixel * 4 + 3] = 255;
+	}
+
+	const HGDIOBJ oldBitmap = SelectObject(dc, bitmap);
+	SetBkMode(dc, TRANSPARENT);
+	// Keep the interactive settings in the unused strip below the title. This
+	// avoids covering any of the permanent controller, camera, or VR-tip text.
+	const RECT panel{ 610, 176, 1310, 252 };
+	HBRUSH panelBrush = CreateSolidBrush(RGB(3, 10, 4));
+	FillRect(dc, &panel, panelBrush);
+	DeleteObject(panelBrush);
+	HPEN borderPen = CreatePen(PS_SOLID, 3, RGB(115, 165, 20));
+	const HGDIOBJ oldPen = SelectObject(dc, borderPen);
+	const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+	Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
+
+	HFONT titleFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_SWISS, L"Arial");
+	HFONT optionFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_SWISS, L"Arial");
+	HFONT footerFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_SWISS, L"Arial");
+	if (titleFont == nullptr || optionFont == nullptr || footerFont == nullptr)
+	{
+		if (titleFont != nullptr) DeleteObject(titleFont);
+		if (optionFont != nullptr) DeleteObject(optionFont);
+		if (footerFont != nullptr) DeleteObject(footerFont);
+		SelectObject(dc, oldBrush);
+		SelectObject(dc, oldPen);
+		DeleteObject(borderPen);
+		SelectObject(dc, oldBitmap);
+		DeleteObject(bitmap);
+		DeleteDC(dc);
+		return false;
+	}
+
+	const HGDIOBJ oldFont = SelectObject(dc, titleFont);
+	SetTextColor(dc, RGB(226, 166, 61));
+	RECT titleRect{ panel.left + 12, panel.top + 4, panel.right - 12, panel.top + 28 };
+	DrawTextW(dc, L"VR OPTIONS   -   LEFT STICK: SELECT   -   A: CHANGE", -1, &titleRect,
+		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+	SelectObject(dc, optionFont);
+	for (uint32_t index = 0; index < 2; ++index)
+	{
+		const LONG halfWidth = (panel.right - panel.left - 30) / 2;
+		RECT row{ panel.left + 10 + static_cast<LONG>(index) * (halfWidth + 10), panel.top + 31,
+			panel.left + 10 + static_cast<LONG>(index) * (halfWidth + 10) + halfWidth, panel.bottom - 8 };
+		if (index == selectedOption)
+		{
+			HBRUSH selectedBrush = CreateSolidBrush(RGB(35, 58, 12));
+			FillRect(dc, &row, selectedBrush);
+			DeleteObject(selectedBrush);
+		}
+		SetTextColor(dc, index == selectedOption ? RGB(245, 245, 220) : RGB(205, 215, 198));
+		if (index == 0)
+		{
+			const wchar_t* state = movementOrientation == 1 ? L"HEAD / HMD"
+				: movementOrientation == 0 ? L"STANDARD" : L"CUSTOM";
+			std::wstring label = L"BODY ORIENTATION: ";
+			label += state;
+			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
+			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+		}
+		else
+		{
+			std::wstring label = L"HUD AUTO-HIDE: ";
+			label += hudAutoHide ? L"ON" : L"OFF";
+			SetTextColor(dc, hudAutoHide ? RGB(139, 208, 36) : RGB(210, 85, 65));
+			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
+			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+		}
+	}
+
+	SelectObject(dc, footerFont);
+	SetTextColor(dc, RGB(235, 35, 54));
+	RECT footerRect{ 730, 371, 1190, 402 };
+	DrawTextW(dc, L"AND VR OPTIONS", -1, &footerRect,
+		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+	pixels.resize(basePixels.size());
+	for (size_t pixel = 0; pixel < static_cast<size_t>(imageWidth) * imageHeight; ++pixel)
+	{
+		pixels[pixel * 4 + 0] = bgra[pixel * 4 + 2];
+		pixels[pixel * 4 + 1] = bgra[pixel * 4 + 1];
+		pixels[pixel * 4 + 2] = bgra[pixel * 4 + 0];
+		pixels[pixel * 4 + 3] = 255;
+	}
+
+	SelectObject(dc, oldFont);
+	DeleteObject(titleFont);
+	DeleteObject(optionFont);
+	DeleteObject(footerFont);
+	SelectObject(dc, oldBrush);
+	SelectObject(dc, oldPen);
+	DeleteObject(borderPen);
+	SelectObject(dc, oldBitmap);
+	DeleteObject(bitmap);
+	DeleteDC(dc);
 	return true;
 }
 
