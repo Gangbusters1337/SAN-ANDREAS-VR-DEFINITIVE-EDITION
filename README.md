@@ -14,7 +14,7 @@ The included profile is tuned for sharp visuals and good performance, with plent
 
 The big difference is how physical the game feels:
 
-- **All weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
+- **All aimable weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
 - **Two-handed aiming and stabilization:** grip rifles and shotguns with both hands, steady the rear grip, and use the forward hand to guide the barrel.
 - **Animated VR hands:** controller-tracked open, grip, trigger, and clenched-hand poses keep the hands feeling connected to what you are doing.
 - **Refined, accurate melee:** swing bats and melee weapons, punch with either fist, and fight with a melee weapon in one hand while the other hand fights freely.
@@ -54,7 +54,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 
 ### Weapons and hands
 
-- **All weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
+- **All aimable weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
 - **Two-handed aiming and stabilization:** grip rifles, shotguns, and other long weapons with both hands and steady the rear grip while the forward hand guides the barrel.
 - **Animated controller-tracked hands:** open, grip, trigger, and clenched-hand poses follow what you are actually doing.
 - **Refined physical melee:** fists, brass knuckles, bats, and melee weapons support independent left/right hand fighting, including a melee weapon in one hand and a fist in the other.
