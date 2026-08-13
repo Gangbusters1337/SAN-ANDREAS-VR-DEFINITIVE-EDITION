@@ -14,13 +14,17 @@ The included profile is tuned for sharp visuals and good performance, with plent
 
 The big difference is how physical the game feels:
 
-- Point and fire firearms naturally with either controller, with weapon-origin aiming and visible shot trails.
-- Grip shotguns and rifles with both hands and stabilize the barrel instead of fighting a flat-screen crosshair.
-- Swing bats and melee weapons, punch with either fist, and use brass knuckles with independent hand control.
-- Fight and aim from supported vehicles while keeping normal driving and acceleration available.
-- Store weapons around the waist with per-weapon recall and use per-vehicle camera positions.
-- Use the auto-hiding HUD, the A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
-- Enjoy sharper textures, cleaner effects, a usable VR sniper scope, improved muzzle presentation, and graphics settings that leave room for extra quality.
+- **All weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
+- **Two-handed aiming and stabilization:** grip rifles and shotguns with both hands, steady the rear grip, and use the forward hand to guide the barrel.
+- **Animated VR hands:** controller-tracked open, grip, trigger, and clenched-hand poses keep the hands feeling connected to what you are doing.
+- **Refined, accurate melee:** swing bats and melee weapons, punch with either fist, and fight with a melee weapon in one hand while the other hand fights freely.
+- **Punch and melee weapon sound effects:** hits feel physical, with distinct feedback for fists, knuckles, blunt weapons, sharp weapons, and vehicles.
+- **Excellent vehicle free aim:** aim and fire from supported cars and bikes while keeping driving controls available.
+- **Great-feeling driving controls:** drive, steer, accelerate, brake, and use vehicle weapons without fighting the VR controls.
+- **Custom refined flight controls:** aircraft handling and VR camera controls are tuned separately from ground vehicles.
+- **Natural weapon handling:** drop weapons into magnetic waist holsters, recall them per weapon, and keep two-hand grips stable through regrips.
+- **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
+- **Sharper, clearer visuals:** improved textures, scope and muzzle presentation, cleaner effects, and graphics settings that leave room for extra quality.
 
 This is still beta software, so back up your existing UEVR `SanAndreas` profile before installing. A few missions, unusual vehicles, and weapon combinations may still need refinement.
 
@@ -45,18 +49,17 @@ The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in b
 
 See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 
-## Why this build feels different
+## What you get in VR
 
-- **Full free aim:** point and fire naturally with either hand instead of steering a conventional crosshair.
-- **Two-handed weapons:** shoulder shotguns and rifles, then use the forward hand to stabilize and direct the barrel.
-- **Physical fighting:** motion-tracked bare fists, brass knuckles, bats, and melee weapons turn close combat into a genuine VR interaction.
-- **Responsive combat feedback:** independent left/right strikes, motion-gated fist contact, weapon-aware impact sounds, and buffered semi-automatic trigger taps make combat more immediate without replacing GTA's native ammo, damage, recoil, or weapon cadence.
-- **Free aim while driving:** keep driving normally while independently aiming and firing supported submachine guns through the vehicle window.
-- **High-definition clarity:** VR-oriented texture, cvar, scope, reticle, muzzle-flash, and rendering choices deliver a much cleaner image.
-- **Performance-aware tuning:** strong visual quality without needlessly spending all available GPU headroom, with room for stronger systems to push texture quality further.
-- **Immersive interface:** an auto-hiding HUD reveals itself when useful and disappears when you want an unobstructed view of San Andreas.
-- **Intuitive Quest controls:** weapon handling, HUD gestures, vehicle firing, camera controls, phone interactions, and contextual D-pad actions are designed around motion controllers.
-- **Per-vehicle comfort:** camera offsets are remembered by vehicle model so cars, bikes, boats, and aircraft can retain their own tuned viewpoint.
+- **Full motion-tracked weapon handling** across firearms and melee weapons.
+- **Two-handed aiming and stabilization** for rifles, shotguns, and other long weapons.
+- **Animated controller-tracked hands** with open, grip, trigger, and clenched-hand presentation.
+- **Accurate physical melee** with fists, brass knuckles, bats, and weapon-plus-fist combinations.
+- **Punch and melee weapon sound FX** with clear contact feedback.
+- **Free aim in cars** with a strong, natural-feeling driving setup.
+- **Custom flight controls** tuned for aircraft rather than copied from ground movement.
+- **Per-vehicle camera comfort**, auto-hide HUD behavior, phone interactions, and an in-game control guide.
+- **Sharper high-definition presentation** with a usable sniper scope and room to raise graphics settings on stronger PCs.
 
 Physical grenade/Molotov throwing is not enabled in this beta; throwables retain GTA's native handling while the motion implementation remains under development.
 
