@@ -6,15 +6,23 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.1** — Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.2** - Click the control guide above to open the full-resolution image.
 
-Experience San Andreas in glorious high-definition VR: dramatically clearer, sharper, more immersive, and built around full motion-controller interaction. This unofficial beta enhancement package transforms **Grand Theft Auto: San Andreas – The Definitive Edition** through Praydog's UEVR.
+Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
-The included VR graphics profile is tuned for outstanding detail and strong performance, avoiding the worst visual artifacts while leaving capable PCs headroom to raise texture quality and other settings further. The HUD automatically gets out of your way, controls are designed to feel natural on motion controllers, and the world is presented with far greater clarity than a basic injected profile.
+The included profile is tuned for sharp visuals and good performance, with plenty of headroom left for stronger PCs to turn the graphics up. The HUD hides itself when you do not need it, the controls are built around Quest motion controllers, and the control guide is available both at startup and in VR.
 
-This is not just head tracking. Aim pistols freely, stabilize shotguns and rifles with both hands, swing bats and melee weapons using tracked physical motion, fight bare-knuckle with either fist, and aim submachine guns freely from inside supported vehicles. Weapon rays and visible trails follow the weapon itself instead of an invisible flat-screen crosshair.
+The big difference is how physical the game feels:
 
-> Beta software: back up your existing UEVR `SanAndreas` profile. Mission scripts, unusual vehicles, and some weapon combinations may still expose edge cases.
+- Point and fire firearms naturally with either controller, with weapon-origin aiming and visible shot trails.
+- Grip shotguns and rifles with both hands and stabilize the barrel instead of fighting a flat-screen crosshair.
+- Swing bats and melee weapons, punch with either fist, and use brass knuckles with independent hand control.
+- Fight and aim from supported vehicles while keeping normal driving and acceleration available.
+- Store weapons around the waist with per-weapon recall and use per-vehicle camera positions.
+- Use the auto-hiding HUD, the A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
+- Enjoy sharper textures, cleaner effects, a usable VR sniper scope, improved muzzle presentation, and graphics settings that leave room for extra quality.
+
+This is still beta software, so back up your existing UEVR `SanAndreas` profile before installing. A few missions, unusual vehicles, and weapon combinations may still need refinement.
 
 ## Requirements
 
@@ -25,26 +33,32 @@ This is not just head tracking. Aim pistols freely, stabilize shotguns and rifle
 
 ## Downloads
 
-Two separate archives are available from the GitHub release:
+The latest release has separate downloads for VRHub and regular users:
 
-- **`San-Andreas-VR-DE-v0.1-Manual.zip`** — transparent folder trees for users who prefer placing every file themselves.
-- **`San-Andreas-VR-DE-v0.1-Installer.zip`** — the same payload plus a Windows installer with `Auto Detect` and `Manual Path` modes.
+- **`San-Andreas-VR-DE-v0.2-LATEST-Manual.zip`** - versioned manual download.
+- **`San-Andreas-VR-DE-v0.2-LATEST-Installer.zip`** - versioned installer with `Auto Detect` and `Manual Path` modes.
+- **`San-Andreas-VR-DE-Manual.zip`** - plain manual filename for VRHub automation.
+
+Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA256SUMS.txt` covers every packaged file.
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the v0.1 changes.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 
 ## Why this build feels different
 
 - **Full free aim:** point and fire naturally with either hand instead of steering a conventional crosshair.
 - **Two-handed weapons:** shoulder shotguns and rifles, then use the forward hand to stabilize and direct the barrel.
 - **Physical fighting:** motion-tracked bare fists, brass knuckles, bats, and melee weapons turn close combat into a genuine VR interaction.
+- **Responsive combat feedback:** independent left/right strikes, motion-gated fist contact, weapon-aware impact sounds, and buffered semi-automatic trigger taps make combat more immediate without replacing GTA's native ammo, damage, recoil, or weapon cadence.
 - **Free aim while driving:** keep driving normally while independently aiming and firing supported submachine guns through the vehicle window.
 - **High-definition clarity:** VR-oriented texture, cvar, scope, reticle, muzzle-flash, and rendering choices deliver a much cleaner image.
 - **Performance-aware tuning:** strong visual quality without needlessly spending all available GPU headroom, with room for stronger systems to push texture quality further.
 - **Immersive interface:** an auto-hiding HUD reveals itself when useful and disappears when you want an unobstructed view of San Andreas.
 - **Intuitive Quest controls:** weapon handling, HUD gestures, vehicle firing, camera controls, phone interactions, and contextual D-pad actions are designed around motion controllers.
 - **Per-vehicle comfort:** camera offsets are remembered by vehicle model so cars, bikes, boats, and aircraft can retain their own tuned viewpoint.
+
+Physical grenade/Molotov throwing is not enabled in this beta; throwables retain GTA's native handling while the motion implementation remains under development.
 
 ## Installer
 
@@ -57,6 +71,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the v0.1 changes.
 5. Confirm the detected paths. The installer backs up the existing UEVR profile and GTA settings before copying files.
 
 The installer resolves Windows' real Documents known folder, including OneDrive redirection, and installs the tested GTA VR settings with Free Aim. It backs up the existing UEVR profile, GTA settings, and every game-folder file it replaces—including the original startup movie. Use the advanced `-SkipGameSettings` switch only if you deliberately want to retain your existing GTA graphics/gameplay configuration.
+
+Launch through the installed **GTA San Andreas DE VR** desktop, Start-menu, or taskbar shortcut. SAVR's guarded launcher prevents rapid double-clicks from starting two game instances and saves `GameUserSettings.SAVR-last-launch.ini` before each launch. The installer also upgrades existing user shortcuts and taskbar pins that point to the detected game executable. Do not pin or launch the raw `SanAndreas.exe` directly, because Windows shortcuts cannot intercept a direct executable launch without unsafe game-file or system-level modification.
 
 The installer never installs UEVR or the game.
 
