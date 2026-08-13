@@ -21,7 +21,8 @@ The big difference is how physical the game feels:
 - **Punch and melee weapon sound effects:** hits feel physical, with distinct feedback for fists, knuckles, blunt weapons, sharp weapons, and vehicles.
 - **Excellent vehicle free aim:** aim and fire from supported cars and bikes while keeping driving controls available.
 - **Great-feeling driving controls:** drive, steer, accelerate, brake, and use vehicle weapons without fighting the VR controls.
-- **Custom refined flight controls:** aircraft handling and VR camera controls are tuned separately from ground vehicles.
+- **Custom refined flight controls:** aircraft handling, Hydra VTOL support, and landing-gear camera feedback are tuned separately from ground vehicles.
+- **Vehicle cameras that remember you:** calibrate a car or other vehicle once and its camera position is saved and recalled automatically every time you get back in. Many cars, bikes, boats, and aircraft already have tuned profiles.
 - **Natural weapon handling:** drop weapons into magnetic waist holsters, recall them per weapon, and keep two-hand grips stable through regrips.
 - **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
 - **Sharper, clearer visuals:** improved textures, scope and muzzle presentation, cleaner effects, and graphics settings that leave room for extra quality.
@@ -51,15 +52,32 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 
 ## What you get in VR
 
-- **Full motion-tracked weapon handling** across firearms and melee weapons.
-- **Two-handed aiming and stabilization** for rifles, shotguns, and other long weapons.
-- **Animated controller-tracked hands** with open, grip, trigger, and clenched-hand presentation.
-- **Accurate physical melee** with fists, brass knuckles, bats, and weapon-plus-fist combinations.
-- **Punch and melee weapon sound FX** with clear contact feedback.
-- **Free aim in cars** with a strong, natural-feeling driving setup.
-- **Custom flight controls** tuned for aircraft rather than copied from ground movement.
-- **Per-vehicle camera comfort**, auto-hide HUD behavior, phone interactions, and an in-game control guide.
-- **Sharper high-definition presentation** with a usable sniper scope and room to raise graphics settings on stronger PCs.
+### Weapons and hands
+
+- **All weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
+- **Two-handed aiming and stabilization:** grip rifles, shotguns, and other long weapons with both hands and steady the rear grip while the forward hand guides the barrel.
+- **Animated controller-tracked hands:** open, grip, trigger, and clenched-hand poses follow what you are actually doing.
+- **Refined physical melee:** fists, brass knuckles, bats, and melee weapons support independent left/right hand fighting, including a melee weapon in one hand and a fist in the other.
+- **Punch and melee weapon sound FX:** clear contact feedback for fists, knuckles, blunt weapons, sharp weapons, and vehicle impacts.
+- **Natural holsters:** drop weapons into lowered magnetic waist positions, keep their remembered per-weapon placement, and regrip without losing the correct hand relationship.
+- **Sniper and long-gun polish:** usable scope presentation, steadier two-hand handling, improved muzzle presentation, and cleaner weapon visibility.
+
+### Cars, bikes, boats, and aircraft
+
+- **Free aim in cars:** aim and fire supported vehicle weapons while keeping acceleration and driving controls available.
+- **Great-feeling driving controls:** steering, acceleration, braking, vehicle hands, bicycle pedals, motorbike handling, and vehicle firing are separated so they do not fight each other.
+- **Camera calibration that sticks:** open the UEVR camera controls, position the view once, and the mod saves it per vehicle model and restores it automatically on future entries.
+- **Many pre-calibrated vehicles:** tuned profiles are included for a broad set of cars and other vehicle types; uncalibrated models fall back safely and can be adjusted the same way.
+- **Custom refined flight controls:** aircraft controls stay native where appropriate, with Hydra VTOL support, aircraft-specific input handling, and brief exterior-camera feedback for supported landing-gear changes.
+- **HMD-oriented movement support:** use the UEVR body/movement option that suits your standing or seated setup while retaining stick locomotion.
+
+### Comfort, controls, and presentation
+
+- **Auto-hiding HUD for maximum immersion in sunny San Andreas:** show it with the left touch, pin or unpin it with a double-tap, and use the touch modifier with the right stick for contextual D-pad actions.
+- **In-game control guide:** A+X opens the Quest 3 layout and quick VR options without needing to leave the game.
+- **Useful interaction shortcuts:** phone answering, pause controls, camera switching, weapon cycling, vehicle fire, and aircraft-specific controls are mapped for motion controllers.
+- **Sharper high-definition VR:** improved textures, scope and reticle clarity, cleaner effects, better muzzle flashes, and graphics settings with headroom for stronger PCs.
+- **Installer safety:** Auto Detect and Manual Path modes, OneDrive-aware profile handling, backups, guarded single-instance launching, and package hashes help protect existing settings.
 
 Physical grenade/Molotov throwing is not enabled in this beta; throwables retain GTA's native handling while the motion implementation remains under development.
 
