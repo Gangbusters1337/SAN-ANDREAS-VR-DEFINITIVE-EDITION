@@ -1,21 +1,29 @@
 # Changelog
 
-## v0.1.0-beta — San Andreas VR Definitive Edition Pre-Release Beta
+## v0.2.0-beta — San Andreas VR Definitive Edition Latest Beta
 
-This release candidate updates the original public pre-release beta with the tested interaction, presentation, control, and packaging work completed since that build.
+This beta brings the tested interaction, presentation, control, graphics, and packaging improvements together in one easier-to-install release.
 
 ### VR interaction and combat
 
 - Reworked physical melee around swept motion contact instead of synthetic trigger attacks.
 - Added native pedestrian damage and reactions for supported melee weapons, brass knuckles, and independent bare-fist strikes.
 - Added two-hand fist and one-knuckle/one-fist fighting while preventing trigger input from starting unwanted native punching.
-- Improved fast-swing contact coverage, per-swing target deduplication, cooldown behavior, and transition cleanup.
+- Added independent weapon-hand/free-fist combinations for held melee weapons, so both hands retain separate strike ownership and cooldowns.
+- Improved fast-swing contact coverage, short forward prediction, per-swing target deduplication, cooldown behavior, and transition cleanup.
+- Required real tracking-space movement for fist and brass-knuckle damage, preventing pedestrians from taking damage simply by walking into a stationary clenched hand.
+- Added weapon-aware contact audio for fists/knuckles, blunt weapons, sharp weapons, and vehicles, with safe packaged-asset fallbacks.
+- Removed the melee collision visualizer from normal play.
+- Added split left/right clenched-hand assets and controller-tracked presentation without the duplicate attached hand from the original native two-hand mesh.
 - Corrected two-hand rifle/shotgun attachment roles, rear-hand orientation, regrip behavior, and support-hand stability.
 - Preserved full weapon-origin damage rays and visible trails for normal and supported vehicle firing.
+- Added a bounded single-request buffer for rapid semi-automatic trigger taps so a valid pull is not discarded merely because GTA is still finishing the previous shot's cooldown.
+- Limited first-shot fire-task prewarming to pistols and SMGs, avoiding the slow ready-walk stance when merely gripping shotguns or rifles.
 
 ### Controls and HUD
 
 - Added the large A+X in-game control guide with quick VR options.
+- Guarded the A+X close action so closing the guide cannot also change the highlighted quick option.
 - Consolidated HUD interaction on the left thumb rest: tap for timed HUD, double-tap to pin/unpin, and hold with the right stick for contextual D-pad input.
 - Added touch feedback patterns and action-handle recovery after UEVR device/session resets.
 - Preserved A as vehicle fire while keeping the right trigger as accelerator.
@@ -34,8 +42,10 @@ This release candidate updates the original public pre-release beta with the tes
 
 - Updated the tested GTA graphics/gameplay settings and UEVR profile shipped with the release.
 - Added installer Auto Detect and Manual Path modes with OneDrive-aware Documents resolution.
+- Added a guarded launcher for desktop, Start-menu, and upgraded taskbar shortcuts to prevent accidental duplicate game launches and preserve a last-launch GTA settings recovery copy.
 - Added backups for the existing UEVR profile, GTA settings, and every game-folder file replaced by the installer.
 - Added clean-install verification for both installer modes and checksum verification for the manual archive.
+- Kept the stable archive names `San-Andreas-VR-DE-Manual.zip` and `San-Andreas-VR-DE-Installer.zip`; exact version and hashes are stored inside each archive.
 - Kept internal snapshots, logs, dumps, personal paths, development instructions, and game executables out of the public repository and release archives.
 
 ### Beta limitations
@@ -43,4 +53,5 @@ This release candidate updates the original public pre-release beta with the tes
 - This remains a pre-release beta tested primarily with Quest Touch-style controls and the supported SanAndreas executable listed in the README.
 - Some missions, uncommon vehicles, weapon combinations, and uncalibrated cameras may still require refinement.
 - Structural vehicle deformation from physical melee is not claimed; pedestrian melee reactions are currently the more complete path.
+- Physical grenade/Molotov throwing remains disabled; this beta keeps GTA's native throwable behavior.
 - Grip calibration and experimental options remain available through the UEVR/plugin settings for users who need them.
