@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <functional>
 #include <filesystem>
 #include <fstream>
@@ -30,9 +31,19 @@ namespace
 		bool bPropagateToChildren = true;
 	};
 
+	struct ParameterSetScale3D {
+		glm::fvec3 newScale3D = { 1.0f, 1.0f, 1.0f };
+	};
+
 	struct ParameterGetLocalBounds {
 		glm::fvec3 min{};
 		glm::fvec3 max{};
+	};
+
+	struct ReflectedScriptArray {
+		void* data = nullptr;
+		int32_t count = 0;
+		int32_t capacity = 0;
 	};
 
 	glm::fvec3 NormalizeOrZero(const glm::fvec3& value)
@@ -283,6 +294,32 @@ namespace
 		Utilities::FRotator returnValue{};
 	};
 
+	// The custom hand-thrown bottle deliberately uses some of the same reflected
+	// SpawnExplosion helpers as the game. Keep a per-thread suppression depth so
+	// a passive observer can distinguish our own setup calls from a genuine
+	// native Molotov trigger. This changes neither call nor result.
+	thread_local uint32_t motionThrowableNativeProbeSuppressDepth = 0;
+
+	class ScopedMotionThrowableNativeProbeSuppression
+	{
+	public:
+		ScopedMotionThrowableNativeProbeSuppression()
+		{
+			++motionThrowableNativeProbeSuppressDepth;
+		}
+
+		~ScopedMotionThrowableNativeProbeSuppression()
+		{
+			if (motionThrowableNativeProbeSuppressDepth > 0)
+				--motionThrowableNativeProbeSuppressDepth;
+		}
+
+		ScopedMotionThrowableNativeProbeSuppression(
+			const ScopedMotionThrowableNativeProbeSuppression&) = delete;
+		ScopedMotionThrowableNativeProbeSuppression& operator=(
+			const ScopedMotionThrowableNativeProbeSuppression&) = delete;
+	};
+
 	uevr::API::FProperty* FindFunctionParameter(uevr::API::UFunction* function, const wchar_t* name)
 	{
 		return function != nullptr ? function->find_property(name) : nullptr;
@@ -337,6 +374,54 @@ namespace
 		return true;
 	}
 
+	bool SetReflectedFloatParameter(uevr::API::UFunction* function,
+		std::vector<uint8_t>& params, const wchar_t* name, float value)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"FloatProperty"
+			|| static_cast<size_t>(property->get_offset()) + sizeof(value) > params.size()
+			|| !std::isfinite(value))
+			return false;
+		std::memcpy(params.data() + property->get_offset(), &value, sizeof(value));
+		return true;
+	}
+
+	bool SetReflectedVectorParameter(uevr::API::UFunction* function,
+		std::vector<uint8_t>& params, const wchar_t* name, const glm::fvec3& value)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"StructProperty"
+			|| !IsFiniteVector(value))
+			return false;
+		auto structProperty = reinterpret_cast<uevr::API::FStructProperty*>(property);
+		const int32_t structSize = structProperty->get_struct() != nullptr
+			? structProperty->get_struct()->get_struct_size() : 0;
+		if (structSize < static_cast<int32_t>(sizeof(value))
+			|| static_cast<size_t>(property->get_offset()) + structSize > params.size())
+			return false;
+		std::memset(params.data() + property->get_offset(), 0, structSize);
+		std::memcpy(params.data() + property->get_offset(), &value, sizeof(value));
+		return true;
+	}
+
+	bool SetReflectedArrayParameter(uevr::API::UFunction* function,
+		std::vector<uint8_t>& params, const wchar_t* name, void* data, int32_t count)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"ArrayProperty"
+			|| static_cast<size_t>(property->get_offset()) + sizeof(ReflectedScriptArray) > params.size())
+			return false;
+		ReflectedScriptArray value{ data, count, count };
+		std::memcpy(params.data() + property->get_offset(), &value, sizeof(value));
+		return true;
+	}
+
 	bool SetReflectedByteParameter(uevr::API::UFunction* function, std::vector<uint8_t>& params,
 		const wchar_t* name, uint8_t value)
 	{
@@ -382,6 +467,35 @@ namespace
 		return true;
 	}
 
+	bool SetReflectedTransformParameter(uevr::API::UFunction* function, std::vector<uint8_t>& params,
+		const wchar_t* name, const glm::fvec3& position, const glm::fquat& rotation,
+		const glm::fvec3& scale = glm::fvec3(1.0f))
+	{
+		auto property = FindFunctionParameter(function, name);
+		const auto propertyClassName = property != nullptr && property->get_class() != nullptr
+			? property->get_class()->get_fname()->to_string() : L"";
+		if (propertyClassName != L"StructProperty" || property->get_offset() < 0)
+			return false;
+		auto structProperty = reinterpret_cast<uevr::API::FStructProperty*>(property);
+		const int32_t structSize = structProperty->get_struct() != nullptr
+			? structProperty->get_struct()->get_struct_size() : 0;
+		if (structSize < 40 || static_cast<size_t>(property->get_offset()) + structSize > params.size()
+			|| !IsFiniteVector(position) || !IsFiniteQuaternion(rotation)
+			|| !IsFiniteVector(scale))
+			return false;
+		std::memset(params.data() + property->get_offset(), 0, structSize);
+		const glm::fquat normalized = glm::normalize(rotation);
+		// UE4 FTransform: quaternion XYZW, 16-byte aligned translation, then scale.
+		const float transform[12] = {
+			normalized.x, normalized.y, normalized.z, normalized.w,
+			position.x, position.y, position.z, 0.0f,
+			scale.x, scale.y, scale.z, 0.0f
+		};
+		std::memcpy(params.data() + property->get_offset(), transform,
+			(std::min)(static_cast<size_t>(structSize), sizeof(transform)));
+		return true;
+	}
+
 	bool ReadReflectedObjectReturn(uevr::API::UFunction* function, const std::vector<uint8_t>& params,
 		uevr::API::UObject*& value)
 	{
@@ -391,6 +505,184 @@ namespace
 			return false;
 		std::memcpy(&value, params.data() + property->get_offset(), sizeof(value));
 		return true;
+	}
+
+	bool ReadReflectedObjectParameter(uevr::API::UFunction* function,
+		const std::vector<uint8_t>& params, const wchar_t* name, uevr::API::UObject*& value)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0
+			|| static_cast<size_t>(property->get_offset()) + sizeof(value) > params.size())
+			return false;
+		std::memcpy(&value, params.data() + property->get_offset(), sizeof(value));
+		return true;
+	}
+
+	bool ReadReflectedBoolParameter(uevr::API::UFunction* function,
+		const std::vector<uint8_t>& params, const wchar_t* name, bool& value)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0)
+			return false;
+		const auto propertyClassName = property->get_class() != nullptr
+			? property->get_class()->get_fname()->to_string() : L"";
+		if (propertyClassName == L"BoolProperty")
+		{
+			auto boolProperty = reinterpret_cast<uevr::API::FBoolProperty*>(property);
+			const size_t byteIndex = static_cast<size_t>(property->get_offset())
+				+ boolProperty->get_byte_offset();
+			if (byteIndex >= params.size())
+				return false;
+			value = (params[byteIndex]
+				& static_cast<uint8_t>(boolProperty->get_byte_mask())) != 0;
+			return true;
+		}
+		if (static_cast<size_t>(property->get_offset()) + sizeof(bool) > params.size())
+			return false;
+		std::memcpy(&value, params.data() + property->get_offset(), sizeof(value));
+		return true;
+	}
+
+	bool ReadReflectedVectorField(uevr::API::UFunction* function,
+		const std::vector<uint8_t>& params, const wchar_t* structParameterName,
+		const wchar_t* fieldName, glm::fvec3& value)
+	{
+		auto property = FindFunctionParameter(function, structParameterName);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"StructProperty")
+			return false;
+		auto structProperty = reinterpret_cast<uevr::API::FStructProperty*>(property);
+		auto scriptStruct = structProperty->get_struct();
+		if (scriptStruct == nullptr)
+			return false;
+		auto field = scriptStruct->find_property(fieldName);
+		if (field == nullptr || field->get_offset() < 0
+			|| static_cast<size_t>(field->get_offset()) + sizeof(value)
+				> static_cast<size_t>(scriptStruct->get_struct_size()))
+			return false;
+		const size_t byteIndex = static_cast<size_t>(property->get_offset())
+			+ static_cast<size_t>(field->get_offset());
+		if (byteIndex + sizeof(value) > params.size())
+			return false;
+		std::memcpy(&value, params.data() + byteIndex, sizeof(value));
+		return IsFiniteVector(value);
+	}
+
+	bool ReadReflectedBoolField(uevr::API::UFunction* function,
+		const std::vector<uint8_t>& params, const wchar_t* structParameterName,
+		const wchar_t* fieldName, bool& value)
+	{
+		auto property = FindFunctionParameter(function, structParameterName);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"StructProperty")
+			return false;
+		auto structProperty = reinterpret_cast<uevr::API::FStructProperty*>(property);
+		auto scriptStruct = structProperty->get_struct();
+		if (scriptStruct == nullptr)
+			return false;
+		auto field = scriptStruct->find_property(fieldName);
+		if (field == nullptr || field->get_offset() < 0
+			|| field->get_class() == nullptr
+			|| field->get_class()->get_fname()->to_string() != L"BoolProperty")
+			return false;
+		auto boolProperty = reinterpret_cast<uevr::API::FBoolProperty*>(field);
+		const size_t byteIndex = static_cast<size_t>(property->get_offset())
+			+ static_cast<size_t>(field->get_offset())
+			+ boolProperty->get_byte_offset();
+		if (byteIndex >= params.size())
+			return false;
+		value = (params[byteIndex]
+			& static_cast<uint8_t>(boolProperty->get_byte_mask())) != 0;
+		return true;
+	}
+
+	struct MotionThrowableWorldSweepHit
+	{
+		glm::fvec3 point{};
+		glm::fvec3 normal{};
+	};
+
+	bool MoveMotionThrowableCollisionProxy(uevr::API::UObject* proxy,
+		const glm::fvec3& position, MotionThrowableWorldSweepHit& hit)
+	{
+		hit = MotionThrowableWorldSweepHit{};
+		if (proxy == nullptr || !uevr::API::UObjectHook::exists(proxy)
+			|| !IsFiniteVector(position) || proxy->get_class() == nullptr)
+			return false;
+		auto function = proxy->get_class()->find_function(L"K2_SetWorldLocation");
+		if (function == nullptr)
+			return false;
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedVectorParameter(function, params, L"NewLocation", position)
+			|| !SetReflectedBoolParameter(function, params, L"bSweep", true)
+			|| !SetReflectedBoolParameter(function, params, L"bTeleport", false))
+			return false;
+		function->call(proxy, params.data());
+		bool blockingHit = false;
+		if (!ReadReflectedBoolField(function, params, L"SweepHitResult",
+			L"bBlockingHit", blockingHit) || !blockingHit)
+			return false;
+		if (!ReadReflectedVectorField(function, params, L"SweepHitResult",
+			L"ImpactPoint", hit.point)
+			&& !ReadReflectedVectorField(function, params, L"SweepHitResult",
+				L"Location", hit.point))
+			return false;
+		ReadReflectedVectorField(function, params, L"SweepHitResult",
+			L"ImpactNormal", hit.normal);
+		return IsFiniteVector(hit.point);
+	}
+
+	bool SweepMotionThrowableWorld(uevr::API::UObject* worldContext,
+		const glm::fvec3& start, const glm::fvec3& end, float radius,
+		uint8_t traceChannel,
+		bool& traceAvailable, MotionThrowableWorldSweepHit& hit)
+	{
+		traceAvailable = false;
+		hit = MotionThrowableWorldSweepHit{};
+		if (worldContext == nullptr || !IsFiniteVector(start)
+			|| !IsFiniteVector(end) || !std::isfinite(radius) || radius <= 0.0f)
+			return false;
+		auto traceClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+			L"Class /Script/Engine.KismetSystemLibrary");
+		auto traceObject = traceClass != nullptr
+			? traceClass->get_class_default_object() : nullptr;
+		auto function = traceClass != nullptr
+			? traceClass->find_function(L"SphereTraceSingle") : nullptr;
+		if (traceObject == nullptr || function == nullptr
+			|| FindFunctionParameter(function, L"OutHit") == nullptr
+			|| FindFunctionParameter(function, L"ReturnValue") == nullptr)
+			return false;
+
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedObjectParameter(function, params, L"WorldContextObject", worldContext)
+			|| !SetReflectedVectorParameter(function, params, L"Start", start)
+			|| !SetReflectedVectorParameter(function, params, L"End", end)
+			|| !SetReflectedFloatParameter(function, params, L"Radius", radius)
+			|| !SetReflectedByteParameter(function, params, L"TraceChannel", traceChannel)
+			|| !SetReflectedBoolParameter(function, params, L"bTraceComplex", false)
+			|| !SetReflectedArrayParameter(function, params, L"ActorsToIgnore", nullptr, 0)
+			|| !SetReflectedByteParameter(function, params, L"DrawDebugType", 0)
+			|| !SetReflectedBoolParameter(function, params, L"bIgnoreSelf", true))
+			return false;
+		if (FindFunctionParameter(function, L"DrawTime") != nullptr
+			&& !SetReflectedFloatParameter(function, params, L"DrawTime", 0.0f))
+			return false;
+
+		traceAvailable = true;
+		function->call(traceObject, params.data());
+		bool returnedHit = false;
+		if (!ReadReflectedBoolParameter(function, params, L"ReturnValue", returnedHit)
+			|| !returnedHit)
+			return false;
+		if (!ReadReflectedVectorField(function, params, L"OutHit", L"ImpactPoint", hit.point)
+			&& !ReadReflectedVectorField(function, params, L"OutHit", L"Location", hit.point))
+			return false;
+		ReadReflectedVectorField(function, params, L"OutHit", L"ImpactNormal", hit.normal);
+		if (glm::length(hit.normal) <= 0.01f)
+			ReadReflectedVectorField(function, params, L"OutHit", L"Normal", hit.normal);
+		return IsFiniteVector(hit.point);
 	}
 
 	bool CallSetSkeletalMesh(uevr::API::UObject* component, uevr::API::UObject* skeletalMesh)
@@ -408,11 +700,733 @@ namespace
 		return true;
 	}
 
+	size_t ReflectedPropertySpan(uevr::API::UFunction* function,
+		uevr::API::FProperty* property)
+	{
+		if (function == nullptr || property == nullptr || property->get_offset() < 0)
+			return 0;
+		const size_t begin = static_cast<size_t>(property->get_offset());
+		size_t end = static_cast<size_t>(function->get_properties_size());
+		for (auto field = function->get_child_properties(); field != nullptr; field = field->get_next())
+		{
+			auto candidate = reinterpret_cast<uevr::API::FProperty*>(field);
+			if (candidate == property || candidate->get_offset() <= property->get_offset())
+				continue;
+			end = (std::min)(end, static_cast<size_t>(candidate->get_offset()));
+		}
+		return end > begin ? end - begin : 0;
+	}
+
+	bool SetReflectedStringParameter(uevr::API::UFunction* function,
+		std::vector<uint8_t>& params, const wchar_t* name,
+		std::vector<wchar_t>& storage)
+	{
+		auto property = FindFunctionParameter(function, name);
+		if (property == nullptr || property->get_offset() < 0
+			|| property->get_class() == nullptr
+			|| property->get_class()->get_fname()->to_string() != L"StrProperty")
+			return false;
+		struct ReflectedString
+		{
+			wchar_t* data;
+			int32_t count;
+			int32_t capacity;
+		};
+		const ReflectedString value{ storage.data(),
+			static_cast<int32_t>(storage.size()), static_cast<int32_t>(storage.size()) };
+		if (static_cast<size_t>(property->get_offset()) + sizeof(value) > params.size())
+			return false;
+		std::memcpy(params.data() + property->get_offset(), &value, sizeof(value));
+		return true;
+	}
+
+	bool CopyReflectedParameterBytes(uevr::API::UFunction* function,
+		std::vector<uint8_t>& params, const wchar_t* name,
+		const std::vector<uint8_t>& source)
+	{
+		auto property = FindFunctionParameter(function, name);
+		const size_t span = ReflectedPropertySpan(function, property);
+		if (property == nullptr || property->get_offset() < 0 || span == 0
+			|| source.empty() || source.size() > span
+			|| static_cast<size_t>(property->get_offset()) + span > params.size())
+			return false;
+		std::memcpy(params.data() + property->get_offset(), source.data(), source.size());
+		return true;
+	}
+
+	bool ReadReflectedParameterBytes(uevr::API::UFunction* function,
+		const std::vector<uint8_t>& params, const wchar_t* name,
+		std::vector<uint8_t>& destination)
+	{
+		auto property = FindFunctionParameter(function, name);
+		const size_t span = ReflectedPropertySpan(function, property);
+		if (property == nullptr || property->get_offset() < 0 || span == 0
+			|| static_cast<size_t>(property->get_offset()) + span > params.size())
+			return false;
+		destination.assign(params.begin() + property->get_offset(),
+			params.begin() + property->get_offset() + span);
+		return true;
+	}
+
+	uevr::API::UObject* LoadStaticMeshAssetBlocking(const wchar_t* objectPath)
+	{
+		if (objectPath == nullptr || objectPath[0] == L'\0')
+			return nullptr;
+		const std::wstring fullName = std::wstring(L"StaticMesh ") + objectPath;
+		if (auto loaded = uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str()))
+			return loaded;
+		const auto fail = [&](const char* stage) -> uevr::API::UObject*
+		{
+			uevr::API::get()->log_warn(
+				"[ClenchedAssets] load failed stage=%s path=%ls", stage, objectPath);
+			return nullptr;
+		};
+
+		// Shipping builds sometimes retain the native OBJ loader even when an asset
+		// was not indexed in the base AssetRegistry. Try that bounded package load
+		// first, then use the reflected soft-reference path below.
+		std::wstring packagePath(objectPath);
+		if (const auto dot = packagePath.rfind(L'.'); dot != std::wstring::npos)
+			packagePath.resize(dot);
+		const std::wstring loadCommand = L"obj load package=" + packagePath;
+		uevr::API::get()->execute_command(loadCommand.c_str());
+		if (auto loaded = uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str()))
+			return loaded;
+
+		auto systemClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+			L"Class /Script/Engine.KismetSystemLibrary");
+		auto systemObject = systemClass != nullptr ? systemClass->get_class_default_object() : nullptr;
+		if (systemClass == nullptr || systemObject == nullptr)
+			return fail("kismet-system-class");
+		auto makePath = systemClass->find_function(L"MakeSoftObjectPath");
+		auto convertPath = systemClass->find_function(L"Conv_SoftObjPathToSoftObjRef");
+		auto loadAsset = systemClass->find_function(L"LoadAsset_Blocking");
+		if (makePath == nullptr || convertPath == nullptr || loadAsset == nullptr)
+			return fail("kismet-functions");
+
+		std::vector<wchar_t> pathStorage(objectPath, objectPath + std::wcslen(objectPath));
+		pathStorage.push_back(L'\0');
+		std::vector<uint8_t> makeParams(makePath->get_properties_size());
+		if (!SetReflectedStringParameter(makePath, makeParams, L"PathString", pathStorage))
+			return fail("make-path-input");
+		makePath->call(systemObject, makeParams.data());
+		std::vector<uint8_t> softPath;
+		if (!ReadReflectedParameterBytes(makePath, makeParams, L"ReturnValue", softPath))
+			return fail("make-path-output");
+
+		std::vector<uint8_t> convertParams(convertPath->get_properties_size());
+		if (!CopyReflectedParameterBytes(convertPath, convertParams, L"SoftObjectPath", softPath))
+			return fail("convert-path-input");
+		convertPath->call(systemObject, convertParams.data());
+		std::vector<uint8_t> softReference;
+		if (!ReadReflectedParameterBytes(convertPath, convertParams, L"ReturnValue", softReference))
+			return fail("convert-path-output");
+
+		std::vector<uint8_t> loadParams(loadAsset->get_properties_size());
+		if (!CopyReflectedParameterBytes(loadAsset, loadParams, L"Asset", softReference))
+			return fail("load-asset-input");
+		loadAsset->call(systemObject, loadParams.data());
+		uevr::API::UObject* result = nullptr;
+		if (!ReadReflectedObjectReturn(loadAsset, loadParams, result))
+			return fail("load-asset-output");
+		if (result == nullptr)
+			return fail("load-asset-null");
+		uevr::API::get()->log_info(
+			"[ClenchedAssets] loaded path=%ls object=%p name=%ls",
+			objectPath, result, result->get_full_name().c_str());
+		return result;
+	}
+
+	uevr::API::UObject* FindOrLoadSoundWave(const wchar_t* objectPath)
+	{
+		if (objectPath == nullptr || objectPath[0] == L'\0')
+			return nullptr;
+		const std::wstring fullName = std::wstring(L"SoundWave ") + objectPath;
+		if (auto loaded = uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str()))
+			return loaded;
+
+		// These sounds ship in the game's own collision bank. Ask the engine to
+		// load only the exact package, then require the expected SoundWave object.
+		std::wstring packagePath(objectPath);
+		if (const auto dot = packagePath.rfind(L'.'); dot != std::wstring::npos)
+			packagePath.resize(dot);
+		const std::wstring loadCommand = L"obj load package=" + packagePath;
+		uevr::API::get()->execute_command(loadCommand.c_str());
+		return uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str());
+	}
+
+	uevr::API::UObject* FindOrLoadParticleSystem(const wchar_t* objectPath)
+	{
+		if (objectPath == nullptr || objectPath[0] == L'\0')
+			return nullptr;
+		const std::wstring fullName = std::wstring(L"ParticleSystem ") + objectPath;
+		if (auto loaded = uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str()))
+			return loaded;
+
+		std::wstring packagePath(objectPath);
+		if (const auto dot = packagePath.rfind(L'.'); dot != std::wstring::npos)
+			packagePath.resize(dot);
+		uevr::API::get()->execute_command((std::wstring(L"obj load package=") + packagePath).c_str());
+		return uevr::API::get()->find_uobject<uevr::API::UObject>(fullName.c_str());
+	}
+
+	uevr::API::UClass* FindOrLoadBlueprintGeneratedClass(const wchar_t* objectPath)
+	{
+		if (objectPath == nullptr || objectPath[0] == L'\0')
+			return nullptr;
+		const std::wstring fullName = std::wstring(L"BlueprintGeneratedClass ") + objectPath;
+		if (auto loaded = uevr::API::get()->find_uobject<uevr::API::UClass>(fullName.c_str()))
+			return loaded;
+
+		std::wstring packagePath(objectPath);
+		if (const auto dot = packagePath.rfind(L'.'); dot != std::wstring::npos)
+			packagePath.resize(dot);
+		uevr::API::get()->execute_command((std::wstring(L"obj load package=") + packagePath).c_str());
+		return uevr::API::get()->find_uobject<uevr::API::UClass>(fullName.c_str());
+	}
+
+	uevr::API::UObject* SpawnNativeActorAtLocation(uevr::API::UObject* worldContext,
+		uevr::API::UClass* actorClass, const glm::fvec3& location)
+	{
+		if (worldContext == nullptr || actorClass == nullptr || !IsFiniteVector(location))
+			return nullptr;
+		auto gameplayStaticsClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+			L"Class /Script/Engine.GameplayStatics");
+		auto gameplayStatics = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->get_class_default_object() : nullptr;
+		auto beginSpawn = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->find_function(L"BeginDeferredActorSpawnFromClass") : nullptr;
+		auto finishSpawn = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->find_function(L"FinishSpawningActor") : nullptr;
+		if (gameplayStatics == nullptr || beginSpawn == nullptr || finishSpawn == nullptr)
+			return nullptr;
+
+		const glm::fquat identity = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+		std::vector<uint8_t> beginParams(beginSpawn->get_properties_size());
+		if (!SetReflectedObjectParameter(beginSpawn, beginParams, L"WorldContextObject", worldContext)
+			|| !SetReflectedObjectParameter(beginSpawn, beginParams, L"ActorClass", actorClass)
+			|| !SetReflectedTransformParameter(beginSpawn, beginParams, L"SpawnTransform",
+				location, identity))
+			return nullptr;
+		// This enum value is the one already used by the project's proven Lua
+		// actor-spawn helper: always create at the measured impact rather than
+		// silently rejecting a wall, vehicle, or floor collision.
+		if (FindFunctionParameter(beginSpawn, L"CollisionHandlingOverride") != nullptr
+			&& !SetReflectedByteParameter(beginSpawn, beginParams,
+				L"CollisionHandlingOverride", 1))
+			return nullptr;
+		if (FindFunctionParameter(beginSpawn, L"Owner") != nullptr
+			&& !SetReflectedObjectParameter(beginSpawn, beginParams, L"Owner", worldContext))
+			return nullptr;
+		beginSpawn->call(gameplayStatics, beginParams.data());
+		uevr::API::UObject* actor = nullptr;
+		if (!ReadReflectedObjectReturn(beginSpawn, beginParams, actor)
+			|| actor == nullptr || !uevr::API::UObjectHook::exists(actor))
+			return nullptr;
+
+		std::vector<uint8_t> finishParams(finishSpawn->get_properties_size());
+		if (!SetReflectedObjectParameter(finishSpawn, finishParams, L"Actor", actor)
+			|| !SetReflectedTransformParameter(finishSpawn, finishParams, L"SpawnTransform",
+				location, identity))
+			return nullptr;
+		finishSpawn->call(gameplayStatics, finishParams.data());
+		return uevr::API::UObjectHook::exists(actor) ? actor : nullptr;
+	}
+
+	bool ResolveNativeMolotovExplosionSelection(uevr::API::UObject* worldContext,
+		uevr::API::UClass* spawnLibraryClass, uevr::API::UClass*& actorClass,
+		uevr::API::UObject*& debrisTemplate, uint8_t& explosionType)
+	{
+		actorClass = nullptr;
+		debrisTemplate = nullptr;
+		explosionType = 0;
+		if (worldContext == nullptr || spawnLibraryClass == nullptr)
+			return false;
+		ScopedMotionThrowableNativeProbeSuppression suppressProbe;
+		auto* spawnLibrary = spawnLibraryClass->get_class_default_object();
+		auto* selector = spawnLibraryClass->find_function(L"Get Explosion to Spawn");
+		if (spawnLibrary == nullptr || selector == nullptr)
+			return false;
+
+		// Type is a raw byte in this cooked Blueprint, so its DE enum labels are
+		// unavailable through reflection. The function itself is a selector: query
+		// its small explosion range once and make the returned assets authoritative.
+		// A generic actor plus a Molotov debris template is a valid native Molotov
+		// selection; the prior implementation incorrectly rejected that combination.
+		constexpr uint8_t FirstExplosionType = 0;
+		constexpr uint8_t LastExplosionType = 31;
+		const auto hasMolotovName = [](const std::wstring& name) {
+			return name.find(L"Molotov") != std::wstring::npos
+				|| name.find(L"molotov") != std::wstring::npos;
+		};
+
+		uevr::API::UClass* classOnlyFallback = nullptr;
+		uevr::API::UObject* classOnlyFallbackDebris = nullptr;
+		uint8_t classOnlyFallbackType = 0;
+		for (uint16_t candidate = FirstExplosionType;
+			candidate <= LastExplosionType; ++candidate)
+		{
+			std::vector<uint8_t> params(selector->get_properties_size());
+			if (!SetReflectedByteParameter(selector, params, L"Type",
+				static_cast<uint8_t>(candidate))
+				|| !SetReflectedByteParameter(selector, params, L"Surface", 0)
+				|| !SetReflectedObjectParameter(selector, params, L"ExplodingActor", nullptr)
+				|| !SetReflectedObjectParameter(selector, params, L"__WorldContext", worldContext))
+				return false;
+			selector->call(spawnLibrary, params.data());
+
+			uevr::API::UObject* selectedActor = nullptr;
+			uevr::API::UObject* selectedDebris = nullptr;
+			if (!ReadReflectedObjectParameter(selector, params, L"Actor", selectedActor)
+				|| !ReadReflectedObjectParameter(selector, params, L"DebrisParticle", selectedDebris)
+				|| selectedActor == nullptr || !uevr::API::UObjectHook::exists(selectedActor))
+				continue;
+
+			auto* selectedClass = selectedActor->dcast<uevr::API::UClass>();
+			if (selectedClass == nullptr)
+				continue;
+			const bool debrisValid = selectedDebris != nullptr
+				&& uevr::API::UObjectHook::exists(selectedDebris);
+			const auto className = selectedClass->get_full_name();
+			const auto debrisName = debrisValid ? selectedDebris->get_full_name()
+				: std::wstring(L"<null>");
+			const bool classIsMolotov = hasMolotovName(className);
+			const bool debrisIsMolotov = debrisValid && hasMolotovName(debrisName);
+			uevr::API::get()->log_info(
+				"[MotionThrowableNativeMolotov] selector candidate type=%u class=%ls debris=%ls",
+				static_cast<unsigned int>(candidate), className.c_str(), debrisName.c_str());
+			if (classIsMolotov || debrisIsMolotov)
+			{
+				uevr::API::get()->log_info(
+					"[MotionThrowableNativeMolotov] selector candidate type=%u class=%p name=%ls debris=%p debrisName=%ls match=%s",
+					static_cast<unsigned int>(candidate), selectedClass, className.c_str(),
+					selectedDebris, debrisName.c_str(), debrisIsMolotov ? "debris" : "class");
+				if (debrisIsMolotov || (classIsMolotov && debrisValid))
+				{
+					actorClass = selectedClass;
+					debrisTemplate = selectedDebris;
+					explosionType = static_cast<uint8_t>(candidate);
+					return true;
+				}
+				if (classOnlyFallback == nullptr)
+				{
+					classOnlyFallback = selectedClass;
+					classOnlyFallbackDebris = debrisValid ? selectedDebris : nullptr;
+					classOnlyFallbackType = static_cast<uint8_t>(candidate);
+				}
+			}
+		}
+
+		if (classOnlyFallback != nullptr)
+		{
+			actorClass = classOnlyFallback;
+			debrisTemplate = classOnlyFallbackDebris;
+			explosionType = classOnlyFallbackType;
+			uevr::API::get()->log_warn(
+				"[MotionThrowableNativeMolotov] selector using class-only fallback type=%u class=%ls debris=%p",
+				static_cast<unsigned int>(classOnlyFallbackType),
+				classOnlyFallback->get_full_name().c_str(), classOnlyFallbackDebris);
+			return true;
+		}
+		return false;
+	}
+
+	bool SetupNativeSpawnedExplosion(uevr::API::UObject* worldContext,
+		uevr::API::UClass* spawnLibraryClass, uevr::API::UObject* explosion,
+		uevr::API::UObject* debrisTemplate)
+	{
+		if (worldContext == nullptr || spawnLibraryClass == nullptr || explosion == nullptr)
+			return false;
+		ScopedMotionThrowableNativeProbeSuppression suppressProbe;
+		auto* spawnLibrary = spawnLibraryClass->get_class_default_object();
+		auto* setup = spawnLibraryClass->find_function(L"SetupSpawnedExplosion");
+		if (spawnLibrary == nullptr || setup == nullptr)
+			return false;
+		std::vector<uint8_t> params(setup->get_properties_size());
+		// Collision contacts in this plugin identify the DE-native CEntity, not a
+		// reflected Unreal actor. Passing it through an ObjectProperty would be
+		// unsafe; null is the native world-impact case and the Blueprint handles it.
+		if (!SetReflectedObjectParameter(setup, params, L"Explosion", explosion)
+			|| !SetReflectedObjectParameter(setup, params, L"ExplodingActor", nullptr)
+			|| !SetReflectedObjectParameter(setup, params, L"DebrisTemplate", debrisTemplate)
+			|| !SetReflectedBoolParameter(setup, params, L"bSuppressLight", false)
+			|| !SetReflectedObjectParameter(setup, params, L"__WorldContext", worldContext))
+			return false;
+		setup->call(spawnLibrary, params.data());
+		return uevr::API::UObjectHook::exists(explosion);
+	}
+
+	void LogBlueprintDeclaredMembers(uevr::API::UClass* blueprintClass, const char* tag)
+	{
+		if (blueprintClass == nullptr || tag == nullptr)
+			return;
+		// Only inspect the Blueprint's own declarations. Its engine parent has a
+		// large generic member list that would obscure the activation entry point.
+		size_t functionCount = 0;
+		for (auto* field = blueprintClass->get_children(); field != nullptr
+			&& functionCount < 32; field = field->get_next())
+		{
+			auto* function = field->dcast<uevr::API::UFunction>();
+			if (function == nullptr || function->get_fname() == nullptr)
+				continue;
+			uevr::API::get()->log_info("[%s] declared-function=%ls flags=0x%X params=%d",
+				tag, function->get_fname()->to_string().c_str(),
+				function->get_function_flags(), function->get_properties_size());
+			size_t parameterCount = 0;
+			for (auto* parameter = function->get_child_properties(); parameter != nullptr
+				&& parameterCount < 32; parameter = parameter->get_next())
+			{
+				if (parameter->get_fname() == nullptr)
+					continue;
+				auto* reflectedParameter = static_cast<uevr::API::FProperty*>(parameter);
+				const auto* parameterClass = parameter->get_class();
+				const auto parameterClassName = parameterClass != nullptr
+					&& parameterClass->get_fname() != nullptr
+					? parameterClass->get_fname()->to_string() : L"<null>";
+				std::wstring structName;
+				if (parameterClassName == L"StructProperty")
+				{
+					auto* structProperty = reinterpret_cast<uevr::API::FStructProperty*>(parameter);
+					if (auto* scriptStruct = structProperty->get_struct(); scriptStruct != nullptr
+						&& scriptStruct->get_fname() != nullptr)
+						structName = scriptStruct->get_fname()->to_string();
+				}
+				uevr::API::get()->log_info(
+					"[%s] function=%ls parameter=%ls type=%ls struct=%ls offset=%d param=%d out=%d return=%d ref=%d",
+					tag, function->get_fname()->to_string().c_str(),
+					parameter->get_fname()->to_string().c_str(), parameterClassName.c_str(),
+					structName.empty() ? L"<none>" : structName.c_str(),
+					reflectedParameter->get_offset(), reflectedParameter->is_param() ? 1 : 0,
+					reflectedParameter->is_out_param() ? 1 : 0,
+					reflectedParameter->is_return_param() ? 1 : 0,
+					reflectedParameter->is_reference_param() ? 1 : 0);
+				++parameterCount;
+			}
+			++functionCount;
+		}
+		size_t propertyCount = 0;
+		for (auto* property = blueprintClass->get_child_properties(); property != nullptr
+			&& propertyCount < 32; property = property->get_next())
+		{
+			if (property->get_fname() == nullptr)
+				continue;
+			const auto* propertyClass = property->get_class();
+			uevr::API::get()->log_info("[%s] declared-property=%ls class=%ls offset=%d",
+				tag, property->get_fname()->to_string().c_str(),
+				propertyClass != nullptr && propertyClass->get_fname() != nullptr
+					? propertyClass->get_fname()->to_string().c_str() : L"<null>",
+				static_cast<uevr::API::FProperty*>(property)->get_offset());
+			++propertyCount;
+		}
+		uevr::API::get()->log_info("[%s] inventory functions=%zu properties=%zu",
+			tag, functionCount, propertyCount);
+	}
+
+	void LogRelevantClassHierarchyMembers(uevr::API::UClass* blueprintClass,
+		const char* tag)
+	{
+		if (blueprintClass == nullptr || tag == nullptr)
+			return;
+		const auto isRelevant = [](const std::wstring& name) {
+			static constexpr std::array<const wchar_t*, 12> Terms{
+				L"Fire", L"Burn", L"Ignit", L"Explosion", L"Damage", L"Life",
+				L"Start", L"Attach", L"Creator", L"Extinguish", L"Kill", L"System" };
+			for (const auto* term : Terms)
+			{
+				if (name.find(term) != std::wstring::npos)
+					return true;
+			}
+			return false;
+		};
+
+		size_t loggedFunctions = 0;
+		size_t loggedProperties = 0;
+		int depth = 0;
+		for (auto* type = static_cast<uevr::API::UStruct*>(blueprintClass);
+			type != nullptr && depth < 8; type = type->get_super(), ++depth)
+		{
+			const auto typeName = type->get_full_name();
+			for (auto* field = type->get_children(); field != nullptr;
+				field = field->get_next())
+			{
+				auto* function = field->dcast<uevr::API::UFunction>();
+				if (function == nullptr || function->get_fname() == nullptr)
+					continue;
+				const auto functionName = function->get_fname()->to_string();
+				if (!isRelevant(functionName))
+					continue;
+				uevr::API::get()->log_info(
+					"[%s] hierarchy-function depth=%d owner=%ls name=%ls flags=0x%X params=%d",
+					tag, depth, typeName.c_str(), functionName.c_str(),
+					function->get_function_flags(), function->get_properties_size());
+				for (auto* parameter = function->get_child_properties(); parameter != nullptr;
+					parameter = parameter->get_next())
+				{
+					if (parameter->get_fname() == nullptr)
+						continue;
+					auto* reflectedParameter = static_cast<uevr::API::FProperty*>(parameter);
+					const auto* parameterClass = parameter->get_class();
+					const auto parameterType = parameterClass != nullptr
+						&& parameterClass->get_fname() != nullptr
+						? parameterClass->get_fname()->to_string() : L"<null>";
+					uevr::API::get()->log_info(
+						"[%s] hierarchy-parameter function=%ls name=%ls type=%ls offset=%d param=%d out=%d return=%d",
+						tag, functionName.c_str(),
+						parameter->get_fname()->to_string().c_str(), parameterType.c_str(),
+						reflectedParameter->get_offset(), reflectedParameter->is_param() ? 1 : 0,
+						reflectedParameter->is_out_param() ? 1 : 0,
+						reflectedParameter->is_return_param() ? 1 : 0);
+				}
+				++loggedFunctions;
+			}
+			for (auto* property = type->get_child_properties(); property != nullptr;
+				property = property->get_next())
+			{
+				if (property->get_fname() == nullptr)
+					continue;
+				const auto propertyName = property->get_fname()->to_string();
+				if (!isRelevant(propertyName))
+					continue;
+				const auto* propertyClass = property->get_class();
+				uevr::API::get()->log_info(
+					"[%s] hierarchy-property depth=%d owner=%ls name=%ls type=%ls offset=%d",
+					tag, depth, typeName.c_str(), propertyName.c_str(),
+					propertyClass != nullptr && propertyClass->get_fname() != nullptr
+						? propertyClass->get_fname()->to_string().c_str() : L"<null>",
+					static_cast<uevr::API::FProperty*>(property)->get_offset());
+				++loggedProperties;
+			}
+		}
+		uevr::API::get()->log_info(
+			"[%s] hierarchy-inventory relevantFunctions=%zu relevantProperties=%zu",
+			tag, loggedFunctions, loggedProperties);
+	}
+
+	uevr::API::UObject* SpawnParticleSystemAtLocation(uevr::API::UObject* worldContext,
+		uevr::API::UObject* particleSystem, const glm::fvec3& location,
+		const glm::fvec3& scale = glm::fvec3(1.0f), bool autoDestroy = true)
+	{
+		if (worldContext == nullptr || particleSystem == nullptr || !IsFiniteVector(location))
+			return nullptr;
+		auto gameplayStaticsClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+			L"Class /Script/Engine.GameplayStatics");
+		auto gameplayStatics = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->get_class_default_object() : nullptr;
+		auto function = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->find_function(L"SpawnEmitterAtLocation") : nullptr;
+		if (gameplayStatics == nullptr || function == nullptr)
+			return nullptr;
+
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedObjectParameter(function, params, L"WorldContextObject", worldContext)
+			|| !SetReflectedObjectParameter(function, params, L"EmitterTemplate", particleSystem)
+			|| !SetReflectedVectorParameter(function, params, L"Location", location))
+			return nullptr;
+		// SpawnEmitterAtLocation has a Rotation input on this build. Leaving the
+		// zeroed FRotator untouched can produce a valid call with an invalid
+		// transform, so explicitly provide the identity rotator when reflected.
+		if (FindFunctionParameter(function, L"Rotation") != nullptr
+			&& !SetReflectedVectorParameter(function, params, L"Rotation",
+				glm::fvec3(0.0f)))
+			return nullptr;
+		if (FindFunctionParameter(function, L"Scale") != nullptr
+			&& !SetReflectedVectorParameter(function, params, L"Scale", scale))
+			return nullptr;
+		if (FindFunctionParameter(function, L"bAutoDestroy") != nullptr
+			&& !SetReflectedBoolParameter(function, params, L"bAutoDestroy", autoDestroy))
+			return nullptr;
+		if (FindFunctionParameter(function, L"bAutoActivate") != nullptr
+			&& !SetReflectedBoolParameter(function, params, L"bAutoActivate", true))
+			return nullptr;
+		function->call(gameplayStatics, params.data());
+		uevr::API::UObject* spawnedComponent = nullptr;
+		if (!ReadReflectedObjectReturn(function, params, spawnedComponent)
+			|| spawnedComponent == nullptr
+			|| !uevr::API::UObjectHook::exists(spawnedComponent))
+			return nullptr;
+		return spawnedComponent;
+	}
+
+	bool PlaySoundWaveAtLocation(uevr::API::UObject* worldContext,
+		uevr::API::UObject* sound, const glm::fvec3& location,
+		float volume, float pitch)
+	{
+		if (worldContext == nullptr || sound == nullptr || !IsFiniteVector(location))
+			return false;
+		auto gameplayStaticsClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+			L"Class /Script/Engine.GameplayStatics");
+		auto gameplayStatics = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->get_class_default_object() : nullptr;
+		auto function = gameplayStaticsClass != nullptr
+			? gameplayStaticsClass->find_function(L"PlaySoundAtLocation") : nullptr;
+		if (gameplayStatics == nullptr || function == nullptr)
+			return false;
+
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedObjectParameter(function, params, L"WorldContextObject", worldContext)
+			|| !SetReflectedObjectParameter(function, params, L"Sound", sound)
+			|| !SetReflectedVectorParameter(function, params, L"Location", location)
+			|| !SetReflectedFloatParameter(function, params, L"VolumeMultiplier", volume)
+			|| !SetReflectedFloatParameter(function, params, L"PitchMultiplier", pitch)
+			|| !SetReflectedFloatParameter(function, params, L"StartTime", 0.0f))
+			return false;
+		function->call(gameplayStatics, params.data());
+		return true;
+	}
+
+	bool CallSetStaticMesh(uevr::API::UObject* component, uevr::API::UObject* staticMesh)
+	{
+		if (component == nullptr || staticMesh == nullptr || component->get_class() == nullptr)
+			return false;
+		auto function = component->get_class()->find_function(L"SetStaticMesh");
+		if (function == nullptr)
+			return false;
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedObjectParameter(function, params, L"NewMesh", staticMesh))
+			return false;
+		function->call(component, params.data());
+		return true;
+	}
+
+	uevr::API::UObject* ReadComponentMaterial(uevr::API::UObject* component, int32_t elementIndex)
+	{
+		if (component == nullptr || component->get_class() == nullptr)
+			return nullptr;
+		auto function = component->get_class()->find_function(L"GetMaterial");
+		if (function == nullptr)
+			return nullptr;
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedIntParameter(function, params, L"ElementIndex", elementIndex))
+			return nullptr;
+		function->call(component, params.data());
+		uevr::API::UObject* material = nullptr;
+		return ReadReflectedObjectReturn(function, params, material) ? material : nullptr;
+	}
+
+	bool SetComponentMaterial(uevr::API::UObject* component, int32_t elementIndex,
+		uevr::API::UObject* material)
+	{
+		if (component == nullptr || material == nullptr || component->get_class() == nullptr)
+			return false;
+		auto function = component->get_class()->find_function(L"SetMaterial");
+		if (function == nullptr)
+			return false;
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedIntParameter(function, params, L"ElementIndex", elementIndex)
+			|| !SetReflectedObjectParameter(function, params, L"Material", material))
+			return false;
+		function->call(component, params.data());
+		return true;
+	}
+
 	uevr::API::UObject* AddSkeletalComponent(uevr::API::UObject* actor, uevr::API::UClass* componentClass)
 	{
 		if (actor == nullptr || componentClass == nullptr)
 			return nullptr;
 		return uevr::API::get()->add_component_by_class(actor, componentClass, false);
+	}
+
+	bool ReadBoneTransform(uevr::API::UObject* component,
+		const uevr::API::FName& boneName, glm::fvec3& translation,
+		glm::fquat& rotation, uint8_t transformSpace);
+
+	bool AttachStaticHandToDriver(uevr::API::UObject* staticHand,
+		uevr::API::UObject* driver, const uevr::API::FName& driverHandBone)
+	{
+		if (staticHand == nullptr || driver == nullptr
+			|| staticHand->get_class() == nullptr || driverHandBone.comparison_index == 0)
+			return false;
+		glm::fvec3 handPosition{};
+		glm::fquat handRotation{};
+		if (!ReadBoneTransform(driver, driverHandBone, handPosition, handRotation, 2))
+			return false;
+		auto attachFunction = staticHand->get_class()->find_function(L"AttachToComponent");
+		if (attachFunction == nullptr)
+			attachFunction = staticHand->get_class()->find_function(L"K2_AttachToComponent");
+		if (attachFunction == nullptr)
+			return false;
+		std::vector<uint8_t> attachParams(attachFunction->get_properties_size());
+		if (!SetReflectedObjectParameter(attachFunction, attachParams, L"Parent", driver)
+			|| !SetReflectedFNameParameter(attachFunction, attachParams, L"SocketName", uevr::API::FName{})
+			|| !SetReflectedByteParameter(attachFunction, attachParams, L"LocationRule", 0)
+			|| !SetReflectedByteParameter(attachFunction, attachParams, L"RotationRule", 0)
+			|| !SetReflectedByteParameter(attachFunction, attachParams, L"ScaleRule", 0))
+			return false;
+		SetReflectedBoolParameter(attachFunction, attachParams, L"bWeldSimulatedBodies", false);
+		SetReflectedBoolParameter(attachFunction, attachParams, L"WeldSimulatedBodies", false);
+		attachFunction->call(staticHand, attachParams.data());
+
+		if (Utilities::KismetMathLibrary == nullptr)
+			Utilities::InitHelperClasses();
+		if (Utilities::KismetMathLibrary == nullptr)
+			return false;
+		const glm::fvec3 forward = NormalizeOrZero(handRotation * glm::fvec3(1.0f, 0.0f, 0.0f));
+		const glm::fvec3 right = NormalizeOrZero(handRotation * glm::fvec3(0.0f, 1.0f, 0.0f));
+		const glm::fvec3 up = NormalizeOrZero(handRotation * glm::fvec3(0.0f, 0.0f, 1.0f));
+		ParameterMakeRotationFromAxes rotationParams{};
+		rotationParams.forward = forward;
+		rotationParams.right = right;
+		rotationParams.up = up;
+		Utilities::KismetMathLibrary->call_function(L"MakeRotationFromAxes", &rotationParams);
+		Utilities::Parameter_K2_SetWorldOrRelativeLocation locationParams{};
+		locationParams.newLocation = handPosition;
+		locationParams.bTeleport = true;
+		staticHand->call_function(L"K2_SetRelativeLocation", &locationParams);
+		Utilities::Parameter_K2_SetWorldOrRelativeRotation relativeRotationParams{};
+		relativeRotationParams.newRotation = rotationParams.returnValue;
+		relativeRotationParams.bTeleport = true;
+		staticHand->call_function(L"K2_SetRelativeRotation", &relativeRotationParams);
+		return true;
+	}
+
+	bool SetComponentTickEnabled(uevr::API::UObject* component, bool enabled)
+	{
+		if (component == nullptr || component->get_class() == nullptr)
+			return false;
+		auto function = component->get_class()->find_function(L"SetComponentTickEnabled");
+		if (function == nullptr)
+			return false;
+		std::vector<uint8_t> params(function->get_properties_size());
+		if (!SetReflectedBoolParameter(function, params, L"bEnabled", enabled))
+			return false;
+		function->call(component, params.data());
+		return true;
+	}
+
+	bool SetBoneTransformInSpace(uevr::API::UObject* component, const uevr::API::FName& boneName,
+		const glm::fvec3& position, const glm::fquat& rotation,
+		const glm::fvec3& scale, uint8_t boneSpace)
+	{
+		if (component == nullptr || component->get_class() == nullptr)
+			return false;
+		auto function = component->get_class()->find_function(L"SetBoneTransformByName");
+		if (function == nullptr)
+			return false;
+		std::vector<uint8_t> params(function->get_properties_size());
+		const bool transformSet = SetReflectedTransformParameter(function, params,
+			L"InTransform", position, rotation, scale)
+			|| SetReflectedTransformParameter(function, params,
+				L"Transform", position, rotation, scale);
+		const bool spaceSet = SetReflectedByteParameter(function, params, L"BoneSpace", boneSpace);
+		if (!SetReflectedFNameParameter(function, params, L"BoneName", boneName)
+			|| !transformSet || !spaceSet)
+			return false;
+		function->call(component, params.data());
+		return true;
+	}
+
+	bool SetBoneComponentTransform(uevr::API::UObject* component, const uevr::API::FName& boneName,
+		const glm::fvec3& position, const glm::fquat& rotation,
+		const glm::fvec3& scale = glm::fvec3(1.0f))
+	{
+		return SetBoneTransformInSpace(component, boneName, position, rotation, scale, 1);
+	}
+
+	bool SetBoneWorldTransform(uevr::API::UObject* component, const uevr::API::FName& boneName,
+		const glm::fvec3& position, const glm::fquat& rotation)
+	{
+		return SetBoneTransformInSpace(component, boneName, position, rotation,
+			glm::fvec3(1.0f), 0);
 	}
 
 	bool HideBone(uevr::API::UObject* component, const uevr::API::FName& boneName)
@@ -649,6 +1663,118 @@ namespace
 		return ReadBoneTransform(component, boneName, translation, rotation, 0);
 	}
 
+	struct CapturedGripBone
+	{
+		const wchar_t* name = L"";
+		int parent = -1;
+		glm::fvec3 position{};
+		glm::fquat rotation{};
+	};
+
+	const std::array<CapturedGripBone, 6>& CapturedVehicleGripBones(int hand)
+	{
+		// Settled native steering pose captured from GTAPoseableComponent hands on
+		// 2026-08-12.  Positions/rotations are component-space source data.  We
+		// derive same-rig parent-local relations below, so existing controller and
+		// per-weapon calibration remain authoritative for final placement.
+		static const std::array<CapturedGripBone, 6> left = {{
+			{ L"L_Hand", -1, {-19.046440f, -30.546392f, 36.806976f}, glm::fquat::wxyz(-0.2643142f, -0.6824937f, 0.6778587f, 0.0696287f) },
+			{ L"LThumb1", 0, {-13.812113f, -31.628971f, 40.731544f}, glm::fquat::wxyz(-0.5455648f, 0.3662382f, 0.2162129f, -0.7221363f) },
+			{ L"LThumb2", 1, {-12.939327f, -36.854279f, 42.525272f}, glm::fquat::wxyz(0.4331086f, -0.7964645f, 0.2601637f, 0.3322292f) },
+			{ L"L_Finger", 0, {-18.466402f, -38.444386f, 38.967026f}, glm::fquat::wxyz(-0.1797713f, -0.9451519f, 0.1791810f, 0.2055831f) },
+			{ L"L_Finger01", 3, {-14.928052f, -40.149456f, 37.623699f}, glm::fquat::wxyz(-0.0539415f, -0.9093494f, -0.3138497f, 0.2677172f) },
+			{ L"L_Finger0Nub", 4, {-12.461994f, -38.116325f, 35.665619f}, glm::fquat::wxyz(0.0539420f, 0.9093489f, 0.3138497f, -0.2677186f) }
+		}};
+		static const std::array<CapturedGripBone, 6> right = {{
+			{ L"R_Hand", -1, {18.787901f, -30.801706f, 38.321873f}, glm::fquat::wxyz(0.5842338f, 0.0821629f, -0.2386883f, -0.7713288f) },
+			{ L"RThumb1", 0, {14.200489f, -31.616087f, 41.868973f}, glm::fquat::wxyz(-0.2244088f, 0.8459628f, 0.4140857f, -0.2500416f) },
+			{ L"RThumb2", 1, {11.102139f, -36.028500f, 43.290676f}, glm::fquat::wxyz(0.3739921f, -0.8132555f, -0.0945300f, -0.4356714f) },
+			{ L"R_Finger", 0, {16.295494f, -38.518932f, 39.570023f}, glm::fquat::wxyz(-0.0095865f, 0.2109961f, -0.1385766f, -0.9675667f) },
+			{ L"R_Finger01", 3, {12.520937f, -38.690578f, 37.867455f}, glm::fquat::wxyz(-0.4366697f, 0.2505321f, -0.0309272f, -0.8634796f) },
+			{ L"R_Finger0Nub", 4, {10.661525f, -35.904903f, 36.138832f}, glm::fquat::wxyz(0.8634790f, -0.0309282f, -0.2505341f, -0.4366696f) }
+		}};
+		return hand == 0 ? left : right;
+	}
+
+	bool ApplyHandPoseFromComponentTransforms(uevr::API::UObject* component, int hand,
+		const uevr::API::FName& handBoneName,
+		const std::array<glm::fvec3, 6>& sourcePositions,
+		const std::array<glm::fquat, 6>& sourceRotations)
+	{
+		if (component == nullptr || (hand != 0 && hand != 1)
+			|| !SetComponentTickEnabled(component, false))
+			return false;
+		glm::fvec3 rootPosition{};
+		glm::fquat rootRotation{};
+		if (!ReadBoneTransform(component, handBoneName, rootPosition, rootRotation, 2))
+			return false;
+		const auto& source = CapturedVehicleGripBones(hand);
+		std::array<glm::fvec3, 6> desiredPositions{};
+		std::array<glm::fquat, 6> desiredRotations{};
+		desiredPositions[0] = rootPosition;
+		desiredRotations[0] = glm::normalize(rootRotation);
+		for (size_t index = 1; index < source.size(); ++index)
+		{
+			const int parent = source[index].parent;
+			if (parent < 0 || parent >= static_cast<int>(index))
+				return false;
+			const glm::fquat sourceParentRotation = glm::normalize(
+				sourceRotations[static_cast<size_t>(parent)]);
+			const glm::fquat localRotation = glm::normalize(
+				glm::inverse(sourceParentRotation) * glm::normalize(sourceRotations[index]));
+			const glm::fvec3 localPosition = glm::inverse(sourceParentRotation)
+				* (sourcePositions[index] - sourcePositions[static_cast<size_t>(parent)]);
+			desiredRotations[index] = glm::normalize(desiredRotations[static_cast<size_t>(parent)] * localRotation);
+			desiredPositions[index] = desiredPositions[static_cast<size_t>(parent)]
+				+ desiredRotations[static_cast<size_t>(parent)] * localPosition;
+			ResolvedBone target;
+			if (!ResolveBone(component, source[index].name, target)
+				|| !SetBoneComponentTransform(component, target.name,
+					desiredPositions[index], desiredRotations[index]))
+				return false;
+		}
+		return true;
+	}
+
+	bool ApplyCapturedVehicleGripPose(uevr::API::UObject* component, int hand,
+		const uevr::API::FName& handBoneName)
+	{
+		if (hand != 0 && hand != 1)
+			return false;
+		const auto& source = CapturedVehicleGripBones(hand);
+		std::array<glm::fvec3, 6> sourcePositions{};
+		std::array<glm::fquat, 6> sourceRotations{};
+		for (size_t index = 0; index < source.size(); ++index)
+		{
+			sourcePositions[index] = source[index].position;
+			sourceRotations[index] = source[index].rotation;
+		}
+		return ApplyHandPoseFromComponentTransforms(component, hand, handBoneName,
+			sourcePositions, sourceRotations);
+	}
+
+	bool ApplyReferenceHandPose(uevr::API::UObject* component,
+		uevr::API::UObject* referenceComponent, int hand,
+		const uevr::API::FName& handBoneName)
+	{
+		if (component == nullptr || referenceComponent == nullptr
+			|| (hand != 0 && hand != 1))
+			return false;
+		const auto& source = CapturedVehicleGripBones(hand);
+		std::array<glm::fvec3, 6> sourcePositions{};
+		std::array<glm::fquat, 6> sourceRotations{};
+		for (size_t index = 0; index < source.size(); ++index)
+		{
+			ResolvedBone sourceBone;
+			if (!ResolveBone(referenceComponent, source[index].name, sourceBone)
+				|| !ReadBoneTransform(referenceComponent, sourceBone.name,
+					sourcePositions[index], sourceRotations[index], 2))
+				return false;
+		}
+		return ApplyHandPoseFromComponentTransforms(component, hand, handBoneName,
+			sourcePositions, sourceRotations);
+	}
+
 	struct NativeFunctionFrame
 	{
 		void* vtable = nullptr;
@@ -659,6 +1785,132 @@ namespace
 		void* code = nullptr;
 		void* locals = nullptr;
 	};
+
+	struct MotionThrowableNativeProbeHook
+	{
+		uevr::API::UFunction* function = nullptr;
+		const char* label = nullptr;
+	};
+
+	std::array<MotionThrowableNativeProbeHook, 3> motionThrowableNativeProbeHooks{};
+	std::atomic<uint32_t> motionThrowableNativeProbeHookCount{ 0 };
+	std::atomic<uint32_t> motionThrowableNativeProbeEventCount{ 0 };
+	bool motionThrowableNativeProbeHooksInitialized = false;
+
+	template <typename TValue>
+	bool ReadNativeFunctionFrameParameter(uevr::API::UFunction* function, void* locals,
+		const wchar_t* name, TValue& value)
+	{
+		if (function == nullptr || locals == nullptr || name == nullptr)
+			return false;
+		auto* property = function->find_property(name);
+		const int32_t offset = property != nullptr ? property->get_offset() : -1;
+		const int32_t propertySize = function->get_properties_size();
+		if (offset < 0 || propertySize < 0
+			|| static_cast<size_t>(offset) + sizeof(TValue) > static_cast<size_t>(propertySize))
+			return false;
+		std::memcpy(&value, reinterpret_cast<const uint8_t*>(locals) + offset, sizeof(value));
+		return true;
+	}
+
+	const char* MotionThrowableNativeProbeLabel(uevr::API::UFunction* function)
+	{
+		const uint32_t count = motionThrowableNativeProbeHookCount.load(std::memory_order_acquire);
+		for (uint32_t index = 0; index < count && index < motionThrowableNativeProbeHooks.size(); ++index)
+		{
+			if (motionThrowableNativeProbeHooks[index].function == function)
+				return motionThrowableNativeProbeHooks[index].label;
+		}
+		return "unknown";
+	}
+
+	bool MotionThrowableNativeMolotovProbePreHook(uevr::API::UFunction* function,
+		uevr::API::UObject* object, void* framePointer, void*)
+	{
+		if (motionThrowableNativeProbeSuppressDepth != 0 || function == nullptr
+			|| framePointer == nullptr)
+			return true;
+
+		const uint32_t event = motionThrowableNativeProbeEventCount.fetch_add(
+			1, std::memory_order_acq_rel) + 1;
+		// The source path can be called by broad explosion systems. Keep the probe
+		// finite and event-level; a native Molotov trigger needs only one or two
+		// records to identify whether this Blueprint route is the right owner.
+		if (event > 32)
+			return true;
+
+		auto* frame = reinterpret_cast<NativeFunctionFrame*>(framePointer);
+		if (frame->locals == nullptr)
+			return true;
+
+		uint8_t type = 0xFF;
+		uint8_t surface = 0xFF;
+		uevr::API::UObject* explosion = nullptr;
+		uevr::API::UObject* explodingActor = nullptr;
+		uevr::API::UObject* debris = nullptr;
+		uevr::API::UObject* worldContext = nullptr;
+		const bool hasType = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"Type", type);
+		const bool hasSurface = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"Surface", surface);
+		const bool hasExplosion = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"Explosion", explosion);
+		const bool hasExplodingActor = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"ExplodingActor", explodingActor);
+		const bool hasDebris = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"DebrisTemplate", debris);
+		const bool hasWorldContext = ReadNativeFunctionFrameParameter(function, frame->locals,
+			L"__WorldContext", worldContext);
+		const std::wstring objectName = object != nullptr && uevr::API::UObjectHook::exists(object)
+			? object->get_full_name() : L"<invalid>";
+		uevr::API::get()->log_info(
+			"[NativeMolotovProbe] event=%u function=%s object=%p objectName=%ls type=%s%u surface=%s%u explosion=%s%p explodingActor=%s%p debris=%s%p world=%s%p",
+			event, MotionThrowableNativeProbeLabel(function), object, objectName.c_str(),
+			hasType ? "" : "n/a:", static_cast<unsigned int>(type),
+			hasSurface ? "" : "n/a:", static_cast<unsigned int>(surface),
+			hasExplosion ? "" : "n/a:", explosion,
+			hasExplodingActor ? "" : "n/a:", explodingActor,
+			hasDebris ? "" : "n/a:", debris,
+			hasWorldContext ? "" : "n/a:", worldContext);
+		return true;
+	}
+
+	void EnsureMotionThrowableNativeMolotovProbeHooks(uevr::API::UClass* spawnLibraryClass)
+	{
+		if (motionThrowableNativeProbeHooksInitialized || spawnLibraryClass == nullptr)
+			return;
+
+		const struct { const wchar_t* name; const char* label; } candidates[] = {
+			{ L"Get Explosion to Spawn", "GetExplosionToSpawn" },
+			{ L"DetermineExplosionTransform", "DetermineExplosionTransform" },
+			{ L"SetupSpawnedExplosion", "SetupSpawnedExplosion" }
+		};
+		uint32_t installed = 0;
+		for (const auto& candidate : candidates)
+		{
+			if (installed >= motionThrowableNativeProbeHooks.size())
+				break;
+			auto* function = spawnLibraryClass->find_function(candidate.name);
+			if (function == nullptr)
+				continue;
+			auto& hook = motionThrowableNativeProbeHooks[installed];
+			hook.function = function;
+			hook.label = candidate.label;
+			if (function->hook_ptr(MotionThrowableNativeMolotovProbePreHook, nullptr))
+				++installed;
+			else
+			{
+				hook = {};
+				uevr::API::get()->log_warn(
+					"[NativeMolotovProbe] hook install failed function=%s", candidate.label);
+			}
+		}
+		motionThrowableNativeProbeHookCount.store(installed, std::memory_order_release);
+		motionThrowableNativeProbeHooksInitialized = true;
+		uevr::API::get()->log_info(
+			"[NativeMolotovProbe] hook initialization installed=%u; custom selector/setup calls are suppressed",
+			installed);
+	}
 
 	struct RawArray
 	{
@@ -1408,6 +2660,238 @@ void WeaponManager::SetMeleeClenchState(bool leftTriggerHeld, bool rightTriggerH
 	motionMeleeClenchMask.store(mask, std::memory_order_release);
 }
 
+void WeaponManager::SetCustomAkimboInputState(uint8_t heldMask,
+	uint8_t edgeMask, int luaWeaponId)
+{
+	customAkimboHeldMaskSnapshot.store(heldMask & 0x03U, std::memory_order_release);
+	if ((edgeMask & 0x03U) != 0)
+		customAkimboEdgeMaskPending.fetch_or(edgeMask & 0x03U, std::memory_order_acq_rel);
+	customAkimboInputWeapon.store(luaWeaponId, std::memory_order_release);
+}
+
+void WeaponManager::ProcessCustomAkimboState()
+{
+	const int weapon = static_cast<int>(currentWeaponEquipped);
+	const bool supported = weapon == Pistol || weapon == Sawnoff
+		|| weapon == MicroUzi || weapon == Tec9;
+	int rejection = 0;
+	if (settingsManager == nullptr || !settingsManager->enableCustomAkimbo)
+		rejection = 1;
+	else if (!supported)
+		rejection = 2;
+	else if (playerManager == nullptr || !playerManager->isInControl
+		|| playerManager->isInVehicle || playerManager->weaponWheelEnabled)
+		rejection = 3;
+	else if (firstWeaponMesh == nullptr || secondWeaponMesh == nullptr
+		|| !uevr::API::UObjectHook::exists(firstWeaponMesh)
+		|| !uevr::API::UObjectHook::exists(secondWeaponMesh))
+		rejection = 4;
+	else if ((gripStateMask.load(std::memory_order_acquire) & 0x03U) != 0x03U)
+		rejection = 5;
+	else if (customAkimboInputWeapon.load(std::memory_order_acquire) >= 0
+		&& customAkimboInputWeapon.load(std::memory_order_acquire) != weapon)
+		rejection = 6;
+
+	const bool active = rejection == 0;
+	const uint8_t heldMask = customAkimboHeldMaskSnapshot.load(std::memory_order_acquire);
+	const uint8_t edgeMask = customAkimboEdgeMaskPending.exchange(0, std::memory_order_acq_rel);
+	if (active && !customAkimboActive)
+	{
+		// UpdateActualWeaponMesh has already assigned the duplicate to the hand
+		// opposite the live GTA mesh. ProcessMagneticIdleWeapon then suspends its
+		// ownership and clears motionConfiguredFirstHand, so recover the primary
+		// from that surviving opposite-hand assignment before forcing both visuals
+		// into controller ownership below.
+		if (motionConfiguredSecondWeaponMesh == customAkimboVisualMesh
+			&& motionConfiguredSecondHand >= 0 && motionConfiguredSecondHand <= 1)
+			customAkimboPrimaryHand = 1 - motionConfiguredSecondHand;
+		else
+			customAkimboPrimaryHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1;
+	}
+	if (memoryManager != nullptr)
+		memoryManager->SetCustomAkimboState(active, weapon, heldMask, edgeMask);
+	if (active != customAkimboActive || rejection != customAkimboLastRejection)
+	{
+		uevr::API::get()->log_info(
+			"[CustomAkimbo] %s weapon=%d rejection=%d grips=%u heldNativeMask=%u first=%p second=%p",
+			active ? "active" : "inactive", weapon, rejection,
+			static_cast<unsigned int>(gripStateMask.load(std::memory_order_relaxed) & 0x03U),
+			static_cast<unsigned int>(heldMask), firstWeaponMesh, secondWeaponMesh);
+		customAkimboActive = active;
+		customAkimboLastRejection = rejection;
+	}
+
+	if (active)
+	{
+		// Magnetic suspension intentionally restores GTA's native attachment and
+		// removes the live mesh's motion state. Akimbo must reclaim both visuals
+		// after that transition; otherwise the duplicate follows one controller
+		// while the original follows CJ's body animation.
+		const bool firstReady = uevr::API::UObjectHook::get_motion_controller_state(firstWeaponMesh) != nullptr;
+		const bool secondReady = uevr::API::UObjectHook::get_motion_controller_state(secondWeaponMesh) != nullptr;
+		if (!motionWeaponTrackingEnabled || !visualWeaponTrackingEnabled
+			|| !firstReady || !secondReady)
+		{
+			// Do not expose either mesh at its native/default transform during the
+			// one-frame ownership handoff. Both are revealed together only after
+			// their controller states exist.
+			SetComponentVisibility(firstWeaponMesh, false);
+			SetComponentVisibility(secondWeaponMesh, false);
+			motionWeaponTrackingEnabled = true;
+			visualWeaponTrackingEnabled = true;
+			magneticIdleWeaponActive = false;
+			if (!firstReady)
+			{
+				motionConfiguredFirstWeaponMesh = nullptr;
+				motionConfiguredFirstHand = -1;
+				motionConfiguredFirstCalibrationRole = -1;
+			}
+			if (!secondReady)
+			{
+				motionConfiguredSecondWeaponMesh = nullptr;
+				motionConfiguredSecondHand = -1;
+			}
+			UpdateActualWeaponMesh();
+			uevr::API::get()->log_info(
+				"[CustomAkimbo] controller ownership repaired primaryHand=%d firstReady=%s secondReady=%s",
+				customAkimboPrimaryHand,
+				uevr::API::UObjectHook::get_motion_controller_state(firstWeaponMesh) != nullptr ? "true" : "false",
+				uevr::API::UObjectHook::get_motion_controller_state(secondWeaponMesh) != nullptr ? "true" : "false");
+		}
+		const bool bothReady = firstWeaponMesh != nullptr && secondWeaponMesh != nullptr
+			&& uevr::API::UObjectHook::get_motion_controller_state(firstWeaponMesh) != nullptr
+			&& uevr::API::UObjectHook::get_motion_controller_state(secondWeaponMesh) != nullptr;
+		SetComponentVisibility(firstWeaponMesh, bothReady && weaponScaledVisible);
+		SetComponentVisibility(secondWeaponMesh, bothReady && weaponScaledVisible);
+	}
+	else
+	{
+		if (customAkimboVisualMesh != nullptr
+			&& uevr::API::UObjectHook::exists(customAkimboVisualMesh))
+			SetComponentVisibility(customAkimboVisualMesh, false);
+		customAkimboPrimaryHand = -1;
+	}
+}
+
+void WeaponManager::RemoveCustomAkimboVisual(const char* reason)
+{
+	auto* visual = customAkimboVisualMesh;
+	if (visual != nullptr && uevr::API::UObjectHook::exists(visual))
+	{
+		uevr::API::UObjectHook::remove_motion_controller_state(visual);
+		SetComponentVisibility(visual, false);
+		auto* componentClass = visual->get_class();
+		auto* destroy = componentClass != nullptr
+			? componentClass->find_function(L"DestroyComponent") : nullptr;
+		if (destroy != nullptr)
+		{
+			std::vector<uint8_t> params(destroy->get_properties_size());
+			SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+			destroy->call(visual, params.data());
+		}
+	}
+	if (secondWeaponMesh == visual)
+	{
+		secondWeaponMesh = nullptr;
+		secondWeaponStaticMesh = nullptr;
+		secondWeaponContainer = nullptr;
+	}
+	if (visibilityAppliedSecondWeaponMesh == visual)
+		visibilityAppliedSecondWeaponMesh = nullptr;
+	if (motionConfiguredSecondWeaponMesh == visual)
+	{
+		motionConfiguredSecondWeaponMesh = nullptr;
+		motionConfiguredSecondHand = -1;
+	}
+	if (visual != nullptr)
+		uevr::API::get()->log_info("[CustomAkimbo] visual removed reason=%s mesh=%p weapon=%d",
+			reason != nullptr ? reason : "unknown", visual, customAkimboVisualWeapon);
+	customAkimboVisualMesh = nullptr;
+	customAkimboVisualStaticMesh = nullptr;
+	customAkimboVisualCharacter = nullptr;
+	customAkimboVisualWeapon = -1;
+}
+
+bool WeaponManager::EnsureCustomAkimboVisual()
+{
+	const int weapon = static_cast<int>(currentWeaponEquipped);
+	const bool supported = weapon == Pistol || weapon == Sawnoff
+		|| weapon == MicroUzi || weapon == Tec9;
+	auto* character = playerManager != nullptr ? playerManager->playerCharacter : nullptr;
+	if (!supported || character == nullptr || firstWeaponStaticMesh == nullptr
+		|| !uevr::API::UObjectHook::exists(character)
+		|| !uevr::API::UObjectHook::exists(firstWeaponStaticMesh))
+		return false;
+
+	if (customAkimboVisualMesh != nullptr
+		&& customAkimboVisualCharacter == character
+		&& customAkimboVisualStaticMesh == firstWeaponStaticMesh
+		&& customAkimboVisualWeapon == weapon
+		&& uevr::API::UObjectHook::exists(customAkimboVisualMesh))
+	{
+		secondWeaponMesh = customAkimboVisualMesh;
+		secondWeaponStaticMesh = customAkimboVisualStaticMesh;
+		secondWeaponContainer = nullptr;
+		return true;
+	}
+
+	RemoveCustomAkimboVisual("replace");
+	auto* staticMeshClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+		L"Class /Script/Engine.StaticMeshComponent");
+	auto* visual = staticMeshClass != nullptr
+		? AddSkeletalComponent(character, staticMeshClass) : nullptr;
+	if (visual == nullptr || !CallSetStaticMesh(visual, firstWeaponStaticMesh))
+	{
+		if (visual != nullptr && uevr::API::UObjectHook::exists(visual))
+			SetComponentVisibility(visual, false);
+		uevr::API::get()->log_warn("[CustomAkimbo] visual creation failed weapon=%d", weapon);
+		return false;
+	}
+
+	customAkimboVisualMesh = visual;
+	customAkimboVisualStaticMesh = firstWeaponStaticMesh;
+	customAkimboVisualCharacter = character;
+	customAkimboVisualWeapon = weapon;
+	secondWeaponMesh = visual;
+	secondWeaponStaticMesh = firstWeaponStaticMesh;
+	secondWeaponContainer = nullptr;
+	SetComponentVisibility(visual, false);
+	uevr::API::get()->log_info("[CustomAkimbo] visual created weapon=%d mesh=%p asset=%p character=%p",
+		weapon, visual, firstWeaponStaticMesh, character);
+	return true;
+}
+
+void WeaponManager::QueuePhysicalThrowableProbeEvent(int eventType,
+	uint32_t sequence, uint8_t handMask, uint8_t gripMask,
+	uint32_t holdMilliseconds, int luaWeaponId)
+{
+	// Called from Lua/custom-event context: publish plain values only. UObject and
+	// controller-pose reads remain on the engine thread in ProcessPhysicalThrowableProbe.
+	handMask &= 3U;
+	gripMask &= 3U;
+	if (eventType == 1 && sequence != 0 && handMask != 0)
+	{
+		throwableProbeEdgeSequence.store(sequence, std::memory_order_relaxed);
+		throwableProbeEdgeHandMask.store(handMask, std::memory_order_relaxed);
+		throwableProbeEdgeGripMask.store(gripMask, std::memory_order_relaxed);
+		throwableProbeEdgeLuaWeapon.store(luaWeaponId, std::memory_order_relaxed);
+		throwableProbeEdgePending.store(true, std::memory_order_release);
+	}
+	else if (eventType == 2 && sequence != 0 && handMask != 0)
+	{
+		throwableProbeReleaseSequence.store(sequence, std::memory_order_relaxed);
+		throwableProbeReleaseHandMask.store(handMask, std::memory_order_relaxed);
+		throwableProbeReleaseGripMask.store(gripMask, std::memory_order_relaxed);
+		throwableProbeReleaseHoldMilliseconds.store(holdMilliseconds, std::memory_order_relaxed);
+		throwableProbeReleaseLuaWeapon.store(luaWeaponId, std::memory_order_relaxed);
+		throwableProbeReleasePending.store(true, std::memory_order_release);
+	}
+	else if (eventType == 3)
+	{
+		throwableProbeCancelPending.store(true, std::memory_order_release);
+	}
+}
+
 void WeaponManager::BeginInteractionEngineTick()
 {
 	// Advance once at the outer engine-tick boundary, before any forced/free-hand
@@ -1955,7 +3439,8 @@ void WeaponManager::ProcessTwoHandStabilization(float delta)
 	}
 }
 
-void WeaponManager::SetComponentVisibility(uevr::API::UObject* object, bool visible)
+void WeaponManager::SetComponentVisibility(uevr::API::UObject* object, bool visible,
+	bool propagateToChildren)
 {
 	if (object == nullptr || !uevr::API::UObjectHook::exists(object))
 		return;
@@ -1966,7 +3451,7 @@ void WeaponManager::SetComponentVisibility(uevr::API::UObject* object, bool visi
 
 	ParameterSetVisibility params{};
 	params.bNewVisibility = visible;
-	params.bPropagateToChildren = true;
+	params.bPropagateToChildren = propagateToChildren;
 
 	if (objectClass->find_function(L"SetVisibility") != nullptr)
 		object->call_function(L"SetVisibility", &params);
@@ -2063,14 +3548,12 @@ void WeaponManager::RefreshRuntimeHandRoles(const char* reason)
 	}
 
 	const uint8_t grips = gripStateMask.load(std::memory_order_acquire);
-	const bool nativeThrowable = currentWeaponEquipped >= Grenade
-		&& currentWeaponEquipped <= Molotov;
 	std::array<RuntimeHandState, 2> desired{};
 	for (int hand = 0; hand < 2; ++hand)
 	{
 		desired[static_cast<size_t>(hand)].weaponId = -1;
 		desired[static_cast<size_t>(hand)].gripHeld = (grips & (1U << hand)) != 0;
-		if (freeAimFakeHandsActive && !nativeThrowable)
+		if (freeAimFakeHandsActive)
 			desired[static_cast<size_t>(hand)].role = RuntimeHandRole::FreeTracked;
 	}
 
@@ -2080,7 +3563,7 @@ void WeaponManager::RefreshRuntimeHandRoles(const char* reason)
 		desired[1].role = RuntimeHandRole::VehiclePrimary;
 		desired[1].weaponId = static_cast<int>(currentWeaponEquipped);
 	}
-	else if (!nativeThrowable)
+	else
 	{
 		int primaryHand = magneticGripHand;
 		if (primaryHand < 0 && motionWeaponTrackingEnabled)
@@ -2150,15 +3633,17 @@ bool WeaponManager::IsGripCalibrationEligible(int controllerHand) const
 	const uint8_t mask = gripStateMask.load(std::memory_order_acquire);
 	const bool meleeWeapon = currentWeaponEquipped >= BrassKnuckles
 		&& currentWeaponEquipped <= Cane;
+	const bool throwable = currentWeaponEquipped >= Grenade
+		&& currentWeaponEquipped <= Molotov;
 	const bool firearm = currentWeaponEquipped >= Pistol
 		&& currentWeaponEquipped <= Minigun;
 	const bool controllerHeldUtility = IsControllerHeldUtility();
 	if ((mask & (1U << controllerHand)) == 0
 		|| !playerManager->isInControl || playerManager->isInVehicle
-		|| playerManager->weaponWheelEnabled || (!meleeWeapon && !firearm && !controllerHeldUtility)
+		|| playerManager->weaponWheelEnabled || (!meleeWeapon && !throwable && !firearm && !controllerHeldUtility)
 		// Melee calibration is deliberately single-hand until its two-hand
 		// semantics exist; firearm support keeps the existing support path.
-		|| ((meleeWeapon || controllerHeldUtility) && mask == 3U) || firstWeaponMesh == nullptr
+		|| ((meleeWeapon || throwable || controllerHeldUtility) && mask == 3U) || firstWeaponMesh == nullptr
 		|| !uevr::API::UObjectHook::exists(firstWeaponMesh))
 		return false;
 	const bool supportHand = mask == 3U
@@ -3769,6 +5254,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 
 	if (playerManager->playerController == nullptr || gta_BPplayerCharacter_c == nullptr || gta_StaticMeshComponent_c == nullptr)
 	{
+		RemoveCustomAkimboVisual("player-unavailable");
 		logVehicleResolution(8);
 		currentWeaponEquipped = Unarmed;
 		firstWeaponMesh = nullptr;
@@ -3800,6 +5286,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 		torso = gta_BPplayerCharacter->get_property<uevr::API::UObject*>(L"torso");
 	else
 	{
+		RemoveCustomAkimboVisual("character-unavailable");
 		uevr::API::get()->log_info("gta_BPplayerCharacter not found.");
 		logVehicleResolution(5);
 		torso = nullptr;
@@ -3822,6 +5309,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 	}
 	if (torso == nullptr)
 	{
+		RemoveCustomAkimboVisual("torso-unavailable");
 		logVehicleResolution(5);
 		currentWeaponEquipped = Unarmed;
 		firstWeaponMesh = nullptr;
@@ -3949,6 +5437,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 	}
 	else
 	{
+		RemoveCustomAkimboVisual("weapon-mesh-unavailable");
 		logVehicleResolution(5);
 		currentWeaponEquipped = Unarmed;
 		firstWeaponMesh = nullptr;
@@ -3980,6 +5469,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 	if (firstWeaponStaticMesh == nullptr
 		|| !uevr::API::UObjectHook::exists(firstWeaponStaticMesh))
 	{
+		RemoveCustomAkimboVisual("weapon-asset-unavailable");
 		logVehicleResolution(5);
 		currentWeaponEquipped = Unarmed;
 		firstWeaponMesh = nullptr;
@@ -3998,6 +5488,28 @@ void WeaponManager::UpdateActualWeaponMesh()
 	auto it = weaponNameToIndex.find(weaponName);
 	if (it != weaponNameToIndex.end())
 		currentWeaponEquipped = static_cast<WeaponType>(it->second);
+
+	const int discoveredWeapon = static_cast<int>(currentWeaponEquipped);
+	const bool customAkimboSupported = discoveredWeapon == Pistol || discoveredWeapon == Sawnoff
+		|| discoveredWeapon == MicroUzi || discoveredWeapon == Tec9;
+	if (secondWeaponMeshFetch != nullptr)
+	{
+		// Prefer GTA's live second mesh if one exists; never show a third gun.
+		RemoveCustomAkimboVisual("native-second-present");
+		secondWeaponMesh = secondWeaponMeshFetch;
+		secondWeaponStaticMesh = secondWeaponMesh->get_property<uevr::API::UObject*>(L"StaticMesh");
+		secondWeaponContainer = secondWeaponContainerFetch;
+	}
+	else if (settingsManager != nullptr && settingsManager->enableCustomAkimbo
+		&& customAkimboSupported && playerManager->isInControl && !playerManager->isInVehicle
+		&& (gripStateMask.load(std::memory_order_acquire) & 0x03U) == 0x03U)
+	{
+		EnsureCustomAkimboVisual();
+	}
+	else
+	{
+		RemoveCustomAkimboVisual("ineligible");
+	}
 
 	const bool wasVehicleFreeAimActive = vehicleFreeAimPresentationActive;
 	const bool vehicleFreeAimActive = IsVehicleFreeAimActive();
@@ -4126,10 +5638,15 @@ void WeaponManager::UpdateActualWeaponMesh()
 	}
 	if (visibilityAppliedSecondWeaponMesh != secondWeaponMesh)
 	{
-		SetComponentVisibility(secondWeaponMesh, weaponScaledVisible);
+		const bool customVisual = secondWeaponMesh != nullptr
+			&& secondWeaponMesh == customAkimboVisualMesh;
+		const bool secondVisible = weaponScaledVisible && (!customVisual
+			|| customAkimboActive);
+		SetComponentVisibility(secondWeaponMesh, secondVisible);
 		visibilityAppliedSecondWeaponMesh = secondWeaponMesh;
 		if (settingsManager->debugInputLayerProbe)
-			uevr::API::get()->log_info("[WeaponAttach] second mesh=%p visible=%s", secondWeaponMesh, weaponScaledVisible ? "true" : "false");
+			uevr::API::get()->log_info("[WeaponAttach] second mesh=%p visible=%s custom=%s",
+				secondWeaponMesh, secondVisible ? "true" : "false", customVisual ? "true" : "false");
 	}
 
 	if (visualWeaponTrackingEnabled && !magneticIdleWeaponActive && !IsGripCalibrationActive()
@@ -4141,8 +5658,12 @@ void WeaponManager::UpdateActualWeaponMesh()
 		const bool lockTwoHandPrimary = twoHandLatchEligibleSnapshot.load(std::memory_order_acquire)
 			&& gripStateMask.load(std::memory_order_acquire) != 0
 			&& latchedTwoHandPrimary >= 0;
+		const bool customAkimboPresentation = secondWeaponMesh == customAkimboVisualMesh
+			&& (gripStateMask.load(std::memory_order_acquire) & 0x03U) == 0x03U;
 		const int desiredFirstHand = vehicleFreeAimActive
 			? 1
+			: customAkimboPresentation && customAkimboPrimaryHand >= 0
+			? customAkimboPrimaryHand
 			: magneticGripHand >= 0
 			? magneticGripHand
 			: lockTwoHandPrimary
@@ -4193,13 +5714,15 @@ void WeaponManager::UpdateActualWeaponMesh()
 		}
 		if (secondWeaponMesh != nullptr)
 		{
-			const int desiredSecondHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 1 : 0;
+			const int desiredSecondHand = secondWeaponMesh == customAkimboVisualMesh
+				? 1 - desiredFirstHand
+				: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 1 : 0);
 			if (motionConfiguredSecondWeaponMesh != secondWeaponMesh || motionConfiguredSecondHand != desiredSecondHand)
 			{
 				auto motionState = uevr::API::UObjectHook::get_or_add_motion_controller_state(secondWeaponMesh);
 				const glm::fvec3 weaponPosition = GetWeaponGripPositionOffset(desiredSecondHand);
 				const UEVR_Vector3f weaponPositionUevr = { weaponPosition.x, weaponPosition.y, weaponPosition.z };
-				glm::fquat defaultWeaponRotationQuat = glm::fquat(defaultWeaponRotationEuler);
+				glm::fquat defaultWeaponRotationQuat = GetWeaponGripRotationOffset(desiredSecondHand);
 				UEVR_Quaternionf defaultWeaponRotationQuat_UEVR = { defaultWeaponRotationQuat.w , defaultWeaponRotationQuat.x, defaultWeaponRotationQuat.y, defaultWeaponRotationQuat.z };
 				motionState->set_location_offset(&weaponPositionUevr);
 				motionState->set_rotation_offset(&defaultWeaponRotationQuat_UEVR);
@@ -4245,6 +5768,25 @@ void WeaponManager::ResetShootingState()
 {
 	firstWeaponIsShooting = false;
 	secondWeaponIsShooting = false;
+	customAkimboHeldMaskSnapshot.store(0, std::memory_order_release);
+	customAkimboEdgeMaskPending.store(0, std::memory_order_release);
+	customAkimboInputWeapon.store(-1, std::memory_order_release);
+	customAkimboActive = false;
+	customAkimboLastRejection = -1;
+	customAkimboPrimaryHand = -1;
+	customAkimboMuzzleValidMask = 0;
+	customAkimboFlashAlternateHand = 0;
+	customAkimboLastEffectMuzzleWorld = {};
+	customAkimboLastEffectMuzzleValid = false;
+	customAkimboMuzzleEffectTemplate = nullptr;
+	customAkimboMuzzleEffectTemplates.clear();
+	customAkimboMuzzleEffectScales.clear();
+	customAkimboMuzzleEffectTemplateWeapon = -1;
+	customAkimboPendingEffectHandMask = 0;
+	customAkimboPendingEffectSince = 0;
+	customAkimboMissingEffectTemplateLogged = false;
+	if (memoryManager != nullptr)
+		memoryManager->ClearCustomAkimboState();
 	motionMeleeNativeTriggerBlockSnapshot.store(false, std::memory_order_release);
 	motionMeleeClenchMask.store(0, std::memory_order_release);
 	motionMeleeLastLoggedClenchMask = 0xFF;
@@ -4262,6 +5804,7 @@ void WeaponManager::ResetShootingState()
 	motionMeleeInterSwingCooldownRemaining = { 0.0f, 0.0f };
 	motionMeleeContactWindowRemaining = { 0.0f, 0.0f };
 	motionMeleeHandActiveState = { false, false };
+	motionMeleeHandGeometryMode = { -1, -1 };
 	firstWeaponShotDone = false;
 	firstWeaponLastParticleShot = nullptr;
 	secondWeaponLastParticleShot = nullptr;
@@ -4295,6 +5838,55 @@ bool WeaponManager::HideBulletTrace()
 	return true;
 }
 
+void WeaponManager::CacheCustomAkimboEffectTemplate(uevr::API::UObject* component)
+{
+	if (component == nullptr || !uevr::API::UObjectHook::exists(component)
+		|| component->get_class() == nullptr)
+		return;
+	auto* componentClass = component->get_class();
+	if (componentClass->find_property(L"Template") == nullptr)
+		return;
+	auto* effectTemplate = component->get_property<uevr::API::UObject*>(L"Template");
+	if (effectTemplate == nullptr || !uevr::API::UObjectHook::exists(effectTemplate))
+		return;
+
+	glm::fvec3 nativeScale(1.0f);
+	auto* getScale = componentClass->find_function(L"GetComponentScale");
+	if (getScale == nullptr)
+		getScale = componentClass->find_function(L"K2_GetComponentScale");
+	if (getScale != nullptr)
+	{
+		Utilities::ParameterSingleVector3 scaleParams{};
+		getScale->call(component, &scaleParams);
+		const glm::fvec3 candidate = glm::abs(scaleParams.vec3Value);
+		if (IsFiniteVector(candidate)
+			&& candidate.x > 0.001f && candidate.y > 0.001f && candidate.z > 0.001f
+			&& candidate.x < 100.0f && candidate.y < 100.0f && candidate.z < 100.0f)
+			nativeScale = candidate;
+	}
+
+	auto existing = std::find(customAkimboMuzzleEffectTemplates.begin(),
+		customAkimboMuzzleEffectTemplates.end(), effectTemplate);
+	if (existing == customAkimboMuzzleEffectTemplates.end())
+	{
+		customAkimboMuzzleEffectTemplates.push_back(effectTemplate);
+		customAkimboMuzzleEffectScales.push_back(nativeScale);
+		uevr::API::get()->log_info(
+			"[CustomAkimboFlash] native effect template captured index=%llu name=%ls scale=(%.2f %.2f %.2f)",
+			static_cast<unsigned long long>(customAkimboMuzzleEffectTemplates.size() - 1),
+			effectTemplate->get_full_name().c_str(), nativeScale.x, nativeScale.y, nativeScale.z);
+	}
+	else
+	{
+		const size_t index = static_cast<size_t>(existing - customAkimboMuzzleEffectTemplates.begin());
+		if (index < customAkimboMuzzleEffectScales.size())
+			customAkimboMuzzleEffectScales[index] = nativeScale;
+	}
+	customAkimboMuzzleEffectTemplate = effectTemplate;
+	customAkimboMuzzleEffectTemplateWeapon = static_cast<int>(currentWeaponEquipped);
+	customAkimboMissingEffectTemplateLogged = false;
+}
+
 void WeaponManager::UpdateShootingState(bool firstWeapon)
 {
 	uevr::API::UObject* weaponMesh = firstWeapon ? firstWeaponMesh : secondWeaponMesh;
@@ -4310,6 +5902,7 @@ void WeaponManager::UpdateShootingState(bool firstWeapon)
 
 	bool newParticleDetected = false;
 	uevr::API::UObject* newParticle = nullptr;
+	std::vector<uevr::API::UObject*> newParticles;
 
     for (size_t i = 0; i < childrenParticle.count; ++i)
     {
@@ -4318,9 +5911,10 @@ void WeaponManager::UpdateShootingState(bool firstWeapon)
         if (std::find(previousParticles.begin(), previousParticles.end(), particle) == previousParticles.end())
         {
             newParticleDetected = true;
-			newParticle = particle;
+			if (newParticle == nullptr)
+				newParticle = particle;
+			newParticles.push_back(particle);
 			/*uevr::API::get()->log_info("childrenParticle.data[i] = %ls", childrenParticle.data[i]->get_fname()->to_string().c_str());*/
-            break;
         }
     }
 
@@ -4335,11 +5929,133 @@ void WeaponManager::UpdateShootingState(bool firstWeapon)
 	{
 		firstWeaponIsShooting = false;
 		secondWeaponIsShooting = false;
-		return;
+		// GTA's ordinary cadence cannot create legitimate consecutive-frame
+		// flashes. Custom akimbo can accept the opposite hand on the next frame,
+		// so do not discard that independently owned particle pulse.
+		if (!customAkimboActive)
+			return;
 	}
+
+	const uint64_t effectNow = GetTickCount64();
+	if (customAkimboActive && memoryManager != nullptr)
+	{
+		const uint8_t newlyAccepted = memoryManager->ConsumeCustomAkimboAcceptedHandMask() & 0x03U;
+		if (newlyAccepted != 0)
+		{
+			if (customAkimboPendingEffectHandMask == 0)
+				customAkimboPendingEffectSince = effectNow;
+			customAkimboPendingEffectHandMask |= newlyAccepted;
+		}
+	}
+	else
+	{
+		customAkimboPendingEffectHandMask = 0;
+		customAkimboPendingEffectSince = 0;
+	}
+
+	// Capture the exact native particle system rather than guessing an asset.
+	// This is valid even before akimbo engages, so a later left-first shot can
+	// reuse the already observed weapon-specific flash/smoke effect.
+	for (auto* particle : newParticles)
+	{
+		if (particle == nullptr || !uevr::API::UObjectHook::exists(particle)
+			|| particle->get_class() == nullptr)
+			continue;
+		CacheCustomAkimboEffectTemplate(particle);
+	}
+
+	const auto spawnCustomAkimboEffect = [this](int hand) -> bool
+	{
+		if (hand < 0 || hand > 1
+			|| customAkimboMuzzleEffectTemplate == nullptr
+			|| customAkimboMuzzleEffectTemplateWeapon != static_cast<int>(currentWeaponEquipped)
+			|| !uevr::API::UObjectHook::exists(customAkimboMuzzleEffectTemplate)
+			|| (customAkimboMuzzleValidMask & static_cast<uint8_t>(1U << hand)) == 0
+			|| playerManager == nullptr || playerManager->playerCharacter == nullptr)
+			return false;
+		bool spawnedAny = false;
+		for (size_t effectIndex = 0;
+			effectIndex < customAkimboMuzzleEffectTemplates.size(); ++effectIndex)
+		{
+			auto* effectTemplate = customAkimboMuzzleEffectTemplates[effectIndex];
+			if (effectTemplate == nullptr || !uevr::API::UObjectHook::exists(effectTemplate))
+				continue;
+			glm::fvec3 effectScale = effectIndex < customAkimboMuzzleEffectScales.size()
+				? customAkimboMuzzleEffectScales[effectIndex] : glm::fvec3(1.0f);
+			// The world-spawned copy lacks the native weapon component's inherited
+			// scale/instance setup. A small bounded correction matches the native
+			// right-hand flash without changing the native effect itself.
+			effectScale *= 1.20f;
+			auto* spawned = SpawnParticleSystemAtLocation(playerManager->playerCharacter,
+				effectTemplate, customAkimboMuzzleWorld[hand], effectScale);
+			if (spawned == nullptr)
+				continue;
+			EnsureMotionThrowableVisualRenderable(spawned);
+			spawnedAny = true;
+		}
+		if (!spawnedAny)
+			return false;
+		lastAimMuzzleWorldPosition = customAkimboMuzzleWorld[hand];
+		customAkimboLastEffectMuzzleWorld = customAkimboMuzzleWorld[hand];
+		customAkimboLastEffectMuzzleValid = true;
+		return true;
+	};
 
 	if (newParticleDetected)
 	{
+		if (customAkimboActive && memoryManager != nullptr)
+		{
+			const uint8_t acceptedMask = customAkimboPendingEffectHandMask;
+			uint8_t movedMask = 0;
+			for (size_t particleIndex = 0; particleIndex < newParticles.size(); ++particleIndex)
+			{
+				int flashHand = -1;
+				if (acceptedMask == 0x01U)
+					flashHand = 0;
+				else if (acceptedMask == 0x02U)
+					flashHand = 1;
+				else if (acceptedMask == 0x03U)
+				{
+					// GTA normally creates one particle for its authoritative right lane.
+					// Keep it there and synthesize the missing left visual from its exact
+					// template. If two particles exist, distribute one to each muzzle.
+					flashHand = newParticles.size() >= 2
+						? static_cast<int>(particleIndex & 1U)
+						: 1;
+				}
+				auto* particle = newParticles[particleIndex];
+				if (flashHand < 0
+					|| (customAkimboMuzzleValidMask & static_cast<uint8_t>(1U << flashHand)) == 0
+					|| particle == nullptr || !uevr::API::UObjectHook::exists(particle)
+					|| particle->get_class() == nullptr
+					|| particle->get_class()->find_function(L"K2_SetWorldLocation") == nullptr)
+					continue;
+
+				Utilities::Parameter_K2_SetWorldOrRelativeLocation setWorldLocationParams{};
+				setWorldLocationParams.newLocation = customAkimboMuzzleWorld[flashHand];
+				setWorldLocationParams.bSweep = false;
+				setWorldLocationParams.bTeleport = true;
+				particle->call_function(L"K2_SetWorldLocation", &setWorldLocationParams);
+				lastAimMuzzleWorldPosition = customAkimboMuzzleWorld[flashHand];
+				customAkimboLastEffectMuzzleWorld = customAkimboMuzzleWorld[flashHand];
+				customAkimboLastEffectMuzzleValid = true;
+				movedMask |= static_cast<uint8_t>(1U << flashHand);
+			}
+			uint8_t spawnedMask = 0;
+			if ((acceptedMask & 0x01U) != 0 && (movedMask & 0x01U) == 0
+				&& spawnCustomAkimboEffect(0))
+				spawnedMask |= 0x01U;
+			customAkimboPendingEffectHandMask = 0;
+			customAkimboPendingEffectSince = 0;
+			if (settingsManager->debugInputLayerProbe)
+				uevr::API::get()->log_info(
+					"[CustomAkimboFlash] particles=%llu acceptedMask=%u movedMask=%u spawnedMask=%u muzzleL=(%.1f %.1f %.1f) muzzleR=(%.1f %.1f %.1f)",
+					static_cast<unsigned long long>(newParticles.size()),
+					static_cast<unsigned int>(acceptedMask), static_cast<unsigned int>(movedMask),
+					static_cast<unsigned int>(spawnedMask),
+					customAkimboMuzzleWorld[0].x, customAkimboMuzzleWorld[0].y, customAkimboMuzzleWorld[0].z,
+					customAkimboMuzzleWorld[1].x, customAkimboMuzzleWorld[1].y, customAkimboMuzzleWorld[1].z);
+		}
 		memoryManager->RecordTriggerTimingMuzzleParticle(static_cast<int>(currentWeaponEquipped), firstWeapon);
 		if (!shotHierarchyProbeLogged && settingsManager->debugSpreadProbe)
 		{
@@ -4402,6 +6118,39 @@ void WeaponManager::UpdateShootingState(bool firstWeapon)
 			firstWeaponShotDone = false;
 		}
 	}
+	else if (customAkimboActive && (customAkimboPendingEffectHandMask & 0x01U) != 0
+		&& customAkimboPendingEffectSince != 0
+		&& effectNow - customAkimboPendingEffectSince >= 25)
+	{
+		// The presentation-only left lane has no native particle child. Wait one
+		// short engine interval so a late native particle can still win, then emit
+		// only the missing visual effect at the accepted left muzzle.
+		const bool spawned = spawnCustomAkimboEffect(0);
+		// Native muzzle smoke/effect siblings can exist even when GTA omits the
+		// mesh-child flash for the left presentation lane. Keep the ordinary
+		// one-shot redirect gate open for this accepted shot so those components
+		// are discovered and moved to the left muzzle later in the same tick.
+		firstWeaponIsShooting = true;
+		customAkimboLastEffectMuzzleWorld = customAkimboMuzzleWorld[0];
+		customAkimboLastEffectMuzzleValid = true;
+		customAkimboPendingEffectHandMask &= ~0x01U;
+		if (customAkimboPendingEffectHandMask == 0)
+			customAkimboPendingEffectSince = 0;
+		if (!spawned && !customAkimboMissingEffectTemplateLogged)
+		{
+			customAkimboMissingEffectTemplateLogged = true;
+			uevr::API::get()->log_warn(
+				"[CustomAkimboFlash] left visual deferred: native effect template unavailable weapon=%d",
+				static_cast<int>(currentWeaponEquipped));
+		}
+		else if (spawned && settingsManager->debugInputLayerProbe)
+		{
+			uevr::API::get()->log_info(
+				"[CustomAkimboFlash] particles=0 acceptedMask=1 movedMask=0 spawnedMask=1 muzzleL=(%.1f %.1f %.1f)",
+				customAkimboMuzzleWorld[0].x, customAkimboMuzzleWorld[0].y,
+				customAkimboMuzzleWorld[0].z);
+		}
+	}
 }
 
 void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
@@ -4417,7 +6166,9 @@ void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
 		|| firstWeaponMesh == nullptr || firstWeaponContainer == nullptr
 		|| !uevr::API::UObjectHook::exists(firstWeaponMesh)
 		|| !uevr::API::UObjectHook::exists(firstWeaponContainer)
-		|| !IsFiniteVector(lastAimMuzzleWorldPosition)
+		|| (!IsFiniteVector(lastAimMuzzleWorldPosition)
+			&& !(customAkimboActive && customAkimboLastEffectMuzzleValid
+				&& IsFiniteVector(customAkimboLastEffectMuzzleWorld)))
 		|| currentWeaponEquipped < Pistol || currentWeaponEquipped > Minigun)
 		return;
 
@@ -4430,6 +6181,11 @@ void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
 	const glm::fvec3 nativeEffectOrigin = containerLocationParams.vec3Value;
 	if (!IsFiniteVector(nativeEffectOrigin))
 		return;
+	const glm::fvec3 effectDestination = customAkimboActive
+		&& customAkimboLastEffectMuzzleValid
+		&& IsFiniteVector(customAkimboLastEffectMuzzleWorld)
+		? customAkimboLastEffectMuzzleWorld
+		: lastAimMuzzleWorldPosition;
 
 	const auto getAttachParent = [](uevr::API::UObject* object) -> uevr::API::UObject*
 	{
@@ -4493,9 +6249,16 @@ void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
 			if (!std::isfinite(rootDistance) || rootDistance > 250.0f)
 				continue;
 
+			// Cache every actual native particle-system template involved in the
+			// shot, not merely the first newly attached child (which can be a shell
+			// or another non-visible helper). These become the left lane's visual-only
+			// flash/smoke set on subsequent accepted shots.
+			if (customAkimboActive)
+				CacheCustomAkimboEffectTemplate(effect);
+
 			++candidateCount;
 			Utilities::Parameter_K2_SetWorldOrRelativeLocation setWorldLocationParams{};
-			setWorldLocationParams.newLocation = lastAimMuzzleWorldPosition;
+			setWorldLocationParams.newLocation = effectDestination;
 			setWorldLocationParams.bSweep = false;
 			setWorldLocationParams.bTeleport = true;
 			effect->call_function(L"K2_SetWorldLocation", &setWorldLocationParams);
@@ -4511,7 +6274,7 @@ void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
 					"[WorldShotEffectRedirect] moved effect=%p class=%ls name=%ls parent=%ls from=(%.3f %.3f %.3f) to=(%.3f %.3f %.3f) rootDistance=%.3f",
 					effect, effectClassName.c_str(), effectName.c_str(), parentName.c_str(),
 					effectLocation.x, effectLocation.y, effectLocation.z,
-					lastAimMuzzleWorldPosition.x, lastAimMuzzleWorldPosition.y, lastAimMuzzleWorldPosition.z,
+					effectDestination.x, effectDestination.y, effectDestination.z,
 					rootDistance);
 			}
 		}
@@ -4531,7 +6294,7 @@ void WeaponManager::RedirectWorldShotEffects(bool firstWeapon)
 			"[WorldShotEffectRedirect] shot=%u scanned candidateCount=%u movedCount=%u nativeRoot=(%.3f %.3f %.3f) mockMuzzle=(%.3f %.3f %.3f)",
 			++shotSequence, candidateCount, movedCount,
 			nativeEffectOrigin.x, nativeEffectOrigin.y, nativeEffectOrigin.z,
-			lastAimMuzzleWorldPosition.x, lastAimMuzzleWorldPosition.y, lastAimMuzzleWorldPosition.z);
+			effectDestination.x, effectDestination.y, effectDestination.z);
 	}
 }
 
@@ -4753,7 +6516,7 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		clearNativeShotSnapshot();
 		return;
 	}
-	
+
 	// If not aiming, synchronise the aiming vector with the camera matrix (prevents the radar from following the gun orientation)
 	if (!playerManager->isInVehicle && camModsRequiringAimHandling.find((int)cameraController->currentCameraMode) == camModsRequiringAimHandling.end()) //check if the current camera mode is in the aiming cam, if not, return
 	{
@@ -4811,7 +6574,7 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		clearNativeShotSnapshot();
 		return;
 	}
-	
+
 	uevr::API::UObject* weaponMesh = firstWeapon ? firstWeaponMesh : secondWeaponMesh;
 
 	if (weaponMesh != nullptr) {
@@ -4833,7 +6596,7 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		//mesh alignement weapon offsets
 		switch (currentWeaponEquipped)
 		{
-			// Offsets taken from the game's 3D models in Blender by taking 2 points aligned with the barrel. Units is centimeters. 
+			// Offsets taken from the game's 3D models in Blender by taking 2 points aligned with the barrel. Units is centimeters.
 			// Y axis is inversed in Blender.
 			// We then add some slight offsets manually depending on the aiming tests done ingame.
 		case Pistol :
@@ -4912,6 +6675,13 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		case Minigun :
 			point1Offsets = { 48.1025 , -2.9978 , 14.3878 };
 			point2Offsets = { 86.6453 , 0.429413 /*- 0.5*/ , 35.9644 /*- 0.5 */};
+			break;
+		case Grenade:
+		case Teargas:
+		case Molotov:
+			// Physical throwables use the tracked mesh/controller forward while GTA
+			// retains native cook/release ownership and projectile timing.
+			socketAvailable = false;
 			break;
 		case SprayCan:
 			/*point1Offsets = { 2.82819, -2.52103, 9.92684 };
@@ -5013,7 +6783,7 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		{
 			Utilities::ParameterSingleVector3 componentToWorld_params;
 			weaponMesh->call_function(L"K2_GetComponentLocation", &componentToWorld_params);
-			
+
 			if (glm::length(point1Offsets) > 0.0f && glm::length(point2Offsets) > 0.0f)
 			{
 				point1Position = Utilities::OffsetLocalPositionFromWorld(componentToWorld_params.vec3Value, forwardVector_params.vec3Value, upVector_params.vec3Value, rightVector_params.vec3Value, point1Offsets);
@@ -5034,7 +6804,10 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 		// socket itself is the closest stable pre-fire transform.
 		uevr::API::UObject* gunflashComponent = firstWeapon
 			? firstWeaponLastParticleShot : secondWeaponLastParticleShot;
-		if (gunflashComponent != nullptr && uevr::API::UObjectHook::exists(gunflashComponent))
+		// A relocated akimbo particle must never become the next frame's muzzle
+		// origin. Each hand's gunflash socket is the authoritative barrel tip.
+		if (!customAkimboActive && gunflashComponent != nullptr
+			&& uevr::API::UObjectHook::exists(gunflashComponent))
 		{
 			auto gunflashClass = gunflashComponent->get_class();
 			if (gunflashClass != nullptr
@@ -5055,6 +6828,49 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 
 		calculatedAimForward = {aimingDirection.x, -aimingDirection.y, aimingDirection.z};
 		calculatedAimPosition = { point1Position.x * 0.01f, -point1Position.y * 0.01f, point1Position.z * 0.01f};
+		glm::fvec3 currentBarrelDirection = rawBarrelDirection;
+		if (glm::length(currentBarrelDirection) <= 0.0001f)
+			currentBarrelDirection = aimingDirection;
+		const glm::fvec3 currentTraceForward = NormalizeOrZero({
+			currentBarrelDirection.x, -currentBarrelDirection.y, currentBarrelDirection.z
+		});
+		if (customAkimboActive && currentWeaponEquipped >= Pistol
+			&& currentWeaponEquipped <= Sniper && IsFiniteVector(calculatedAimPosition)
+			&& IsFiniteVector(currentTraceForward)
+			&& glm::length(currentTraceForward) > 0.0001f)
+		{
+			int hand = firstWeapon ? motionConfiguredFirstHand : motionConfiguredSecondHand;
+			if (hand < 0 || hand > 1)
+			{
+				const int firstHand = settingsManager->leftHandedMode
+					!= SettingsManager::Disabled ? 0 : 1;
+				hand = firstWeapon ? firstHand : 1 - firstHand;
+			}
+			constexpr float customAkimboTraceRange = 15000.0f;
+			const glm::fvec3 customTarget = calculatedAimPosition
+				+ currentTraceForward * customAkimboTraceRange;
+			if (IsFiniteVector(customTarget)
+				&& memoryManager->SetCustomAkimboHandTrace(hand,
+					{ calculatedAimPosition.x, calculatedAimPosition.y, calculatedAimPosition.z },
+					{ customTarget.x, customTarget.y, customTarget.z }))
+			{
+				// The gunflash socket is at the weapon pivot on these GTA meshes.
+				// The per-model calibrated second barrel point is the visible muzzle tip.
+				glm::fvec3 customMuzzle = IsFiniteVector(point2Position)
+					? point2Position : muzzleWorldPosition;
+				// The original SMG endpoint tables stop near the rear sight on the
+				// duplicated controller meshes. Correct only akimbo presentation;
+				// the established one-handed aim and effect offsets remain unchanged.
+				if (currentWeaponEquipped == MicroUzi)
+					customMuzzle += forwardVector_params.vec3Value * 8.0f
+						- upVector_params.vec3Value * 2.0f;
+				else if (currentWeaponEquipped == Tec9)
+					customMuzzle += forwardVector_params.vec3Value * 5.0f
+						- upVector_params.vec3Value * 2.0f;
+				customAkimboMuzzleWorld[hand] = customMuzzle;
+				customAkimboMuzzleValidMask |= static_cast<uint8_t>(1U << hand);
+			}
+		}
 		if (applyGameAim)
 		{
 			if (glm::length(rawBarrelDirection) <= 0.0001f)
@@ -5675,6 +7491,45 @@ void WeaponManager::ProcessWeaponVisibility()
 	if (firstWeaponMesh == nullptr)
 		return;
 
+	// During a custom grenade/Molotov flight the proxy owns the visual slot. The normal
+	// weapon-visibility pass runs after ProcessPhysicalThrowableProbe and would
+	// otherwise make the original held mesh visible again every engine tick,
+	// hiding the fact that the released proxy is airborne.
+	if ((currentWeaponEquipped == Grenade || currentWeaponEquipped == Molotov)
+		&& (motionThrowableFlight.active || motionThrowableSourceHidden))
+	{
+		SetComponentVisibility(firstWeaponMesh, false);
+		return;
+	}
+	// A newly accepted grip owns the source bottle until release. Keep this
+	// explicit because weaponScaledVisible can still reflect the previous
+	// detached flight and would otherwise hide the bottle in the hand.
+	if ((currentWeaponEquipped == Grenade || currentWeaponEquipped == Molotov)
+		&& throwableProbeActive
+		&& !motionThrowableFlight.active && !motionThrowableSourceHidden)
+	{
+		SetComponentVisibility(firstWeaponMesh, true);
+		auto heldClass = firstWeaponMesh->get_class();
+		if (heldClass != nullptr)
+		{
+			if (heldClass->find_property(L"bHiddenInGame") != nullptr)
+				firstWeaponMesh->set_bool_property(L"bHiddenInGame", false);
+			if (heldClass->find_property(L"bOwnerNoSee") != nullptr)
+				firstWeaponMesh->set_bool_property(L"bOwnerNoSee", false);
+			if (heldClass->find_property(L"bOnlyOwnerSee") != nullptr)
+				firstWeaponMesh->set_bool_property(L"bOnlyOwnerSee", false);
+			if (heldClass->find_function(L"SetOwnerNoSee") != nullptr)
+			{
+				Utilities::ParameterSingleBool ownerNoSee{};
+				ownerNoSee.boolValue = false;
+				firstWeaponMesh->call_function(L"SetOwnerNoSee", &ownerNoSee);
+			}
+			if (heldClass->find_property(L"bVisible") != nullptr)
+				firstWeaponMesh->set_bool_property(L"bVisible", true);
+		}
+		return;
+	}
+
 	bool hideWeapon = !weaponScaledVisible;
 	switch (currentWeaponEquipped)
 	{
@@ -5704,7 +7559,10 @@ void WeaponManager::SetWeaponScaled(bool visible, bool force)
 
 	weaponScaledVisible = visible;
 	SetComponentVisibility(firstWeaponMesh, visible);
-	SetComponentVisibility(secondWeaponMesh, visible);
+	const bool customSecondVisible = visible && secondWeaponMesh == customAkimboVisualMesh
+		&& customAkimboActive;
+	SetComponentVisibility(secondWeaponMesh,
+		secondWeaponMesh == customAkimboVisualMesh ? customSecondVisible : visible);
 }
 
 void WeaponManager::SetMotionWeaponTrackingEnabled(bool enabled, bool force)
@@ -7164,6 +9022,40 @@ bool WeaponManager::ReadMotionMeleeControllerWorldPose(int controllerHand,
 		&& glm::length(worldRotation) > 0.5f;
 }
 
+bool WeaponManager::ReadMotionMeleeHandWorldPose(int controllerHand,
+	const glm::fvec3& controllerPosition, const glm::fquat& controllerRotation,
+	glm::fvec3& worldPosition, glm::fquat& worldRotation,
+	bool& usedVisibleBone) const
+{
+	worldPosition = glm::fvec3(0.0f);
+	worldRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+	usedVisibleBone = false;
+	if (controllerHand != 0 && controllerHand != 1
+		|| !IsFiniteVector(controllerPosition) || !IsFiniteQuaternion(controllerRotation)
+		|| glm::length(controllerRotation) <= 0.5f)
+		return false;
+
+	const auto handComponent = controllerHand == 0
+		? freeAimFakeLeftHand : freeAimFakeRightHand;
+	const auto& handBone = controllerHand == 0
+		? freeAimFakeLeftHandBoneName : freeAimFakeRightHandBoneName;
+	if (handComponent != nullptr && handBone.comparison_index != 0
+		&& uevr::API::UObjectHook::exists(handComponent))
+	{
+		usedVisibleBone = ReadBoneWorldTransform(
+			handComponent, handBone, worldPosition, worldRotation);
+	}
+	if (!usedVisibleBone)
+	{
+		usedVisibleBone = false;
+		if (!ReadMotionMeleeControllerWorldPose(controllerHand,
+			controllerPosition, controllerRotation, worldPosition, worldRotation))
+			return false;
+	}
+	return IsFiniteVector(worldPosition) && IsFiniteQuaternion(worldRotation)
+		&& glm::length(worldRotation) > 0.5f;
+}
+
 bool WeaponManager::ReadMotionMeleeHandGeometry(int controllerHand,
 	const glm::fvec3& controllerPosition, const glm::fquat& controllerRotation,
 	glm::fvec3& baseUE, glm::fvec3& tipUE, float& radiusUE) const
@@ -7176,22 +9068,9 @@ bool WeaponManager::ReadMotionMeleeHandGeometry(int controllerHand,
 
 	glm::fvec3 handPosition{};
 	glm::fquat handRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
-	bool handWorldTransformValid = false;
-	const auto handComponent = controllerHand == 0 ? freeAimFakeLeftHand : freeAimFakeRightHand;
-	const auto& handBone = controllerHand == 0
-		? freeAimFakeLeftHandBoneName : freeAimFakeRightHandBoneName;
-	if (handComponent != nullptr && handBone.comparison_index != 0
-		&& uevr::API::UObjectHook::exists(handComponent))
-	{
-		handWorldTransformValid = ReadBoneWorldTransform(
-			handComponent, handBone, handPosition, handRotation);
-	}
-	if (!handWorldTransformValid)
-		handWorldTransformValid = ReadMotionMeleeControllerWorldPose(
-		controllerHand, controllerPosition, controllerRotation,
-		handPosition, handRotation);
-	if (!handWorldTransformValid || !IsFiniteVector(handPosition)
-		|| !IsFiniteQuaternion(handRotation) || glm::length(handRotation) <= 0.5f)
+	bool usedVisibleBone = false;
+	if (!ReadMotionMeleeHandWorldPose(controllerHand, controllerPosition,
+		controllerRotation, handPosition, handRotation, usedVisibleBone))
 		return false;
 
 	const glm::fvec3 forward = NormalizeOrZero(handRotation * glm::fvec3(1.0f, 0.0f, 0.0f));
@@ -7200,13 +9079,19 @@ bool WeaponManager::ReadMotionMeleeHandGeometry(int controllerHand,
 
 	const bool unarmed = currentWeaponEquipped == Unarmed;
 	const float baseOffset = unarmed ? 2.0f : 1.5f;
+	// Restore the last proven geometry exactly: a 10 cm bare-fist segment and a
+	// 13 cm brass-knuckle segment. Any temporal lead should be a separately
+	// visible/testable sweep lane, not a silent permanent reach increase.
 	const float contactLength = unarmed ? 10.0f : 13.0f;
 	baseUE = handPosition + forward * baseOffset;
 	tipUE = handPosition + forward * (baseOffset + contactLength);
 	// A fist/knuckle contact is intentionally short and compact. Keep its radius
 	// independent of the native mesh so an absent or decorative mesh cannot widen
 	// the physical hit volume.
-	radiusUE = unarmed ? 6.0f : 5.5f;
+	// Slightly enlarge only the short hand volumes. The temporal lead remains
+	// capped separately, so this improves near-edge fist contacts without making
+	// bats or other held melee weapons feel broad.
+	radiusUE = unarmed ? 6.5f : 6.0f;
 	return IsFiniteVector(baseUE) && IsFiniteVector(tipUE)
 		&& std::isfinite(radiusUE) && glm::length(tipUE - baseUE) >= 5.0f;
 }
@@ -7345,6 +9230,2316 @@ bool WeaponManager::ReadMotionMeleeContactGeometry(const glm::fvec3& meshPositio
 		&& std::isfinite(radiusUE) && glm::length(tipUE - baseUE) >= 10.0f;
 }
 
+bool WeaponManager::EnsureMotionMeleeDebugAxis()
+{
+	auto currentCharacter = playerManager != nullptr ? playerManager->playerCharacter : nullptr;
+	if (motionMeleeDebugAxisCreationFailed
+		&& motionMeleeDebugAxisCharacter == currentCharacter)
+		return false;
+	if (motionMeleeDebugAxisComponent != nullptr
+		&& motionMeleeDebugAxisCharacter == currentCharacter
+		&& uevr::API::UObjectHook::exists(motionMeleeDebugAxisComponent))
+		return true;
+
+	if (motionMeleeDebugAxisComponent != nullptr
+		&& uevr::API::UObjectHook::exists(motionMeleeDebugAxisComponent))
+	{
+		auto destroy = motionMeleeDebugAxisComponent->get_class()->find_function(L"DestroyComponent");
+		if (destroy != nullptr)
+		{
+			std::vector<uint8_t> params(destroy->get_properties_size());
+			SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+			destroy->call(motionMeleeDebugAxisComponent, params.data());
+		}
+	}
+	motionMeleeDebugAxisComponent = nullptr;
+	motionMeleeDebugAxisCharacter = nullptr;
+	motionMeleeDebugAxisCreationFailed = false;
+	if (currentCharacter == nullptr || !uevr::API::UObjectHook::exists(currentCharacter))
+		return false;
+
+	auto proceduralMeshClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+		L"Class /Script/ProceduralMeshComponent.ProceduralMeshComponent");
+	if (proceduralMeshClass == nullptr)
+	{
+		motionMeleeDebugAxisCreationFailed = true;
+		motionMeleeDebugAxisCharacter = currentCharacter;
+		uevr::API::get()->log_warn("[MotionMelee] visible trace unavailable reason=procedural-mesh-class");
+		return false;
+	}
+
+	auto component = uevr::API::get()->add_component_by_class(
+		currentCharacter, proceduralMeshClass, false);
+	if (component == nullptr || !uevr::API::UObjectHook::exists(component))
+	{
+		motionMeleeDebugAxisCreationFailed = true;
+		motionMeleeDebugAxisCharacter = currentCharacter;
+		uevr::API::get()->log_warn("[MotionMelee] visible trace unavailable reason=component-create");
+		return false;
+	}
+
+	auto componentClass = component->get_class();
+	auto createSection = componentClass != nullptr
+		? componentClass->find_function(L"CreateMeshSection_LinearColor") : nullptr;
+	if (createSection == nullptr && componentClass != nullptr)
+		createSection = componentClass->find_function(L"CreateMeshSection");
+	if (createSection == nullptr)
+	{
+		motionMeleeDebugAxisComponent = component;
+		motionMeleeDebugAxisCharacter = currentCharacter;
+		motionMeleeDebugAxisCreationFailed = true;
+		SetComponentVisibility(component, false);
+		uevr::API::get()->log_warn("[MotionMelee] visible trace unavailable reason=create-section-function");
+		return false;
+	}
+
+	// A 100 cm long, 3 cm thick box aligned to local +X. Runtime scale and
+	// rotation place its two ends on the exact native-LOS base and tip.
+	std::array<glm::fvec3, 8> vertices{
+		glm::fvec3(0.0f, -1.5f, -1.5f), glm::fvec3(0.0f, 1.5f, -1.5f),
+		glm::fvec3(0.0f, 1.5f, 1.5f), glm::fvec3(0.0f, -1.5f, 1.5f),
+		glm::fvec3(100.0f, -1.5f, -1.5f), glm::fvec3(100.0f, 1.5f, -1.5f),
+		glm::fvec3(100.0f, 1.5f, 1.5f), glm::fvec3(100.0f, -1.5f, 1.5f)
+	};
+	std::array<int32_t, 36> triangles{
+		0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+		0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
+		0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5
+	};
+	std::vector<uint8_t> params(createSection->get_properties_size());
+	const bool populated = SetReflectedIntParameter(createSection, params, L"SectionIndex", 0)
+		&& SetReflectedArrayParameter(createSection, params, L"Vertices",
+			vertices.data(), static_cast<int32_t>(vertices.size()))
+		&& SetReflectedArrayParameter(createSection, params, L"Triangles",
+			triangles.data(), static_cast<int32_t>(triangles.size()));
+	SetReflectedBoolParameter(createSection, params, L"bCreateCollision", false);
+	if (!populated)
+	{
+		motionMeleeDebugAxisComponent = component;
+		motionMeleeDebugAxisCharacter = currentCharacter;
+		motionMeleeDebugAxisCreationFailed = true;
+		SetComponentVisibility(component, false);
+		uevr::API::get()->log_warn("[MotionMelee] visible trace unavailable reason=create-section-parameters");
+		return false;
+	}
+	createSection->call(component, params.data());
+	motionMeleeDebugAxisComponent = component;
+	motionMeleeDebugAxisCharacter = currentCharacter;
+	SetComponentVisibility(component, false);
+	uevr::API::get()->log_info("[MotionMelee] visible trace component created component=%p", component);
+	return true;
+}
+
+void WeaponManager::UpdateMotionMeleeDebugAxis(const glm::fvec3& startUE,
+	const glm::fvec3& endUE, float radiusUE)
+{
+	if (!EnsureMotionMeleeDebugAxis())
+		return;
+	const glm::fvec3 delta = endUE - startUE;
+	const float length = glm::length(delta);
+	if (!std::isfinite(length) || length <= 0.1f)
+	{
+		HideMotionMeleeDebugAxis();
+		return;
+	}
+	auto componentClass = motionMeleeDebugAxisComponent->get_class();
+	if (componentClass == nullptr || Utilities::KismetMathLibrary == nullptr
+		|| componentClass->find_function(L"K2_SetWorldLocation") == nullptr
+		|| componentClass->find_function(L"K2_SetWorldRotation") == nullptr)
+	{
+		HideMotionMeleeDebugAxis();
+		return;
+	}
+
+	Utilities::ParameterFindLookAtRotation lookAt{};
+	lookAt.start = startUE;
+	lookAt.target = endUE;
+	Utilities::KismetMathLibrary->call_function(L"FindLookAtRotation", &lookAt);
+	Utilities::Parameter_K2_SetWorldOrRelativeLocation location{};
+	location.newLocation = startUE;
+	location.bTeleport = true;
+	motionMeleeDebugAxisComponent->call_function(L"K2_SetWorldLocation", &location);
+	Utilities::Parameter_K2_SetWorldOrRelativeRotation rotation{};
+	rotation.newRotation = lookAt.outRotation;
+	rotation.bTeleport = true;
+	motionMeleeDebugAxisComponent->call_function(L"K2_SetWorldRotation", &rotation);
+	ParameterSetScale3D scale{};
+	const float widthScale = (std::max)(1.0f, (radiusUE * 2.0f) / 3.0f);
+	scale.newScale3D = { length / 100.0f, widthScale, widthScale };
+	if (componentClass->find_function(L"SetWorldScale3D") != nullptr)
+		motionMeleeDebugAxisComponent->call_function(L"SetWorldScale3D", &scale);
+	else if (componentClass->find_function(L"K2_SetWorldScale3D") != nullptr)
+		motionMeleeDebugAxisComponent->call_function(L"K2_SetWorldScale3D", &scale);
+	if (componentClass->find_property(L"bHiddenInGame") != nullptr)
+		motionMeleeDebugAxisComponent->set_bool_property(L"bHiddenInGame", false);
+	if (componentClass->find_property(L"bOwnerNoSee") != nullptr)
+		motionMeleeDebugAxisComponent->set_bool_property(L"bOwnerNoSee", false);
+	SetComponentVisibility(motionMeleeDebugAxisComponent, true);
+}
+
+void WeaponManager::HideMotionMeleeDebugAxis()
+{
+	SetComponentVisibility(motionMeleeDebugAxisComponent, false);
+}
+
+bool WeaponManager::PlayMotionMeleeImpactAudio(
+	const MemoryManager::NativeMeleeContact& contact, int damageWeaponType)
+{
+	if (settingsManager == nullptr || !settingsManager->enableMotionMeleeImpactAudio
+		|| playerManager == nullptr || playerManager->playerActor == nullptr
+		|| !uevr::API::UObjectHook::exists(playerManager->playerActor)
+		|| (contact.entityType != 2 && contact.entityType != 3))
+		return false;
+
+	if (!motionMeleeImpactSoundLoadAttempted)
+	{
+		motionMeleeImpactSoundLoadAttempted = true;
+		// The DE package preserves the original GENRL collision-bank numbering:
+		// S_029 is COLCARPED (a compact body impact) and S_020 is COLCAR01.
+		motionMeleePedImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/COLLISIONS/S_029.S_029");
+		// Prefer GTA's own weapon-bank impacts when those cooked assets are exposed
+		// by this DE package. Each category falls back to the proven collision bank.
+		motionMeleeFistImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/WEAPONS/S_037.S_037");
+		motionMeleeBluntImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/WEAPONS/S_040.S_040");
+		motionMeleeSharpImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/WEAPONS/S_082.S_082");
+		motionMeleeVehicleImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/COLLISIONS/S_020.S_020");
+		uevr::API::get()->log_info(
+			"[MotionMeleeAudio] assets fist=%p blunt=%p sharp=%p pedFallback=%p vehicle=%p",
+			motionMeleeFistImpactSound, motionMeleeBluntImpactSound,
+			motionMeleeSharpImpactSound, motionMeleePedImpactSound,
+			motionMeleeVehicleImpactSound);
+	}
+
+	const bool sharpWeapon = damageWeaponType == Knife || damageWeaponType == Katana
+		|| damageWeaponType == Chainsaw;
+	const bool fistWeapon = damageWeaponType == Unarmed
+		|| damageWeaponType == BrassKnuckles;
+	auto sound = motionMeleeVehicleImpactSound;
+	float volume = 0.82f;
+	float pitch = 1.0f;
+	if (contact.entityType == 3)
+	{
+		sound = fistWeapon ? motionMeleeFistImpactSound
+			: (sharpWeapon ? motionMeleeSharpImpactSound : motionMeleeBluntImpactSound);
+		if (sound == nullptr || !uevr::API::UObjectHook::exists(sound))
+			sound = motionMeleePedImpactSound;
+		// The fallback body sample is wet at full volume. Fists use a shorter,
+		// quieter, higher-pitched thud; blunt and sharp weapons retain more weight.
+		volume = fistWeapon ? 0.48f : (sharpWeapon ? 0.68f : 0.62f);
+		pitch = fistWeapon ? 1.22f : (sharpWeapon ? 1.08f : 0.94f);
+	}
+	if (sound == nullptr || !uevr::API::UObjectHook::exists(sound))
+	{
+		if (!motionMeleeImpactAudioFailureLogged)
+		{
+			motionMeleeImpactAudioFailureLogged = true;
+			uevr::API::get()->log_warn(
+				"[MotionMeleeAudio] unavailable reason=sound-asset entityType=%u",
+				static_cast<unsigned int>(contact.entityType));
+		}
+		return false;
+	}
+
+	const glm::fvec3 point(contact.point[0], contact.point[1], contact.point[2]);
+	const bool played = PlaySoundWaveAtLocation(playerManager->playerActor, sound,
+		point, volume, pitch);
+	if (!played && !motionMeleeImpactAudioFailureLogged)
+	{
+		motionMeleeImpactAudioFailureLogged = true;
+		uevr::API::get()->log_warn(
+			"[MotionMeleeAudio] unavailable reason=reflected-playback entityType=%u",
+			static_cast<unsigned int>(contact.entityType));
+	}
+	return played;
+}
+
+bool WeaponManager::PlayMotionThrowableImpactEffect(
+	int weaponType, const glm::fvec3& impactPoint,
+	const MemoryManager::NativeMeleeContact* contact)
+{
+	if (settingsManager == nullptr || !settingsManager->enableMotionThrowables
+		|| (weaponType == Molotov && settingsManager->enableNativeMolotovMode)
+		|| playerManager == nullptr || playerManager->playerActor == nullptr
+		|| !uevr::API::UObjectHook::exists(playerManager->playerActor)
+		|| !IsFiniteVector(impactPoint))
+		return false;
+
+	// WeaponManager owns the physical bottle and measured collision in UE space.
+	// At impact only, hand the converted point to DE's real Molotov explosion
+	// lifecycle. Returning here prevents duplicate BP shells, synthetic damage,
+	// sounds, or persistent unregistered fire actors from running as well.
+	if (memoryManager != nullptr)
+	{
+		const std::array<float, 3> nativeImpact{
+			impactPoint.x * 0.01f,
+			-impactPoint.y * 0.01f,
+			impactPoint.z * 0.01f };
+		if (memoryManager->ApplyNativeThrowableExplosion(nativeImpact, weaponType))
+			return true;
+	}
+	// Grenades have no Molotov Blueprint/manual fallback. If the validated native
+	// endpoint is unavailable, fail closed instead of producing fire semantics.
+	if (weaponType != Molotov)
+		return false;
+
+	if (!motionThrowableNativeExplosionLoadAttempted)
+	{
+		motionThrowableNativeExplosionLoadAttempted = true;
+		motionThrowableNativeExplosionClass = FindOrLoadBlueprintGeneratedClass(
+			L"/Game/Common/Effects/Explosions/BP_Explosion_Molotov.BP_Explosion_Molotov_C");
+		uevr::API::get()->log_info(
+			"[MotionThrowableImpact] native-molotov-class class=%p name=%ls",
+			motionThrowableNativeExplosionClass,
+			motionThrowableNativeExplosionClass != nullptr
+				? motionThrowableNativeExplosionClass->get_full_name().c_str() : L"<null>");
+		if (motionThrowableNativeExplosionClass != nullptr)
+		{
+			LogBlueprintDeclaredMembers(motionThrowableNativeExplosionClass,
+				"MotionThrowableNativeMolotov");
+			LogRelevantClassHierarchyMembers(motionThrowableNativeExplosionClass,
+				"MotionThrowableNativeMolotov");
+		}
+		motionThrowableNativeFireClass = FindOrLoadBlueprintGeneratedClass(
+			L"/Game/Common/Blueprints/BP_Fire.BP_Fire_C");
+		uevr::API::get()->log_info(
+			"[MotionThrowableNativeMolotov] fire-owner class=%p name=%ls",
+			motionThrowableNativeFireClass,
+			motionThrowableNativeFireClass != nullptr
+				? motionThrowableNativeFireClass->get_full_name().c_str() : L"<null>");
+		if (motionThrowableNativeFireClass != nullptr)
+		{
+			LogBlueprintDeclaredMembers(motionThrowableNativeFireClass,
+				"MotionThrowableNativeFire");
+			LogRelevantClassHierarchyMembers(motionThrowableNativeFireClass,
+				"MotionThrowableNativeFire");
+		}
+		// The impact actor is a data-only shell. The package also exposes a
+		// dedicated SpawnExplosion Blueprint, which is the likely native entry
+		// point that configures fire, damage, and the chosen explosion subtype.
+		motionThrowableNativeSpawnLibraryClass = FindOrLoadBlueprintGeneratedClass(
+			L"/Game/Common/Effects/SpawnExplosion.SpawnExplosion_C");
+		if (motionThrowableNativeSpawnLibraryClass != nullptr)
+		{
+			uevr::API::get()->log_info(
+				"[MotionThrowableNativeMolotov] spawn-library class=%p name=%ls",
+				motionThrowableNativeSpawnLibraryClass,
+				motionThrowableNativeSpawnLibraryClass->get_full_name().c_str());
+			LogBlueprintDeclaredMembers(motionThrowableNativeSpawnLibraryClass,
+				"MotionThrowableSpawnExplosion");
+			EnsureMotionThrowableNativeMolotovProbeHooks(
+				motionThrowableNativeSpawnLibraryClass);
+		}
+		else
+		{
+			uevr::API::get()->log_warn(
+				"[MotionThrowableNativeMolotov] spawn-library class=<null>");
+		}
+		if (motionThrowableNativeSpawnLibraryClass != nullptr)
+		{
+			uevr::API::UClass* selectedClass = nullptr;
+			uevr::API::UObject* selectedDebris = nullptr;
+			uint8_t selectedType = 0;
+			motionThrowableNativeMolotovSelectionResolved =
+				ResolveNativeMolotovExplosionSelection(playerManager->playerActor,
+					motionThrowableNativeSpawnLibraryClass, selectedClass, selectedDebris,
+					selectedType);
+			if (motionThrowableNativeMolotovSelectionResolved)
+			{
+				motionThrowableNativeExplosionClass = selectedClass;
+				motionThrowableNativeMolotovDebrisTemplate = selectedDebris;
+				motionThrowableNativeMolotovTypeByte = selectedType;
+				uevr::API::get()->log_info(
+					"[MotionThrowableNativeMolotov] selector resolved type=%u class=%p name=%ls debris=%p debrisName=%ls",
+					static_cast<unsigned int>(selectedType), selectedClass,
+					selectedClass->get_full_name().c_str(), selectedDebris,
+					selectedDebris != nullptr
+						? selectedDebris->get_full_name().c_str() : L"<null>");
+			}
+			else
+			{
+				uevr::API::get()->log_warn(
+					"[MotionThrowableNativeMolotov] selector found no Molotov class/debris pair; retaining direct class without debris");
+			}
+		}
+	}
+	bool nativeMolotovExplosionActivated = false;
+	bool nativeMolotovFireActorSpawned = false;
+	uevr::API::UObject* spawnedNativeExplosion = nullptr;
+	uevr::API::UObject* spawnedNativeFire = nullptr;
+	if (motionThrowableNativeExplosionClass != nullptr
+		&& uevr::API::UObjectHook::exists(motionThrowableNativeExplosionClass))
+	{
+		// Keep the custom hand-driven bottle and measured collision. Only this
+		// final handoff is native: the game's dedicated Molotov Blueprint is
+		// created at the impact point so it owns fire spread, reactions, visuals,
+		// and damage instead of a generic instant-hit dispatcher.
+		if (auto* nativeExplosion = SpawnNativeActorAtLocation(playerManager->playerActor,
+			motionThrowableNativeExplosionClass, impactPoint))
+		{
+			spawnedNativeExplosion = nativeExplosion;
+			const bool setupApplied = motionThrowableNativeSpawnLibraryClass != nullptr
+				&& uevr::API::UObjectHook::exists(motionThrowableNativeSpawnLibraryClass)
+				&& SetupNativeSpawnedExplosion(playerManager->playerActor,
+					motionThrowableNativeSpawnLibraryClass, nativeExplosion,
+					motionThrowableNativeMolotovDebrisTemplate);
+			uevr::API::get()->log_info(
+				"[MotionThrowableImpact] native-molotov-spawned actor=%p class=%ls point=(%.2f %.2f %.2f) setup=%d",
+				nativeExplosion,
+				motionThrowableNativeExplosionClass->get_full_name().c_str(),
+				impactPoint.x, impactPoint.y, impactPoint.z, setupApplied ? 1 : 0);
+			// The cooked SetupSpawnedExplosion graph only activates ExplosionEffect
+			// when ExplodingActor is valid. A world collision intentionally has no
+			// Unreal actor, so explicitly activate the spawned native components here.
+			// This is still impact-only: the custom hand flight never enters this path.
+			if (nativeExplosion->get_class()->find_property(L"ExplosionEffect") != nullptr)
+			{
+				auto* explosionEffect = nativeExplosion->get_property<uevr::API::UObject*>(
+					L"ExplosionEffect");
+				if (explosionEffect != nullptr
+					&& uevr::API::UObjectHook::exists(explosionEffect))
+				{
+					EnsureMotionThrowableVisualRenderable(explosionEffect);
+					nativeMolotovExplosionActivated = true;
+				}
+			}
+			if (nativeExplosion->get_class()->find_property(L"DebrisEffect") != nullptr)
+			{
+				auto* debrisEffect = nativeExplosion->get_property<uevr::API::UObject*>(
+					L"DebrisEffect");
+				if (debrisEffect != nullptr
+					&& uevr::API::UObjectHook::exists(debrisEffect))
+					EnsureMotionThrowableVisualRenderable(debrisEffect);
+			}
+			if (!setupApplied && !nativeMolotovExplosionActivated)
+			{
+				uevr::API::get()->log_warn(
+					"[MotionThrowableImpact] native-molotov-setup failed actor=%p; using visual fallback",
+					nativeExplosion);
+			}
+		}
+		if (!nativeMolotovExplosionActivated)
+		{
+			uevr::API::get()->log_warn(
+				"[MotionThrowableImpact] native-molotov-spawn/setup unavailable class=%ls; using visual fallback",
+				motionThrowableNativeExplosionClass->get_full_name().c_str());
+		}
+	}
+	// UGTAFire/BP_Fire is the game's persistent fire owner. Spawning it at the
+	// measured impact point gives the native fire manager a real actor to tick;
+	// the old particle-only fallback could never produce burn propagation or
+	// vehicle/ped fire damage. Do not use this actor at release time.
+	if (motionThrowableNativeFireClass != nullptr
+		&& uevr::API::UObjectHook::exists(motionThrowableNativeFireClass))
+	{
+		if (auto* nativeFire = SpawnNativeActorAtLocation(playerManager->playerActor,
+			motionThrowableNativeFireClass, impactPoint))
+		{
+			spawnedNativeFire = nativeFire;
+			if (nativeFire->get_class()->find_property(L"FX") != nullptr)
+			{
+				auto* fireSystem = nativeFire->get_property<uevr::API::UObject*>(L"FX");
+				if (fireSystem != nullptr
+					&& uevr::API::UObjectHook::exists(fireSystem))
+					EnsureMotionThrowableVisualRenderable(fireSystem);
+			}
+			// Force the BP's public system selector once after spawn. Native
+			// BeginPlay normally does this, but the injected spawn can occur before
+			// the first component tick on some frame paths.
+			if (auto* getSystem = nativeFire->get_class()->find_function(L"GetSystem"))
+			{
+				std::vector<uint8_t> params(getSystem->get_properties_size());
+				getSystem->call(nativeFire, params.data());
+				uevr::API::UObject* selectedSystem = nullptr;
+				if (ReadReflectedObjectParameter(getSystem, params, L"system", selectedSystem)
+					&& selectedSystem != nullptr
+					&& uevr::API::UObjectHook::exists(selectedSystem))
+				{
+					EnsureMotionThrowableVisualRenderable(selectedSystem);
+				}
+			}
+			nativeMolotovFireActorSpawned = true;
+			uevr::API::get()->log_info(
+				"[MotionThrowableImpact] native-fire-owner spawned actor=%p class=%ls point=(%.2f %.2f %.2f) fireLifetimeMs=5000 registrationPath=bpFire-unregistered",
+				nativeFire, motionThrowableNativeFireClass->get_full_name().c_str(),
+				impactPoint.x, impactPoint.y, impactPoint.z);
+		}
+		else
+		{
+			uevr::API::get()->log_warn(
+				"[MotionThrowableImpact] native-fire-owner spawn failed class=%ls",
+				motionThrowableNativeFireClass->get_full_name().c_str());
+		}
+	}
+	const bool nativeMolotovFireSetup = nativeMolotovExplosionActivated
+		|| nativeMolotovFireActorSpawned;
+	if (spawnedNativeExplosion != nullptr || spawnedNativeFire != nullptr)
+	{
+		if (motionThrowableNativeImpactActors.size() >= 8)
+		{
+			auto& oldest = motionThrowableNativeImpactActors.front();
+			DestroyMotionThrowableNativeImpactActors(oldest, true, true);
+			motionThrowableNativeImpactActors.erase(
+				motionThrowableNativeImpactActors.begin());
+		}
+		MotionThrowableNativeImpactActors actors{};
+		actors.explosion = spawnedNativeExplosion;
+		actors.fire = spawnedNativeFire;
+		const ULONGLONG now = GetTickCount64();
+		// Classic's Molotov explosion object lives for roughly three seconds and
+		// its planted fire patches for roughly two to five seconds. These bounds
+		// prevent an injected BP_Fire from becoming an immortal orphan while the
+		// real DE fire-registration entry remains under active verification.
+		actors.explosionExpiresAt = spawnedNativeExplosion != nullptr ? now + 3500 : 0;
+		actors.fireExpiresAt = spawnedNativeFire != nullptr ? now + 5000 : 0;
+		motionThrowableNativeImpactActors.push_back(actors);
+	}
+
+	if (!motionThrowableImpactAssetsLoadAttempted)
+	{
+		motionThrowableImpactAssetsLoadAttempted = true;
+		motionThrowableMolotovImpactEffect = FindOrLoadParticleSystem(
+			L"/Game/Common/Effects/Explosions/FX_splode_molotov.FX_splode_molotov");
+		motionThrowableVehicleImpactEffect = FindOrLoadParticleSystem(
+			L"/Game/Common/Effects/Explosions/FX_splode_small.FX_splode_small");
+		motionThrowableVehicleExplosionEffect = FindOrLoadParticleSystem(
+			L"/Game/Common/Effects/Explosions/FX_splode_car.FX_splode_car");
+		const auto loadFirstParticle = [](const std::array<const wchar_t*, 6>& paths)
+			-> uevr::API::UObject* {
+				for (const auto* path : paths)
+				{
+					auto* particle = FindOrLoadParticleSystem(path);
+					if (particle != nullptr)
+						return particle;
+				}
+				return nullptr;
+			};
+		motionThrowableMolotovFlameEffect = loadFirstParticle({
+			L"/Game/Common/Effects/Cascade/FX_ground_fire.FX_ground_fire",
+			L"/Game/Common/Effects/Cascade/FX_molotov_flame.FX_molotov_flame",
+			L"/Game/Common/Effects/Cascade/FX_fire_med.FX_fire_med",
+			L"/Game/Common/Effects/Cascade/FX_fire.FX_fire",
+			L"/Game/Common/Effects/Cascade/FX_Flame.FX_Flame",
+			L"/Game/Common/Effects/Explosions/FX_molotov_flame.FX_molotov_flame" });
+		motionThrowableSmokeEffect = loadFirstParticle({
+			L"/Game/Common/Effects/Cascade/FX_smoke_flare.FX_smoke_flare",
+			L"/Game/Common/Effects/Cascade/FX_smoke50lit.FX_smoke50lit",
+			L"/Game/Common/Effects/Cascade/FX_smoke30lit.FX_smoke30lit",
+			L"/Game/Common/Effects/Cascade/FX_smoke30m.FX_smoke30m",
+			L"/Game/Common/Effects/Cascade/FX_fireball_smoke_new.FX_fireball_smoke_new",
+			L"/Game/Common/Effects/Cascade/FX_prt_collisionsmoke.FX_prt_collisionsmoke" });
+		motionThrowableImpactSound = FindOrLoadSoundWave(
+			L"/Game/SanAndreas/Audio/SFX/GENRL/EXPLOSIONS/S_001.S_001");
+		uevr::API::get()->log_info(
+			"[MotionThrowableImpact] assets effect=%p effectName=%ls vehicle=%p vehicleName=%ls vehicleExplosion=%p vehicleExplosionName=%ls flame=%p flameName=%ls smoke=%p smokeName=%ls sound=%p soundName=%ls",
+			motionThrowableMolotovImpactEffect,
+			motionThrowableMolotovImpactEffect != nullptr
+				? motionThrowableMolotovImpactEffect->get_full_name().c_str() : L"<null>",
+			motionThrowableVehicleImpactEffect,
+			motionThrowableVehicleImpactEffect != nullptr
+				? motionThrowableVehicleImpactEffect->get_full_name().c_str() : L"<null>",
+			motionThrowableVehicleExplosionEffect,
+			motionThrowableVehicleExplosionEffect != nullptr
+				? motionThrowableVehicleExplosionEffect->get_full_name().c_str() : L"<null>",
+			motionThrowableMolotovFlameEffect,
+			motionThrowableMolotovFlameEffect != nullptr
+				? motionThrowableMolotovFlameEffect->get_full_name().c_str() : L"<null>",
+			motionThrowableSmokeEffect,
+			motionThrowableSmokeEffect != nullptr
+				? motionThrowableSmokeEffect->get_full_name().c_str() : L"<null>",
+			motionThrowableImpactSound,
+			motionThrowableImpactSound != nullptr
+				? motionThrowableImpactSound->get_full_name().c_str() : L"<null>");
+	}
+
+	// Ground fallback is deliberately the center of the proxy's crossing plane.
+	// Lift only the visual so it is not buried in the floor; sound remains at the
+	// measured contact point.
+	const glm::fvec3 effectPoint = impactPoint + glm::fvec3(0.0f, 0.0f, 8.0f);
+	const bool useVisualFallback = !nativeMolotovFireSetup;
+	auto spawnedEffect = useVisualFallback ? SpawnParticleSystemAtLocation(
+		playerManager->playerActor, motionThrowableMolotovImpactEffect, effectPoint) : nullptr;
+	// Keep the flame/smoke components alive for a short bounded burn. The
+	// explosion burst remains auto-destroyed; the persistent components are
+	// explicitly destroyed by ProcessMotionThrowableImpactVisuals.
+	const glm::fvec3 flamePoint = impactPoint + glm::fvec3(0.0f, 0.0f, 3.0f);
+	const glm::fvec3 smokePoint = impactPoint + glm::fvec3(0.0f, 0.0f, 12.0f);
+	auto* flameTemplate = motionThrowableMolotovFlameEffect != nullptr
+		? motionThrowableMolotovFlameEffect : motionThrowableMolotovImpactEffect;
+	auto spawnedFlame = useVisualFallback ? SpawnParticleSystemAtLocation(
+		playerManager->playerActor, flameTemplate, flamePoint,
+			glm::fvec3(1.35f), false) : nullptr;
+	auto spawnedSmoke = useVisualFallback ? SpawnParticleSystemAtLocation(
+			playerManager->playerActor, motionThrowableSmokeEffect, smokePoint,
+			glm::fvec3(1.15f), false) : nullptr;
+	if (spawnedFlame != nullptr || spawnedSmoke != nullptr)
+	{
+		MotionThrowableImpactVisual persistentVisual{};
+		persistentVisual.fire = spawnedFlame;
+		persistentVisual.smoke = spawnedSmoke;
+		persistentVisual.expiresAt = GetTickCount64() + 6500;
+		motionThrowableImpactVisuals.push_back(persistentVisual);
+	}
+	const bool effectPlayed = spawnedEffect != nullptr
+		|| spawnedFlame != nullptr || spawnedSmoke != nullptr;
+	EnsureMotionThrowableVisualRenderable(spawnedEffect);
+	EnsureMotionThrowableVisualRenderable(spawnedFlame);
+	EnsureMotionThrowableVisualRenderable(spawnedSmoke);
+	const bool soundPlayed = PlaySoundWaveAtLocation(
+		playerManager->playerActor, motionThrowableImpactSound, impactPoint, 0.92f, 1.0f);
+	int appliedDamage = 0;
+	bool damageApplied = false;
+	MemoryManager::NativeMeleeContact damageContact{};
+	bool damageContactValid = false;
+	if (contact != nullptr && memoryManager != nullptr
+		&& (contact->entityType == 1 || contact->entityType == 2
+			|| contact->entityType == 3))
+	{
+		damageContact = *contact;
+		damageContactValid = true;
+		// Deliberately do not call ApplyNativeThrowableImpactEvent here. That is a
+		// generic CWeapon/CColPoint impact dispatcher requiring a live weapon entry;
+		// classic Molotov damage comes from registered fire ticks, not impact HP.
+		// The native contact is retained only for target classification/diagnostics.
+	}
+	uevr::API::UObject* spawnedVehicleBurst = nullptr;
+	bool vehicleBurstPlayed = false;
+	const bool vehicleDestroyed = damageContactValid && damageApplied
+		&& damageContact.entityType == 2
+		&& damageContact.targetHealthAfter >= 0.0f
+		&& damageContact.targetHealthAfter <= 0.5f;
+	if (damageContactValid && damageApplied && damageContact.entityType == 2)
+	{
+		auto* vehicleEffect = vehicleDestroyed
+			? motionThrowableVehicleExplosionEffect
+			: motionThrowableVehicleImpactEffect;
+		const glm::fvec3 vehicleEffectPoint = impactPoint
+			+ glm::fvec3(0.0f, 0.0f, vehicleDestroyed ? 14.0f : 8.0f);
+		const glm::fvec3 vehicleEffectScale = vehicleDestroyed
+			? glm::fvec3(1.25f) : glm::fvec3(0.85f);
+		spawnedVehicleBurst = SpawnParticleSystemAtLocation(
+			playerManager->playerActor, vehicleEffect, vehicleEffectPoint,
+			vehicleEffectScale, true);
+		vehicleBurstPlayed = spawnedVehicleBurst != nullptr;
+		EnsureMotionThrowableVisualRenderable(spawnedVehicleBurst);
+		// Do not simulate a Molotov by repeatedly applying the generic 75-damage
+		// impact route. That was only a temporary vehicle test and looks unlike
+		// GTA's actual fire system. The custom bottle now waits for a proven native
+		// fire owner instead of presenting a misleading damage-over-time result.
+	}
+	uevr::API::get()->log_info(
+		"[MotionThrowableImpact] playback molotovTypeByte=%u registrationPath=%s nativeFire=%s explosionActivated=%s fireOwner=%s dispatcherUsed=false nativeDamage=none-direct-writes-disabled burst=%s flame=%s smoke=%s vehicleBurst=%s vehicleDestroyed=%s component=%p sound=%s damage=%s amount=%d health=%.2f->%.2f point=(%.2f %.2f %.2f) visualPoint=(%.2f %.2f %.2f)",
+		static_cast<unsigned int>(motionThrowableNativeMolotovTypeByte),
+		nativeMolotovFireActorSpawned ? "bpFire-unregistered"
+			: (nativeMolotovExplosionActivated ? "spawnLibrary-visual" : "fallback"),
+		nativeMolotovFireSetup ? "setup" : "fallback",
+		nativeMolotovExplosionActivated ? "true" : "false",
+		nativeMolotovFireActorSpawned ? "spawned" : "missing",
+		spawnedEffect != nullptr ? "spawned" : "not-spawned",
+		spawnedFlame != nullptr ? "spawned" : "not-spawned",
+		spawnedSmoke != nullptr ? "spawned" : "not-spawned",
+		vehicleBurstPlayed ? "spawned" : "not-spawned",
+		vehicleDestroyed ? "true" : "false", spawnedEffect,
+		soundPlayed ? "played" : "not-played",
+		damageApplied ? "accepted" : (contact != nullptr ? "rejected" : "not-target"),
+		appliedDamage,
+		damageContactValid ? damageContact.targetHealthBefore : -1.0f,
+		damageContactValid ? damageContact.targetHealthAfter : -1.0f,
+		impactPoint.x, impactPoint.y, impactPoint.z,
+		effectPoint.x, effectPoint.y, effectPoint.z);
+	const bool anyVisualPlayed = effectPlayed || vehicleBurstPlayed;
+	if (!anyVisualPlayed && !soundPlayed && !damageApplied
+		&& !motionThrowableImpactFailureLogged)
+	{
+		motionThrowableImpactFailureLogged = true;
+		uevr::API::get()->log_warn(
+			"[MotionThrowableImpact] unavailable effect=%p sound=%p point=(%.2f %.2f %.2f)",
+			motionThrowableMolotovImpactEffect, motionThrowableImpactSound,
+			impactPoint.x, impactPoint.y, impactPoint.z);
+	}
+	return nativeMolotovFireSetup || anyVisualPlayed || soundPlayed || damageApplied;
+}
+
+bool WeaponManager::SetMotionThrowableVisualTransform(uevr::API::UObject* component,
+	const glm::fvec3& position, const glm::fquat& rotation, bool sweep) const
+{
+	if (component == nullptr || !uevr::API::UObjectHook::exists(component)
+		|| !IsFiniteVector(position) || !IsFiniteQuaternion(rotation)
+		|| glm::length(rotation) <= 0.5f)
+		return false;
+	auto componentClass = component->get_class();
+	if (componentClass == nullptr
+		|| componentClass->find_function(L"K2_SetWorldLocation") == nullptr
+		|| componentClass->find_function(L"K2_SetWorldRotation") == nullptr)
+		return false;
+	if (Utilities::KismetMathLibrary == nullptr)
+		Utilities::InitHelperClasses();
+	if (Utilities::KismetMathLibrary == nullptr
+		|| Utilities::KismetMathLibrary->get_class() == nullptr
+		|| Utilities::KismetMathLibrary->get_class()->find_function(
+			L"MakeRotationFromAxes") == nullptr)
+		return false;
+
+	Utilities::Parameter_K2_SetWorldOrRelativeLocation locationParams{};
+	locationParams.newLocation = position;
+	locationParams.bSweep = sweep;
+	locationParams.bTeleport = !sweep;
+	component->call_function(L"K2_SetWorldLocation", &locationParams);
+	ParameterMakeRotationFromAxes makeRotationParams{};
+	makeRotationParams.forward = NormalizeOrZero(rotation * glm::fvec3(1.0f, 0.0f, 0.0f));
+	makeRotationParams.right = NormalizeOrZero(rotation * glm::fvec3(0.0f, 1.0f, 0.0f));
+	makeRotationParams.up = NormalizeOrZero(rotation * glm::fvec3(0.0f, 0.0f, 1.0f));
+	if (glm::length(makeRotationParams.forward) <= 0.5f
+		|| glm::length(makeRotationParams.right) <= 0.5f
+		|| glm::length(makeRotationParams.up) <= 0.5f)
+		return false;
+	Utilities::KismetMathLibrary->call_function(
+		L"MakeRotationFromAxes", &makeRotationParams);
+	Utilities::Parameter_K2_SetWorldOrRelativeRotation rotationParams{};
+	rotationParams.newRotation = makeRotationParams.returnValue;
+	rotationParams.bSweep = false;
+	rotationParams.bTeleport = true;
+	component->call_function(L"K2_SetWorldRotation", &rotationParams);
+	return true;
+}
+
+void WeaponManager::DestroyMotionThrowableFlightVisual(MotionThrowableFlight& flight)
+{
+	if (flight.collisionProxy != nullptr
+		&& uevr::API::UObjectHook::exists(flight.collisionProxy))
+	{
+		SetComponentVisibility(flight.collisionProxy, false);
+		auto proxyClass = flight.collisionProxy->get_class();
+		auto destroyProxy = proxyClass != nullptr
+			? proxyClass->find_function(L"DestroyComponent") : nullptr;
+		if (destroyProxy != nullptr)
+		{
+			std::vector<uint8_t> params(destroyProxy->get_properties_size());
+			SetReflectedBoolParameter(destroyProxy, params, L"bPromoteChildren", false);
+			destroyProxy->call(flight.collisionProxy, params.data());
+		}
+	}
+	flight.collisionProxy = nullptr;
+	auto visual = flight.visual;
+	if (visual == nullptr || !uevr::API::UObjectHook::exists(visual))
+	{
+		flight.visual = nullptr;
+		return;
+	}
+	SetComponentVisibility(visual, false);
+	auto visualClass = visual->get_class();
+	auto destroy = visualClass != nullptr
+		? visualClass->find_function(L"DestroyComponent") : nullptr;
+	if (destroy != nullptr)
+	{
+		std::vector<uint8_t> params(destroy->get_properties_size());
+		SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+		destroy->call(visual, params.data());
+	}
+	flight.visual = nullptr;
+}
+
+void WeaponManager::DestroyMotionThrowableImpactVisual(MotionThrowableImpactVisual& visual)
+{
+	auto destroyComponent = [this](uevr::API::UObject*& component) {
+		if (component == nullptr || !uevr::API::UObjectHook::exists(component))
+		{
+			component = nullptr;
+			return;
+		}
+		SetComponentVisibility(component, false);
+		auto componentClass = component->get_class();
+		auto destroy = componentClass != nullptr
+			? componentClass->find_function(L"DestroyComponent") : nullptr;
+		if (destroy != nullptr)
+		{
+			std::vector<uint8_t> params(destroy->get_properties_size());
+			SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+			destroy->call(component, params.data());
+		}
+		component = nullptr;
+	};
+	destroyComponent(visual.fire);
+	destroyComponent(visual.smoke);
+	visual.expiresAt = 0;
+}
+
+void WeaponManager::DestroyMotionThrowableNativeImpactActors(
+	MotionThrowableNativeImpactActors& actors, bool destroyExplosion, bool destroyFire)
+{
+	const auto destroyActor = [](uevr::API::UObject*& actor, bool fireActor,
+		bool& extinguishCalled)
+	{
+		if (actor == nullptr || !uevr::API::UObjectHook::exists(actor))
+		{
+			actor = nullptr;
+			return;
+		}
+		auto* actorClass = actor->get_class();
+		if (fireActor && actorClass != nullptr)
+		{
+			if (auto* extinguish = actorClass->find_function(L"Extinguish"))
+			{
+				std::vector<uint8_t> params(extinguish->get_properties_size());
+				extinguish->call(actor, params.data());
+				extinguishCalled = true;
+			}
+			if (uevr::API::UObjectHook::exists(actor))
+			{
+				if (auto* killAgain = actorClass->find_function(L"KillAgain"))
+				{
+					std::vector<uint8_t> params(killAgain->get_properties_size());
+					killAgain->call(actor, params.data());
+				}
+			}
+		}
+		if (uevr::API::UObjectHook::exists(actor))
+		{
+			actorClass = actor->get_class();
+			auto* destroy = actorClass != nullptr
+				? actorClass->find_function(L"K2_DestroyActor") : nullptr;
+			if (destroy == nullptr)
+				destroy = actorClass->find_function(L"DestroyActor");
+			if (destroy != nullptr)
+			{
+				std::vector<uint8_t> params(destroy->get_properties_size());
+				destroy->call(actor, params.data());
+			}
+		}
+		actor = nullptr;
+	};
+
+	if (destroyExplosion)
+	{
+		destroyActor(actors.explosion, false, actors.extinguishCalled);
+		actors.explosionExpiresAt = 0;
+	}
+	if (destroyFire)
+	{
+		destroyActor(actors.fire, true, actors.extinguishCalled);
+		actors.fireExpiresAt = 0;
+	}
+}
+
+void WeaponManager::ProcessMotionThrowableImpactVisuals()
+{
+	const ULONGLONG now = GetTickCount64();
+	const bool invalidContext = settingsManager == nullptr
+		|| !settingsManager->enableMotionThrowables
+		|| settingsManager->enableNativeMolotovMode
+		|| playerManager == nullptr || playerManager->playerActor == nullptr
+		|| !uevr::API::UObjectHook::exists(playerManager->playerActor);
+	for (size_t i = 0; i < motionThrowableImpactVisuals.size();)
+	{
+		auto& visual = motionThrowableImpactVisuals[i];
+		if (invalidContext || visual.expiresAt == 0 || now >= visual.expiresAt)
+		{
+			DestroyMotionThrowableImpactVisual(visual);
+			motionThrowableImpactVisuals.erase(
+				motionThrowableImpactVisuals.begin() + static_cast<ptrdiff_t>(i));
+			continue;
+		}
+		++i;
+	}
+	for (size_t i = 0; i < motionThrowableNativeImpactActors.size();)
+	{
+		auto& actors = motionThrowableNativeImpactActors[i];
+		const bool destroyExplosion = invalidContext || actors.explosion == nullptr
+			|| actors.explosionExpiresAt == 0 || now >= actors.explosionExpiresAt;
+		const bool destroyFire = invalidContext || actors.fire == nullptr
+			|| actors.fireExpiresAt == 0 || now >= actors.fireExpiresAt;
+		if (destroyExplosion || destroyFire)
+			DestroyMotionThrowableNativeImpactActors(
+				actors, destroyExplosion, destroyFire);
+		if (actors.explosion == nullptr && actors.fire == nullptr)
+		{
+			uevr::API::get()->log_info(
+				"[MotionThrowableImpact] native actors cleaned extinguishCalled=%s registrationPath=bpFire-unregistered",
+				actors.extinguishCalled ? "true" : "false");
+			motionThrowableNativeImpactActors.erase(
+				motionThrowableNativeImpactActors.begin() + static_cast<ptrdiff_t>(i));
+			continue;
+		}
+		++i;
+	}
+}
+
+void WeaponManager::ResetMotionThrowableFlight(const char* reason, bool logResult)
+{
+	const bool wasActive = motionThrowableFlight.active;
+	const uint32_t sequence = motionThrowableFlight.sequence;
+	const int weaponType = motionThrowableFlight.weaponType;
+	const float age = motionThrowableFlight.ageSeconds;
+	auto sourceMesh = motionThrowableFlight.sourceMesh;
+	DestroyMotionThrowableFlightVisual(motionThrowableFlight);
+	const bool restoreSource = reason != nullptr
+		&& (std::strcmp(reason, "new-grip") == 0
+			|| std::strcmp(reason, "regrip-replace") == 0
+			|| std::strcmp(reason, "replacement") == 0
+			|| std::strcmp(reason, "context-change") == 0
+			|| std::strcmp(reason, "disabled") == 0
+			|| std::strcmp(reason, "presentation-restore") == 0
+			|| std::strcmp(reason, "native-launch-owned") == 0
+			|| std::strcmp(reason, "initial-transform-failed") == 0
+			|| std::strcmp(reason, "visual-lost") == 0
+			|| std::strcmp(reason, "transform-update-failed") == 0
+			|| std::strcmp(reason, "non-finite-flight") == 0);
+	if (restoreSource)
+	{
+		if (sourceMesh != nullptr && uevr::API::UObjectHook::exists(sourceMesh))
+			SetComponentVisibility(sourceMesh, true);
+		else if (motionThrowableSourceHidden && firstWeaponMesh != nullptr
+			&& uevr::API::UObjectHook::exists(firstWeaponMesh))
+			SetComponentVisibility(firstWeaponMesh, true);
+		motionThrowableSourceHidden = false;
+	}
+	else if (wasActive)
+	{
+		// Impact/timeout means the custom bottle has been consumed by this
+		// presentation path. Keep the body-attached source hidden until the next
+		// grip; otherwise GTA's idle animation makes the bottle jog in the holster.
+		motionThrowableSourceHidden = true;
+	}
+	if (reason != nullptr
+		&& (std::strcmp(reason, "disabled") == 0
+			|| std::strcmp(reason, "presentation-restore") == 0))
+	{
+		for (auto& detached : motionThrowableDetachedFlights)
+			DestroyMotionThrowableFlightVisual(detached);
+		motionThrowableDetachedFlights.clear();
+		for (auto& visual : motionThrowableImpactVisuals)
+			DestroyMotionThrowableImpactVisual(visual);
+		motionThrowableImpactVisuals.clear();
+		for (auto& actors : motionThrowableNativeImpactActors)
+			DestroyMotionThrowableNativeImpactActors(actors, true, true);
+		motionThrowableNativeImpactActors.clear();
+	}
+	motionThrowableFlight = MotionThrowableFlight{};
+	if (wasActive && logResult)
+	{
+		const bool nativeProjectileOwnsExplosion = reason != nullptr
+			&& std::strcmp(reason, "native-launch-owned") == 0;
+		const bool visualImpactEffectWasAttempted = reason != nullptr
+			&& (std::strcmp(reason, "impact-probe-complete") == 0
+				|| std::strcmp(reason, "fuse-expired") == 0);
+		uevr::API::get()->log_info(
+			"[MotionThrowableFlight] end seq=%u weapon=%d age=%.3f reason=%s explosion=%s ammo=%s",
+			sequence, weaponType, age, reason != nullptr ? reason : "unspecified",
+			nativeProjectileOwnsExplosion ? "native-projectile-owned"
+				: (visualImpactEffectWasAttempted ? "visual-audio-fallback" : "not-called-unproven"),
+			nativeProjectileOwnsExplosion ? "native" : "unchanged");
+	}
+}
+
+void WeaponManager::EnsureMotionThrowableVisualRenderable(uevr::API::UObject* component)
+{
+	if (component == nullptr || !uevr::API::UObjectHook::exists(component))
+		return;
+	SetComponentVisibility(component, true);
+	auto componentClass = component->get_class();
+	if (componentClass == nullptr)
+		return;
+	if (componentClass->find_property(L"bHiddenInGame") != nullptr)
+		component->set_bool_property(L"bHiddenInGame", false);
+	if (componentClass->find_property(L"bOwnerNoSee") != nullptr)
+		component->set_bool_property(L"bOwnerNoSee", false);
+	if (componentClass->find_property(L"bOnlyOwnerSee") != nullptr)
+		component->set_bool_property(L"bOnlyOwnerSee", false);
+	if (componentClass->find_property(L"bRenderInMainPass") != nullptr)
+		component->set_bool_property(L"bRenderInMainPass", true);
+	if (componentClass->find_function(L"SetOwnerNoSee") != nullptr)
+	{
+		Utilities::ParameterSingleBool ownerNoSee{};
+		ownerNoSee.boolValue = false;
+		component->call_function(L"SetOwnerNoSee", &ownerNoSee);
+	}
+	// SpawnEmitterAtLocation can return a valid component without activating it
+	// when the reflected bAutoActivate parameter is absent or stale. Re-activate
+	// only the returned particle component; this does not touch native gameplay.
+	if (auto activateSystem = componentClass->find_function(L"ActivateSystem"))
+	{
+		std::vector<uint8_t> params(activateSystem->get_properties_size());
+		if (FindFunctionParameter(activateSystem, L"bFlagAsJustAttached") != nullptr)
+			SetReflectedBoolParameter(activateSystem, params,
+				L"bFlagAsJustAttached", true);
+		else if (FindFunctionParameter(activateSystem, L"bReset") != nullptr)
+			SetReflectedBoolParameter(activateSystem, params, L"bReset", true);
+		activateSystem->call(component, params.data());
+	}
+}
+
+void WeaponManager::StartMotionThrowableVehicleBurn(
+	const MemoryManager::NativeMeleeContact& contact)
+{
+	if (contact.entity == 0 || contact.entityType != 2
+		|| memoryManager == nullptr || settingsManager == nullptr
+		|| !settingsManager->enableMotionThrowables
+		|| settingsManager->enableNativeMolotovMode)
+		return;
+	const ULONGLONG now = GetTickCount64();
+	for (auto& burn : motionThrowableVehicleBurns)
+	{
+		if (burn.entity != contact.entity)
+			continue;
+		burn.nativePoint = contact.point;
+		burn.expiresAt = now + 3000;
+		burn.nextDamageAt = (std::min)(burn.nextDamageAt, now + 250);
+		return;
+	}
+	if (motionThrowableVehicleBurns.size() >= 4)
+		motionThrowableVehicleBurns.erase(motionThrowableVehicleBurns.begin());
+	MotionThrowableVehicleBurn burn{};
+	burn.entity = contact.entity;
+	burn.nativePoint = contact.point;
+	burn.expiresAt = now + 3000;
+	burn.nextDamageAt = now + 250;
+	motionThrowableVehicleBurns.push_back(burn);
+	uevr::API::get()->log_info(
+		"[MotionThrowableBurn] start entity=0x%llX duration_ms=3000 interval_ms=250 damage_source=native-75",
+		static_cast<unsigned long long>(burn.entity));
+}
+
+void WeaponManager::ProcessMotionThrowableVehicleBurns()
+{
+	const ULONGLONG now = GetTickCount64();
+	if (settingsManager == nullptr || !settingsManager->enableMotionThrowables
+		|| settingsManager->enableNativeMolotovMode
+		|| memoryManager == nullptr)
+	{
+		motionThrowableVehicleBurns.clear();
+		return;
+	}
+	for (size_t i = 0; i < motionThrowableVehicleBurns.size();)
+	{
+		auto& burn = motionThrowableVehicleBurns[i];
+		if (burn.entity == 0 || now >= burn.expiresAt)
+		{
+			uevr::API::get()->log_info(
+				"[MotionThrowableBurn] end entity=0x%llX reason=%s ticks=%u",
+				static_cast<unsigned long long>(burn.entity),
+				now >= burn.expiresAt ? "timeout" : "invalid", burn.ticks);
+			motionThrowableVehicleBurns.erase(
+				motionThrowableVehicleBurns.begin() + static_cast<ptrdiff_t>(i));
+			continue;
+		}
+		if (now < burn.nextDamageAt)
+		{
+			++i;
+			continue;
+		}
+		MemoryManager::NativeMeleeContact contact{};
+		contact.entity = burn.entity;
+		contact.entityType = 2;
+		contact.point = burn.nativePoint;
+		int appliedDamage = 0;
+		const bool accepted = memoryManager->ApplyNativeThrowableImpactDamage(
+			contact, Molotov, appliedDamage);
+		++burn.ticks;
+		if (!accepted || contact.targetHealthAfter <= 0.5f
+			|| burn.ticks >= 12)
+		{
+			const char* reason = !accepted ? "rejected"
+				: (contact.targetHealthAfter <= 0.5f ? "destroyed" : "max-ticks");
+			uevr::API::get()->log_info(
+				"[MotionThrowableBurn] end entity=0x%llX reason=%s ticks=%u health=%.2f->%.2f",
+				static_cast<unsigned long long>(burn.entity), reason, burn.ticks,
+				contact.targetHealthBefore, contact.targetHealthAfter);
+			motionThrowableVehicleBurns.erase(
+				motionThrowableVehicleBurns.begin() + static_cast<ptrdiff_t>(i));
+			continue;
+		}
+		burn.nextDamageAt = now + 250;
+		++i;
+	}
+}
+
+bool WeaponManager::StartMotionThrowableFlight(uint32_t sequence, int weaponType, int hand,
+	const glm::fvec3& position, const glm::fquat& rotation,
+	const glm::fvec3& linearVelocityMps, const glm::fvec3& angularVelocity)
+{
+	if (sequence == 0 || (weaponType != Grenade && weaponType != Molotov)
+		|| (hand != 0 && hand != 1) || settingsManager == nullptr
+		|| (weaponType == Molotov && settingsManager->enableNativeMolotovMode)
+		|| playerManager == nullptr || playerManager->playerCharacter == nullptr
+		|| !uevr::API::UObjectHook::exists(playerManager->playerCharacter)
+		|| firstWeaponMesh == nullptr || firstWeaponStaticMesh == nullptr
+		|| !uevr::API::UObjectHook::exists(firstWeaponMesh)
+		|| !uevr::API::UObjectHook::exists(firstWeaponStaticMesh)
+		|| !IsFiniteVector(position) || !IsFiniteQuaternion(rotation)
+		|| !IsFiniteVector(linearVelocityMps) || !IsFiniteVector(angularVelocity))
+		return false;
+
+	ResetMotionThrowableFlight("replacement", true);
+	auto staticMeshClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+		L"Class /Script/Engine.StaticMeshComponent");
+	auto visual = staticMeshClass != nullptr
+		? AddSkeletalComponent(playerManager->playerCharacter, staticMeshClass) : nullptr;
+	if (visual == nullptr || !CallSetStaticMesh(visual, firstWeaponStaticMesh))
+	{
+		if (visual != nullptr && uevr::API::UObjectHook::exists(visual))
+			SetComponentVisibility(visual, false);
+		return false;
+	}
+	// The visible static mesh is only a render proxy; weapon meshes in this
+	// build do not provide a dependable collision body. Use a hidden sphere
+	// primitive for authoritative swept movement and leave the visual free to
+	// follow the exact simulated position.
+	uevr::API::UObject* collisionProxy = nullptr;
+	bool collisionProxyCreated = false;
+	bool collisionProxyRegistered = false;
+	bool collisionProxyRadiusConfigured = false;
+	bool collisionProxyCollisionConfigured = false;
+	bool collisionProxyResponsesConfigured = false;
+	bool collisionProxyOwnerIgnored = false;
+	if (auto sphereClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+		L"Class /Script/Engine.SphereComponent"))
+	{
+		collisionProxy = AddSkeletalComponent(
+			playerManager->playerCharacter, sphereClass);
+		if (collisionProxy != nullptr && uevr::API::UObjectHook::exists(collisionProxy))
+		{
+			collisionProxyCreated = true;
+			auto proxyClass = collisionProxy->get_class();
+			if (proxyClass != nullptr)
+			{
+				auto setRadius = proxyClass->find_function(L"SetSphereRadius");
+				if (setRadius != nullptr)
+				{
+					std::vector<uint8_t> params(setRadius->get_properties_size());
+					collisionProxyRadiusConfigured = SetReflectedFloatParameter(
+						setRadius, params, L"NewRadius", 6.0f);
+					if (collisionProxyRadiusConfigured)
+						setRadius->call(collisionProxy, params.data());
+				}
+				// Some shipped UE reflection profiles omit the SetSphereRadius
+				// parameter metadata even though the component property is present.
+				// Set the known float property as a guarded fallback so the proxy does
+				// not silently remain a zero-radius shape.
+				if (!collisionProxyRadiusConfigured
+					&& proxyClass->find_property(L"SphereRadius") != nullptr)
+				{
+					auto radiusData = collisionProxy->get_property_data<float>(
+						L"SphereRadius");
+					if (radiusData != nullptr)
+					{
+						*radiusData = 6.0f;
+						collisionProxyRadiusConfigured = true;
+					}
+				}
+				if (collisionProxyRadiusConfigured)
+				{
+					auto updateBodySetup = proxyClass->find_function(L"UpdateBodySetup");
+					if (updateBodySetup != nullptr)
+					{
+						std::vector<uint8_t> params(updateBodySetup->get_properties_size());
+						updateBodySetup->call(collisionProxy, params.data());
+					}
+				}
+				auto setCollisionEnabled = proxyClass->find_function(
+					L"SetCollisionEnabled");
+				if (setCollisionEnabled != nullptr)
+				{
+					std::vector<uint8_t> params(setCollisionEnabled->get_properties_size());
+					collisionProxyCollisionConfigured = SetReflectedByteParameter(
+						setCollisionEnabled, params,
+						L"NewType", 3)
+						|| SetReflectedByteParameter(setCollisionEnabled, params,
+							L"Type", 3);
+					if (collisionProxyCollisionConfigured)
+						setCollisionEnabled->call(collisionProxy, params.data());
+				}
+				auto setAllResponses = proxyClass->find_function(
+					L"SetCollisionResponseToAllChannels");
+				if (setAllResponses != nullptr)
+				{
+					std::vector<uint8_t> params(setAllResponses->get_properties_size());
+					collisionProxyResponsesConfigured = SetReflectedByteParameter(
+						setAllResponses, params,
+						L"NewResponse", 2)
+						|| SetReflectedByteParameter(setAllResponses, params,
+							L"Response", 2);
+					if (collisionProxyResponsesConfigured)
+						setAllResponses->call(collisionProxy, params.data());
+				}
+				auto ignoreOwner = proxyClass->find_function(L"MoveIgnoreActorAdd");
+				if (ignoreOwner != nullptr)
+				{
+					std::vector<uint8_t> params(ignoreOwner->get_properties_size());
+					collisionProxyOwnerIgnored = SetReflectedObjectParameter(
+						ignoreOwner, params, L"Actor", playerManager->playerCharacter);
+					if (collisionProxyOwnerIgnored)
+						ignoreOwner->call(collisionProxy, params.data());
+				}
+				auto registerComponent = proxyClass->find_function(L"RegisterComponent");
+				if (registerComponent != nullptr)
+				{
+					std::vector<uint8_t> params(registerComponent->get_properties_size());
+					registerComponent->call(collisionProxy, params.data());
+					collisionProxyRegistered = true;
+				}
+			}
+			SetComponentVisibility(collisionProxy, false);
+			if (collisionProxy->get_class()->find_property(L"bHiddenInGame") != nullptr)
+				collisionProxy->set_bool_property(L"bHiddenInGame", true);
+			if (collisionProxy->get_class()->find_property(L"bGenerateOverlapEvents") != nullptr)
+				collisionProxy->set_bool_property(L"bGenerateOverlapEvents", false);
+		}
+	}
+	if (!collisionProxyCreated)
+		uevr::API::get()->log_warn(
+			"[MotionThrowable] collision proxy unavailable reason=class-or-component-create");
+	auto visualClass = visual->get_class();
+	bool collisionConfigured = false;
+	if (visualClass != nullptr)
+	{
+		auto setCollisionEnabled = visualClass->find_function(L"SetCollisionEnabled");
+		if (setCollisionEnabled != nullptr)
+		{
+			std::vector<uint8_t> params(setCollisionEnabled->get_properties_size());
+			collisionConfigured = SetReflectedByteParameter(
+				setCollisionEnabled, params, L"NewType", 3)
+				|| SetReflectedByteParameter(setCollisionEnabled, params, L"Type", 3);
+			if (collisionConfigured)
+				setCollisionEnabled->call(visual, params.data());
+		}
+		auto setAllResponses = visualClass->find_function(
+			L"SetCollisionResponseToAllChannels");
+		if (setAllResponses != nullptr)
+		{
+			std::vector<uint8_t> params(setAllResponses->get_properties_size());
+			const bool responseSet = SetReflectedByteParameter(
+				setAllResponses, params, L"NewResponse", 2)
+				|| SetReflectedByteParameter(setAllResponses, params, L"Response", 2);
+			if (responseSet)
+				setAllResponses->call(visual, params.data());
+			collisionConfigured = collisionConfigured || responseSet;
+		}
+	}
+	for (int32_t element = 0; element < 4; ++element)
+	{
+		auto material = ReadComponentMaterial(firstWeaponMesh, element);
+		if (material == nullptr)
+			break;
+		SetComponentMaterial(visual, element, material);
+	}
+	auto sourceClass = firstWeaponMesh->get_class();
+	EnsureMotionThrowableVisualRenderable(visual);
+	auto getScale = sourceClass != nullptr
+		? sourceClass->find_function(L"GetComponentScale") : nullptr;
+	if (getScale == nullptr && sourceClass != nullptr)
+		getScale = sourceClass->find_function(L"K2_GetComponentScale");
+	auto setScale = visualClass != nullptr
+		? visualClass->find_function(L"SetWorldScale3D") : nullptr;
+	if (setScale == nullptr && visualClass != nullptr)
+		setScale = visualClass->find_function(L"K2_SetWorldScale3D");
+	glm::fvec3 appliedScale(1.0f);
+	bool appliedScaleValid = false;
+	if (getScale != nullptr)
+	{
+		Utilities::ParameterSingleVector3 scaleParams{};
+		getScale->call(firstWeaponMesh, &scaleParams);
+		const glm::fvec3 candidate = glm::abs(scaleParams.vec3Value);
+		if (IsFiniteVector(candidate)
+			&& candidate.x > 0.001f && candidate.y > 0.001f && candidate.z > 0.001f
+			&& candidate.x < 100.0f && candidate.y < 100.0f && candidate.z < 100.0f)
+		{
+			appliedScale = candidate;
+			appliedScaleValid = true;
+		}
+	}
+	if (!appliedScaleValid && sourceClass != nullptr
+		&& sourceClass->find_property(L"RelativeScale3D") != nullptr)
+	{
+		const auto scaleData = firstWeaponMesh->get_property_data<glm::fvec3>(L"RelativeScale3D");
+		if (scaleData != nullptr)
+		{
+			const glm::fvec3 candidate = glm::abs(*scaleData);
+			if (IsFiniteVector(candidate)
+				&& candidate.x > 0.001f && candidate.y > 0.001f && candidate.z > 0.001f
+				&& candidate.x < 100.0f && candidate.y < 100.0f && candidate.z < 100.0f)
+			{
+				appliedScale = candidate;
+				appliedScaleValid = true;
+			}
+		}
+	}
+	if (setScale != nullptr)
+	{
+		ParameterSetScale3D setScaleParams{};
+		setScaleParams.newScale3D = appliedScale;
+		setScale->call(visual, &setScaleParams);
+	}
+
+	motionThrowableFlight.active = true;
+	motionThrowableFlight.sequence = sequence;
+	motionThrowableFlight.generation = interactionEngineTickGeneration;
+	motionThrowableFlight.weaponType = weaponType;
+	motionThrowableFlight.hand = hand;
+	motionThrowableFlight.ownerCharacter = playerManager->playerCharacter;
+	motionThrowableFlight.sourceMesh = firstWeaponMesh;
+	motionThrowableFlight.visual = visual;
+	motionThrowableFlight.collisionProxy = collisionProxy;
+	motionThrowableFlight.position = position;
+	motionThrowableFlight.previousPosition = position;
+	motionThrowableFlight.linearVelocityUE = linearVelocityMps * 100.0f;
+	motionThrowableFlight.angularVelocity = angularVelocity;
+	motionThrowableFlight.rotation = glm::normalize(rotation);
+	motionThrowableFlight.earlyDiagnosticLogged = false;
+	motionThrowableFlight.midDiagnosticLogged = false;
+	if (!SetMotionThrowableVisualTransform(visual, position, rotation))
+	{
+		ResetMotionThrowableFlight("initial-transform-failed", true);
+		return false;
+	}
+	if (collisionProxy != nullptr
+		&& !SetMotionThrowableVisualTransform(collisionProxy, position,
+			glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f), false))
+	{
+		DestroyMotionThrowableFlightVisual(motionThrowableFlight);
+		motionThrowableFlight = MotionThrowableFlight{};
+		return false;
+	}
+	EnsureMotionThrowableVisualRenderable(visual);
+	SetComponentVisibility(firstWeaponMesh, false);
+	motionThrowableSourceHidden = true;
+	glm::fvec3 visualReadback{};
+	if (visualClass != nullptr
+		&& visualClass->find_function(L"K2_GetComponentLocation") != nullptr)
+	{
+		Utilities::ParameterSingleVector3 locationParams{};
+		visual->call_function(L"K2_GetComponentLocation", &locationParams);
+		visualReadback = locationParams.vec3Value;
+	}
+	auto visualMesh = visualClass != nullptr
+		&& visualClass->find_property(L"StaticMesh") != nullptr
+		? visual->get_property<uevr::API::UObject*>(L"StaticMesh") : nullptr;
+	auto visualParent = visualClass != nullptr
+		&& visualClass->find_property(L"AttachParent") != nullptr
+		? visual->get_property<uevr::API::UObject*>(L"AttachParent") : nullptr;
+	const int visible = visualClass != nullptr
+		&& visualClass->find_property(L"bVisible") != nullptr
+		&& visual->get_bool_property(L"bVisible") ? 1 : 0;
+	const int hiddenInGame = visualClass != nullptr
+		&& visualClass->find_property(L"bHiddenInGame") != nullptr
+		&& visual->get_bool_property(L"bHiddenInGame") ? 1 : 0;
+	const int ownerNoSee = visualClass != nullptr
+		&& visualClass->find_property(L"bOwnerNoSee") != nullptr
+		&& visual->get_bool_property(L"bOwnerNoSee") ? 1 : 0;
+	auto proxyClass = collisionProxy != nullptr ? collisionProxy->get_class() : nullptr;
+	uevr::API::get()->log_info(
+		"[MotionThrowableFlight] visual-ready seq=%u component=%p class=%ls mesh=%p parent=%p collision=%d proxy=%p proxyClass=%ls proxyCreated=%d proxyRegistered=%d proxyRadius=%d proxyCollision=%d proxyResponses=%d proxyIgnoreOwner=%d scale=(%.3f %.3f %.3f) scaleSource=%s readback=(%.2f %.2f %.2f) bVisible=%d bHiddenInGame=%d bOwnerNoSee=%d",
+		sequence, visual, visualClass != nullptr ? visualClass->get_full_name().c_str() : L"<null>",
+		visualMesh, visualParent, collisionConfigured ? 1 : 0,
+		collisionProxy,
+		proxyClass != nullptr ? proxyClass->get_full_name().c_str() : L"<null>",
+		collisionProxyCreated ? 1 : 0, collisionProxyRegistered ? 1 : 0,
+		collisionProxyRadiusConfigured ? 1 : 0,
+		collisionProxyCollisionConfigured ? 1 : 0,
+		collisionProxyResponsesConfigured ? 1 : 0,
+		collisionProxyOwnerIgnored ? 1 : 0,
+		appliedScale.x, appliedScale.y, appliedScale.z,
+		appliedScaleValid ? "component-or-relative" : "unit-fallback",
+		visualReadback.x, visualReadback.y, visualReadback.z,
+		visible, hiddenInGame, ownerNoSee);
+	uevr::API::get()->log_info(
+		"[MotionThrowableFlight] begin seq=%u weapon=%d hand=%s originUE=(%.2f %.2f %.2f) velocity_mps=(%.3f %.3f %.3f) speed=%.3f angular=(%.3f %.3f %.3f) explosion=blocked-unproven ammo=unchanged",
+		sequence, weaponType, hand == 0 ? "left" : "right",
+		position.x, position.y, position.z,
+		linearVelocityMps.x, linearVelocityMps.y, linearVelocityMps.z,
+		glm::length(linearVelocityMps), angularVelocity.x,
+		angularVelocity.y, angularVelocity.z);
+	return true;
+}
+
+void WeaponManager::ProcessMotionThrowableFlight(float delta)
+{
+	if (!processingDetachedThrowableFlights)
+	{
+		processingDetachedThrowableFlights = true;
+		// Run the current flight through the existing state machine first, then
+		// temporarily reuse that state slot for each retained older proxy. This
+		// keeps the collision/effect implementation single-sourced and bounds
+		// detached work to the small list populated on regrip.
+		ProcessMotionThrowableFlight(delta);
+		const MotionThrowableFlight currentFlightAfterProcess = motionThrowableFlight;
+		auto detachedFlights = std::move(motionThrowableDetachedFlights);
+		motionThrowableDetachedFlights.clear();
+		for (auto& detached : detachedFlights)
+		{
+			motionThrowableFlight = detached;
+			ProcessMotionThrowableFlight(delta);
+			if (motionThrowableFlight.active)
+				motionThrowableDetachedFlights.push_back(motionThrowableFlight);
+		}
+		motionThrowableFlight = currentFlightAfterProcess;
+		processingDetachedThrowableFlights = false;
+		return;
+	}
+	if (!motionThrowableFlight.active)
+		return;
+	const bool contextValid = settingsManager != nullptr
+		&& settingsManager->enableMotionThrowables
+		&& !(motionThrowableFlight.weaponType == Molotov
+			&& settingsManager->enableNativeMolotovMode)
+		&& playerManager != nullptr && playerManager->isInControl
+		&& !playerManager->isInVehicle && !playerManager->weaponWheelEnabled
+		&& playerManager->playerCharacter == motionThrowableFlight.ownerCharacter
+		&& motionThrowableFlight.ownerCharacter != nullptr
+		&& uevr::API::UObjectHook::exists(motionThrowableFlight.ownerCharacter);
+	if (!contextValid)
+	{
+		ResetMotionThrowableFlight("context-change", true);
+		return;
+	}
+	if (!std::isfinite(delta) || delta <= 0.0001f || delta > 0.1f)
+		return;
+	if (motionThrowableFlight.visual == nullptr
+		|| !uevr::API::UObjectHook::exists(motionThrowableFlight.visual))
+	{
+		ResetMotionThrowableFlight("visual-lost", true);
+		return;
+	}
+	if (motionThrowableFlight.sourceMesh != nullptr
+		&& uevr::API::UObjectHook::exists(motionThrowableFlight.sourceMesh))
+		SetComponentVisibility(motionThrowableFlight.sourceMesh, false);
+	EnsureMotionThrowableVisualRenderable(motionThrowableFlight.visual);
+
+	const float step = (std::min)(delta, 0.05f);
+	constexpr float NativeGrenadeFuseSeconds = 2.0f;
+	if (motionThrowableFlight.weaponType == Grenade && motionThrowableFlight.settled)
+	{
+		motionThrowableFlight.ageSeconds += step;
+		if (motionThrowableFlight.ageSeconds >= NativeGrenadeFuseSeconds)
+		{
+			const bool exploded = PlayMotionThrowableImpactEffect(Grenade,
+				motionThrowableFlight.position);
+			uevr::API::get()->log_info(
+				"[MotionThrowableFlight] grenade fuse seq=%u age=%.3f state=settled point=(%.3f %.3f %.3f) explosion=%s",
+				motionThrowableFlight.sequence, motionThrowableFlight.ageSeconds,
+				motionThrowableFlight.position.x, motionThrowableFlight.position.y,
+				motionThrowableFlight.position.z, exploded ? "de-native" : "failed");
+			ResetMotionThrowableFlight("fuse-expired", true);
+		}
+		return;
+	}
+	const glm::fvec3 previousPosition = motionThrowableFlight.position;
+	const glm::fvec3 previousVelocity = motionThrowableFlight.linearVelocityUE;
+	// Use a deliberately reduced VR throw gravity. Native GTA's projectile
+	// gravity is not available to this visual proxy, and full 9.8 m/s^2 makes
+	// a hand-thrown bottle drop almost vertically before it can be seen.
+	constexpr float MotionThrowableGravityCmPerSecondSquared = -500.0f;
+	glm::fvec3 nextVelocity = previousVelocity
+		+ glm::fvec3(0.0f, 0.0f, MotionThrowableGravityCmPerSecondSquared) * step;
+	nextVelocity *= std::exp(-0.08f * step);
+	const glm::fvec3 nextPosition = previousPosition
+		+ (previousVelocity + nextVelocity) * (0.5f * step);
+	if (!IsFiniteVector(nextPosition) || !IsFiniteVector(nextVelocity))
+	{
+		ResetMotionThrowableFlight("non-finite-flight", true);
+		return;
+	}
+
+	bool collided = false;
+	bool worldSweep = false;
+	bool collisionProxySweep = false;
+	glm::fvec3 impactPoint = nextPosition;
+	glm::fvec3 impactNormal(0.0f, 0.0f, 1.0f);
+	MemoryManager::NativeMeleeContact contact{};
+	const glm::fvec3 displacement = nextPosition - previousPosition;
+	const float distance = glm::length(displacement);
+	const auto toNativePoint = [](const glm::fvec3& uePoint) {
+		return glm::fvec3(uePoint.x * 0.01f, -uePoint.y * 0.01f,
+			uePoint.z * 0.01f);
+	};
+	const auto toUnrealPoint = [](const std::array<float, 3>& nativePoint) {
+		return glm::fvec3(nativePoint[0] * 100.0f,
+			-nativePoint[1] * 100.0f, nativePoint[2] * 100.0f);
+	};
+	MotionThrowableWorldSweepHit worldHit{};
+	bool worldTraceAvailable = false;
+	if (playerManager != nullptr && playerManager->playerActor != nullptr
+		&& uevr::API::UObjectHook::exists(playerManager->playerActor))
+	{
+		constexpr float MotionThrowableSweepRadiusCm = 5.5f;
+		// SphereTraceSingle takes ETraceTypeQuery, not a raw ECC label. The
+		// project mapping is runtime-specific, so probe the standard query slots
+		// once per movement step until one actually reports world geometry, then
+		// retain that working slot for subsequent flights.
+		static constexpr std::array<uint8_t, 8> MotionThrowableTraceChannels{
+			3, 0, 1, 2, 4, 5, 6, 7 };
+		const uint8_t traceChannel = motionThrowableWorldTraceChannel >= 0
+			? static_cast<uint8_t>(motionThrowableWorldTraceChannel)
+			: MotionThrowableTraceChannels[motionThrowableWorldTraceProbeCursor
+				% MotionThrowableTraceChannels.size()];
+		worldSweep = SweepMotionThrowableWorld(playerManager->playerActor,
+			previousPosition, nextPosition, MotionThrowableSweepRadiusCm,
+			traceChannel, worldTraceAvailable, worldHit);
+		if (motionThrowableWorldTraceChannel < 0)
+		{
+			motionThrowableWorldTraceProbeCursor = static_cast<uint8_t>(
+				(motionThrowableWorldTraceProbeCursor + 1)
+				% MotionThrowableTraceChannels.size());
+			if (worldSweep)
+			{
+				motionThrowableWorldTraceChannel = traceChannel;
+				uevr::API::get()->log_info(
+					"[MotionThrowable] world sphere sweep selected channel=%u",
+					static_cast<unsigned int>(traceChannel));
+			}
+		}
+		if (worldTraceAvailable && !motionThrowableWorldSweepReadyLogged)
+		{
+			motionThrowableWorldSweepReadyLogged = true;
+			uevr::API::get()->log_info(
+				"[MotionThrowable] world sphere sweep ready radius_cm=%.1f traceQuery=%u",
+				MotionThrowableSweepRadiusCm,
+				static_cast<unsigned int>(traceChannel));
+		}
+		if (!worldTraceAvailable && !motionThrowableWorldSweepFailureLogged)
+		{
+			motionThrowableWorldSweepFailureLogged = true;
+			uevr::API::get()->log_warn(
+				"[MotionThrowable] world sphere sweep unavailable reason=reflection-or-params");
+		}
+	}
+	if (worldSweep)
+	{
+		collided = true;
+		impactPoint = worldHit.point;
+		impactNormal = worldHit.normal;
+	}
+	if (!collided && motionThrowableFlight.collisionProxy != nullptr)
+	{
+		MotionThrowableWorldSweepHit proxyHit{};
+		if (MoveMotionThrowableCollisionProxy(
+			motionThrowableFlight.collisionProxy, nextPosition, proxyHit))
+		{
+			collided = true;
+			collisionProxySweep = true;
+			impactPoint = proxyHit.point;
+			impactNormal = proxyHit.normal;
+		}
+	}
+	if (memoryManager != nullptr && std::isfinite(distance) && distance > 0.001f)
+	{
+		// QueryNativeLineOfSightEntity intentionally rejects segments longer than
+		// 3 cm. Keep every flight segment below that bound even during a fast
+		// release or a gravity step; the old 32-segment cap could produce a longer
+		// final segment and silently discard the entire collision probe.
+		constexpr float NativeThrowableTraceSegmentCm = 2.0f;
+		constexpr int NativeThrowableTraceMaxSegments = 128;
+		const int segmentCount = (std::clamp)(
+			static_cast<int>(std::ceil(distance / NativeThrowableTraceSegmentCm)),
+			1, NativeThrowableTraceMaxSegments);
+		for (int segment = 0; segment < segmentCount && !collided; ++segment)
+		{
+			const float startT = static_cast<float>(segment)
+				/ static_cast<float>(segmentCount);
+			const float endT = static_cast<float>(segment + 1)
+				/ static_cast<float>(segmentCount);
+			const glm::fvec3 segmentStart = glm::mix(previousPosition, nextPosition, startT);
+			const glm::fvec3 segmentEnd = glm::mix(previousPosition, nextPosition, endT);
+			const glm::fvec3 nativeStart = toNativePoint(segmentStart);
+			const glm::fvec3 nativeEnd = toNativePoint(segmentEnd);
+			collided = memoryManager->QueryNativeLineOfSightEntity(
+				{ nativeStart.x, nativeStart.y, nativeStart.z },
+				{ nativeEnd.x, nativeEnd.y, nativeEnd.z }, contact, false);
+		}
+	}
+	if (collided)
+	{
+		if (!worldSweep && !collisionProxySweep)
+		{
+			impactPoint = toUnrealPoint(contact.point);
+			impactNormal = glm::fvec3(contact.normal[0],
+				-contact.normal[1], contact.normal[2]);
+		}
+		if (IsFiniteVector(impactPoint))
+		{
+			motionThrowableFlight.position = impactPoint;
+			SetMotionThrowableVisualTransform(motionThrowableFlight.visual,
+				impactPoint, motionThrowableFlight.rotation);
+		}
+		if (motionThrowableFlight.weaponType == Grenade)
+		{
+			glm::fvec3 normal = NormalizeOrZero(impactNormal);
+			if (glm::length(normal) < 0.5f)
+				normal = glm::fvec3(0.0f, 0.0f, 1.0f);
+			glm::fvec3 bouncedVelocity = nextVelocity;
+			const float intoSurface = glm::dot(bouncedVelocity, normal);
+			if (intoSurface < 0.0f)
+				bouncedVelocity -= normal * (1.35f * intoSurface);
+			bouncedVelocity *= 0.62f;
+			motionThrowableFlight.settled = !IsFiniteVector(bouncedVelocity)
+				|| glm::length(bouncedVelocity) < 65.0f
+				|| motionThrowableFlight.bounceCount >= 5;
+			if (motionThrowableFlight.settled)
+				bouncedVelocity = glm::fvec3(0.0f);
+			motionThrowableFlight.position = impactPoint + normal * 6.0f;
+			motionThrowableFlight.previousPosition = motionThrowableFlight.position;
+			motionThrowableFlight.linearVelocityUE = bouncedVelocity;
+			motionThrowableFlight.angularVelocity *= 0.65f;
+			motionThrowableFlight.ageSeconds += step;
+			++motionThrowableFlight.bounceCount;
+			SetMotionThrowableVisualTransform(motionThrowableFlight.visual,
+				motionThrowableFlight.position, motionThrowableFlight.rotation, false);
+			uevr::API::get()->log_info(
+				"[MotionThrowableFlight] grenade contact seq=%u bounce=%u age=%.3f source=%s point=(%.3f %.3f %.3f) normal=(%.3f %.3f %.3f) speed_mps=%.3f settled=%s",
+				motionThrowableFlight.sequence, motionThrowableFlight.bounceCount,
+				motionThrowableFlight.ageSeconds,
+				worldSweep ? "world-sphere-sweep"
+					: (collisionProxySweep ? "sphere-component-sweep" : "native-los"),
+				impactPoint.x, impactPoint.y, impactPoint.z,
+				normal.x, normal.y, normal.z,
+				glm::length(bouncedVelocity) * 0.01f,
+				motionThrowableFlight.settled ? "true" : "false");
+			if (motionThrowableFlight.ageSeconds >= NativeGrenadeFuseSeconds)
+			{
+				const bool exploded = PlayMotionThrowableImpactEffect(Grenade,
+					motionThrowableFlight.position, &contact);
+				uevr::API::get()->log_info(
+					"[MotionThrowableFlight] grenade fuse seq=%u age=%.3f state=contact explosion=%s",
+					motionThrowableFlight.sequence, motionThrowableFlight.ageSeconds,
+					exploded ? "de-native" : "failed");
+				ResetMotionThrowableFlight("fuse-expired", true);
+			}
+			return;
+		}
+		const bool impactEffectPlayed = IsFiniteVector(impactPoint)
+			&& PlayMotionThrowableImpactEffect(motionThrowableFlight.weaponType,
+				impactPoint, &contact);
+		uevr::API::get()->log_info(
+			"[MotionThrowableFlight] impact seq=%u weapon=%d hand=%s source=%s point=(%.3f %.3f %.3f) entity=0x%llX type=%u speed_mps=%.3f explosion=%s ammo=unchanged",
+			motionThrowableFlight.sequence, motionThrowableFlight.weaponType,
+			motionThrowableFlight.hand == 0 ? "left" : "right",
+			worldSweep ? "world-sphere-sweep"
+				: (collisionProxySweep ? "sphere-component-sweep" : "native-los"),
+			impactPoint.x, impactPoint.y, impactPoint.z,
+			static_cast<unsigned long long>(contact.entity),
+			static_cast<unsigned int>(contact.entityType),
+			glm::length(nextVelocity) * 0.01f,
+			impactEffectPlayed ? "visual-audio" : "unavailable-native-damage-unproven");
+		ResetMotionThrowableFlight("impact-probe-complete", true);
+		return;
+	}
+
+	motionThrowableFlight.previousPosition = previousPosition;
+	motionThrowableFlight.position = nextPosition;
+	motionThrowableFlight.linearVelocityUE = nextVelocity;
+	const float angularSpeed = glm::length(motionThrowableFlight.angularVelocity);
+	if (std::isfinite(angularSpeed) && angularSpeed > 0.001f)
+	{
+		const glm::fvec3 axis = motionThrowableFlight.angularVelocity / angularSpeed;
+		motionThrowableFlight.rotation = glm::normalize(glm::angleAxis(
+			angularSpeed * step, axis) * motionThrowableFlight.rotation);
+	}
+	motionThrowableFlight.ageSeconds += step;
+	if (!SetMotionThrowableVisualTransform(motionThrowableFlight.visual,
+		motionThrowableFlight.position, motionThrowableFlight.rotation, false))
+	{
+		ResetMotionThrowableFlight("transform-update-failed", true);
+		return;
+	}
+	if (motionThrowableFlight.weaponType == Grenade
+		&& motionThrowableFlight.ageSeconds >= NativeGrenadeFuseSeconds)
+	{
+		const bool exploded = PlayMotionThrowableImpactEffect(Grenade,
+			motionThrowableFlight.position);
+		uevr::API::get()->log_info(
+			"[MotionThrowableFlight] grenade fuse seq=%u age=%.3f state=airborne point=(%.3f %.3f %.3f) explosion=%s",
+			motionThrowableFlight.sequence, motionThrowableFlight.ageSeconds,
+			motionThrowableFlight.position.x, motionThrowableFlight.position.y,
+			motionThrowableFlight.position.z, exploded ? "de-native" : "failed");
+		ResetMotionThrowableFlight("fuse-expired", true);
+		return;
+	}
+	// A static-mesh proxy can provide a second, engine-side collision signal even
+	// when the native DE LOS helper returns no entity for world geometry. A sweep
+	// that stops short of its requested point is treated as an impact; the
+	// native LOS/entity path above remains authoritative for actors.
+	glm::fvec3 sweptPosition{};
+	bool sweepBlocked = false;
+	if (motionThrowableFlight.visual != nullptr
+		&& uevr::API::UObjectHook::exists(motionThrowableFlight.visual))
+	{
+		auto visualClass = motionThrowableFlight.visual->get_class();
+		auto getLocation = visualClass != nullptr
+			? visualClass->find_function(L"K2_GetComponentLocation") : nullptr;
+		if (getLocation != nullptr)
+		{
+			Utilities::ParameterSingleVector3 locationParams{};
+			getLocation->call(motionThrowableFlight.visual, &locationParams);
+			sweptPosition = locationParams.vec3Value;
+			const float requestedDistance = glm::length(
+				nextPosition - previousPosition);
+			const float blockedDistance = glm::length(sweptPosition - nextPosition);
+			sweepBlocked = IsFiniteVector(sweptPosition)
+				&& std::isfinite(requestedDistance)
+				&& std::isfinite(blockedDistance)
+				&& requestedDistance > 1.0f
+				&& blockedDistance > (std::max)(1.0f, requestedDistance * 0.25f);
+		}
+	}
+	if (sweepBlocked)
+	{
+		motionThrowableFlight.position = sweptPosition;
+		if (motionThrowableFlight.weaponType == Grenade)
+		{
+			motionThrowableFlight.linearVelocityUE = glm::fvec3(0.0f);
+			motionThrowableFlight.angularVelocity *= 0.5f;
+			motionThrowableFlight.settled = true;
+			++motionThrowableFlight.bounceCount;
+			uevr::API::get()->log_info(
+				"[MotionThrowableFlight] grenade contact seq=%u bounce=%u age=%.3f source=component-sweep point=(%.3f %.3f %.3f) settled=true",
+				motionThrowableFlight.sequence, motionThrowableFlight.bounceCount,
+				motionThrowableFlight.ageSeconds, sweptPosition.x,
+				sweptPosition.y, sweptPosition.z);
+			return;
+		}
+		const bool impactEffectPlayed = PlayMotionThrowableImpactEffect(
+			motionThrowableFlight.weaponType, sweptPosition);
+		uevr::API::get()->log_info(
+			"[MotionThrowableFlight] impact seq=%u weapon=%d hand=%s source=component-sweep point=(%.3f %.3f %.3f) entity=0x0 type=0 speed_mps=%.3f explosion=%s ammo=unchanged",
+			motionThrowableFlight.sequence, motionThrowableFlight.weaponType,
+			motionThrowableFlight.hand == 0 ? "left" : "right",
+			sweptPosition.x, sweptPosition.y, sweptPosition.z,
+			glm::length(nextVelocity) * 0.01f,
+			impactEffectPlayed ? "visual-and-audio" : "unavailable");
+		ResetMotionThrowableFlight("impact-probe-complete", true);
+		return;
+	}
+	const auto logFlightDiagnostic = [&](const char* phase) {
+		if (motionThrowableFlight.visual == nullptr
+			|| !uevr::API::UObjectHook::exists(motionThrowableFlight.visual))
+			return;
+		auto visualClass = motionThrowableFlight.visual->get_class();
+		glm::fvec3 readback{};
+		if (visualClass != nullptr
+			&& visualClass->find_function(L"K2_GetComponentLocation") != nullptr)
+		{
+			Utilities::ParameterSingleVector3 locationParams{};
+			motionThrowableFlight.visual->call_function(
+				L"K2_GetComponentLocation", &locationParams);
+			readback = locationParams.vec3Value;
+		}
+		const int visible = visualClass != nullptr
+			&& visualClass->find_property(L"bVisible") != nullptr
+			&& motionThrowableFlight.visual->get_bool_property(L"bVisible") ? 1 : 0;
+		const int hiddenInGame = visualClass != nullptr
+			&& visualClass->find_property(L"bHiddenInGame") != nullptr
+			&& motionThrowableFlight.visual->get_bool_property(L"bHiddenInGame") ? 1 : 0;
+		uevr::API::get()->log_info(
+			"[MotionThrowableFlight] diagnostic seq=%u phase=%s age=%.3f state=(%.2f %.2f %.2f) readback=(%.2f %.2f %.2f) velocity_mps=(%.3f %.3f %.3f) visible=%d hiddenInGame=%d",
+			motionThrowableFlight.sequence, phase, motionThrowableFlight.ageSeconds,
+			motionThrowableFlight.position.x, motionThrowableFlight.position.y,
+			motionThrowableFlight.position.z, readback.x, readback.y, readback.z,
+			motionThrowableFlight.linearVelocityUE.x * 0.01f,
+			motionThrowableFlight.linearVelocityUE.y * 0.01f,
+			motionThrowableFlight.linearVelocityUE.z * 0.01f,
+			visible, hiddenInGame);
+	};
+	if (!motionThrowableFlight.earlyDiagnosticLogged
+		&& motionThrowableFlight.ageSeconds >= 0.08f)
+	{
+		motionThrowableFlight.earlyDiagnosticLogged = true;
+		logFlightDiagnostic("early");
+	}
+	if (!motionThrowableFlight.midDiagnosticLogged
+		&& motionThrowableFlight.ageSeconds >= 0.50f)
+	{
+		motionThrowableFlight.midDiagnosticLogged = true;
+		logFlightDiagnostic("mid");
+	}
+	// This is only a fail-safe for an unreachable/missed collision probe. Normal
+	// flights end on native LOS or the bounded ground crossing, and native GTA
+	// projectile ownership ends them earlier once the release pulse is accepted.
+	if (motionThrowableFlight.ageSeconds >= 6.0f)
+		ResetMotionThrowableFlight("timeout", true);
+}
+
+void WeaponManager::ResetPhysicalThrowableProbe(const char* reason, bool logCancellation)
+{
+	if (throwableProbeActive && logCancellation)
+	{
+		uevr::API::get()->log_info(
+			"[ThrowableProbe] cancel seq=%u weapon=%d reason=%s native=unchanged",
+			throwableProbeSequence, static_cast<int>(currentWeaponEquipped),
+			reason != nullptr ? reason : "unspecified");
+	}
+	throwableProbeActive = false;
+	throwableProbeSequence = 0;
+	throwableProbeHandMask = 0;
+	throwableProbeGripMask = 0;
+	throwableProbePoseValid = { false, false };
+	throwableProbeLastPoseFromVisibleBone = { false, false };
+	throwableProbePreviousWorldPositions = {};
+	throwableProbeLastWorldPositions = {};
+	throwableProbeLastDirections = {};
+	throwableProbePreviousWorldRotations = {
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f),
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f) };
+	throwableProbeLastWorldRotations = throwableProbePreviousWorldRotations;
+	throwableProbeSmoothedVelocityMps = {};
+	throwableProbeSmoothedAngularVelocity = {};
+	throwableProbeSampleCounts = { 0, 0 };
+	throwableProbeVelocityHistoryMps = {};
+	throwableProbeVelocityHistoryTimes = {};
+	throwableProbePositionHistoryM = {};
+	throwableProbePositionHistoryTimes = {};
+	throwableProbeVelocityHistoryCursor = {};
+	motionThrowableVehicleBurns.clear();
+}
+
+void WeaponManager::ProcessPhysicalThrowableProbe(float delta)
+{
+	if (memoryManager != nullptr)
+	{
+		MemoryManager::NativeThrowableLaunchProbe nativeLaunchProbe{};
+		if (memoryManager->ReadLatestNativeThrowableLaunchProbe(nativeLaunchProbe))
+		{
+			const bool nativeMode = settingsManager != nullptr
+				&& settingsManager->enableNativeMolotovMode;
+			uevr::API::get()->log_info(
+				"[NativeThrowableProbe] launch seq=%u weapon=%d mode=%s overridden=%s identity=local-player origin=(%.3f %.3f %.3f) direction=%s(%.4f %.4f %.4f) force=%.4f target=0x%llX",
+				nativeLaunchProbe.sequence, nativeLaunchProbe.weaponType,
+				nativeMode ? "native" : "custom-or-native",
+				nativeLaunchProbe.overridden ? "true" : "false",
+				nativeLaunchProbe.rawOrigin[0], nativeLaunchProbe.rawOrigin[1],
+				nativeLaunchProbe.rawOrigin[2],
+				nativeLaunchProbe.directionSupplied ? "provided" : "none",
+				nativeLaunchProbe.rawDirection[0], nativeLaunchProbe.rawDirection[1],
+				nativeLaunchProbe.rawDirection[2], nativeLaunchProbe.force,
+				static_cast<unsigned long long>(nativeLaunchProbe.target));
+		}
+	}
+	const bool nativeMolotovOnly = currentWeaponEquipped == Molotov
+		&& settingsManager != nullptr && settingsManager->enableNativeMolotovMode;
+	const bool motionEnabled = settingsManager != nullptr
+		&& settingsManager->enableMotionThrowables && !nativeMolotovOnly;
+	const bool probeEnabled = settingsManager != nullptr
+		&& !nativeMolotovOnly
+		&& (motionEnabled || settingsManager->enableThrowableMotionProbe);
+	const ULONGLONG now = GetTickCount64();
+	ProcessMotionThrowableImpactVisuals();
+	ProcessMotionThrowableVehicleBurns();
+	ProcessMotionThrowableFlight(delta);
+	if (throwableMotionHiddenMesh != nullptr
+		&& throwableMotionVisualRestoreAt != 0
+		&& now >= throwableMotionVisualRestoreAt)
+	{
+		if (throwableMotionHiddenMesh == firstWeaponMesh
+			&& uevr::API::UObjectHook::exists(throwableMotionHiddenMesh)
+			&& currentWeaponEquipped >= Grenade && currentWeaponEquipped <= Molotov)
+			SetComponentVisibility(throwableMotionHiddenMesh, true);
+		throwableMotionHiddenMesh = nullptr;
+		throwableMotionVisualRestoreAt = 0;
+	}
+	uint32_t consumedSequence = 0;
+	if (memoryManager != nullptr
+		&& memoryManager->ConsumeNativeThrowableMotionApplied(consumedSequence))
+	{
+		uevr::API::get()->log_info(
+			"[MotionThrowable] native launch consumed seq=%u weapon=%d",
+			consumedSequence, throwableMotionOverrideWeapon);
+		if (consumedSequence == throwableMotionOverrideSequence)
+		{
+			uevr::API::UObject* proxySourceMesh = nullptr;
+			if (motionThrowableFlight.active
+				&& motionThrowableFlight.sequence == consumedSequence)
+				proxySourceMesh = motionThrowableFlight.sourceMesh;
+			if (proxySourceMesh != nullptr)
+				ResetMotionThrowableFlight("native-launch-owned", true);
+			throwableMotionOverrideSequence = 0;
+			throwableMotionOverrideExpiresAt = 0;
+			throwableMotionOverrideWeapon = -1;
+			// The native projectile now owns the visible object. Permit GTA's next
+			// inventory bottle to reappear after a short handoff interval.
+			if (proxySourceMesh != nullptr
+				&& uevr::API::UObjectHook::exists(proxySourceMesh))
+			{
+				throwableMotionHiddenMesh = proxySourceMesh;
+				SetComponentVisibility(throwableMotionHiddenMesh, false);
+				throwableMotionVisualRestoreAt = now + 220;
+			}
+			else if (throwableMotionHiddenMesh != nullptr)
+				throwableMotionVisualRestoreAt = now + 220;
+		}
+	}
+	if (throwableMotionOverrideSequence != 0
+		&& throwableMotionOverrideExpiresAt != 0
+		&& now >= throwableMotionOverrideExpiresAt)
+	{
+		if (memoryManager != nullptr)
+			memoryManager->ClearNativeThrowableMotionOverride();
+		uevr::API::get()->log_warn(
+			"[MotionThrowable] native launch expired seq=%u weapon=%d",
+			throwableMotionOverrideSequence, throwableMotionOverrideWeapon);
+		throwableMotionOverrideSequence = 0;
+		throwableMotionOverrideExpiresAt = 0;
+		throwableMotionOverrideWeapon = -1;
+		if (throwableMotionHiddenMesh != nullptr)
+			throwableMotionVisualRestoreAt = now;
+	}
+	if (!probeEnabled)
+	{
+		throwableProbeEdgePending.store(false, std::memory_order_release);
+		throwableProbeReleasePending.store(false, std::memory_order_release);
+		throwableProbeCancelPending.store(false, std::memory_order_release);
+		if (memoryManager != nullptr)
+			memoryManager->ClearNativeThrowableMotionOverride();
+		throwableMotionOverrideSequence = 0;
+		throwableMotionOverrideExpiresAt = 0;
+		throwableMotionOverrideWeapon = -1;
+		if (throwableMotionHiddenMesh != nullptr)
+			throwableMotionVisualRestoreAt = now;
+		ResetMotionThrowableFlight("disabled", true);
+		ResetPhysicalThrowableProbe("disabled", false);
+		return;
+	}
+
+	if (throwableProbeCancelPending.exchange(false, std::memory_order_acq_rel))
+		ResetPhysicalThrowableProbe("lua-transition", true);
+
+	const bool contextValid = playerManager != nullptr
+		&& playerManager->isInControl
+		&& !playerManager->isInVehicle
+		&& !playerManager->weaponWheelEnabled
+		&& currentWeaponEquipped >= Grenade
+		&& currentWeaponEquipped <= Molotov;
+
+	if (throwableProbeEdgePending.exchange(false, std::memory_order_acq_rel))
+	{
+		const uint32_t sequence = throwableProbeEdgeSequence.load(std::memory_order_relaxed);
+		const uint8_t handMask = throwableProbeEdgeHandMask.load(std::memory_order_relaxed) & 3U;
+		const uint8_t gripMask = throwableProbeEdgeGripMask.load(std::memory_order_relaxed) & 3U;
+		const int luaWeaponId = throwableProbeEdgeLuaWeapon.load(std::memory_order_relaxed);
+		ResetPhysicalThrowableProbe("new-edge", false);
+		const uint8_t heldHandMask = static_cast<uint8_t>(handMask & gripMask);
+		if (contextValid && sequence != 0 && heldHandMask != 0)
+		{
+			const bool customFlightOwnsSlot =
+				(currentWeaponEquipped == Grenade || currentWeaponEquipped == Molotov)
+				&& motionThrowableFlight.active;
+			if (customFlightOwnsSlot)
+			{
+				// A new grip is a new held bottle even if an older proxy is still
+				// airborne. Keep the old proxy in the bounded detached list instead
+				// of rejecting the grip and leaving the source bottle hidden.
+				uevr::API::get()->log_info(
+					"[MotionThrowableFlight] grip retains active seq=%u oldSeq=%u age=%.3f detached=%zu",
+					sequence, motionThrowableFlight.sequence,
+					motionThrowableFlight.ageSeconds,
+					motionThrowableDetachedFlights.size());
+				constexpr size_t MotionThrowableMaximumDetachedFlights = 3;
+				if (motionThrowableDetachedFlights.size()
+					>= MotionThrowableMaximumDetachedFlights)
+				{
+					DestroyMotionThrowableFlightVisual(
+						motionThrowableDetachedFlights.front());
+					motionThrowableDetachedFlights.erase(
+						motionThrowableDetachedFlights.begin());
+				}
+				MotionThrowableFlight detachedFlight = motionThrowableFlight;
+				// The native source remains hidden for the new handoff and must
+				// never be restored by cleanup of an older detached proxy.
+				detachedFlight.sourceMesh = nullptr;
+				motionThrowableDetachedFlights.push_back(detachedFlight);
+				motionThrowableFlight = MotionThrowableFlight{};
+				if (memoryManager != nullptr)
+					memoryManager->ClearNativeThrowableMotionOverride();
+				throwableMotionOverrideSequence = 0;
+				throwableMotionOverrideExpiresAt = 0;
+				throwableMotionOverrideWeapon = -1;
+				if (firstWeaponMesh != nullptr
+					&& uevr::API::UObjectHook::exists(firstWeaponMesh))
+					SetComponentVisibility(firstWeaponMesh, true);
+				motionThrowableSourceHidden = false;
+				throwableProbeActive = true;
+				throwableProbeSequence = sequence;
+				throwableProbeHandMask = heldHandMask;
+				throwableProbeGripMask = gripMask;
+			}
+			else
+			{
+				if (motionThrowableSourceHidden && firstWeaponMesh != nullptr
+					&& uevr::API::UObjectHook::exists(firstWeaponMesh))
+					SetComponentVisibility(firstWeaponMesh, true);
+				motionThrowableSourceHidden = false;
+				ResetMotionThrowableFlight("new-grip", true);
+				if (memoryManager != nullptr)
+					memoryManager->ClearNativeThrowableMotionOverride();
+				throwableMotionOverrideSequence = 0;
+				throwableMotionOverrideExpiresAt = 0;
+				throwableMotionOverrideWeapon = -1;
+				throwableProbeActive = true;
+				throwableProbeSequence = sequence;
+				throwableProbeHandMask = heldHandMask;
+				throwableProbeGripMask = gripMask;
+				uevr::API::get()->log_info(
+					"[ThrowableProbe] edge seq=%u weapon=%d luaWeapon=%d hands=%u grips=%u source=grip custom-flight=armed",
+					sequence, static_cast<int>(currentWeaponEquipped), luaWeaponId,
+					static_cast<unsigned int>(heldHandMask),
+					static_cast<unsigned int>(gripMask));
+			}
+		}
+		else if (settingsManager->debugInputLayerProbe
+			|| (luaWeaponId >= Grenade && luaWeaponId <= Molotov))
+		{
+			uevr::API::get()->log_info(
+				"[ThrowableProbe] edge rejected seq=%u nativeWeapon=%d luaWeapon=%d hands=%u reason=context",
+				sequence, static_cast<int>(currentWeaponEquipped), luaWeaponId,
+				static_cast<unsigned int>(handMask));
+		}
+	}
+
+	if (throwableProbeActive && !contextValid)
+	{
+		if (memoryManager != nullptr)
+			memoryManager->ClearNativeThrowableMotionOverride();
+		if (throwableMotionHiddenMesh != nullptr)
+			throwableMotionVisualRestoreAt = now;
+		ResetPhysicalThrowableProbe("authoritative-context-change", true);
+	}
+
+	if (throwableProbeActive && delta > 0.001f && delta <= 0.1f)
+	{
+		for (int hand = 0; hand < 2; ++hand)
+		{
+			const uint8_t bit = static_cast<uint8_t>(1U << hand);
+			if ((throwableProbeHandMask & bit) == 0)
+				continue;
+
+			glm::fvec3 controllerPosition{};
+			glm::fquat controllerRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+			glm::fvec3 worldPosition{};
+			glm::fquat worldRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+			bool usedVisibleBone = false;
+			if (!ReadControllerCalibrationPose(hand, controllerPosition, controllerRotation)
+				|| !ReadMotionMeleeHandWorldPose(hand, controllerPosition,
+					controllerRotation, worldPosition, worldRotation, usedVisibleBone))
+				continue;
+
+			const glm::fvec3 direction = NormalizeOrZero(
+				worldRotation * glm::fvec3(1.0f, 0.0f, 0.0f));
+			if (glm::length(direction) <= 0.5f)
+				continue;
+
+			glm::fvec3 bodyOrigin = playerManager->actualPlayerHeadPositionUE;
+			if (!IsFiniteVector(bodyOrigin) || glm::length(bodyOrigin) <= 0.001f)
+				bodyOrigin = playerManager->actualPlayerPositionUE;
+			const glm::fvec3 handRelativePositionM =
+				(worldPosition - bodyOrigin) * 0.01f;
+			glm::fvec3 instantaneousVelocityMps(0.0f);
+			bool velocitySampleValid = false;
+			if (throwableProbePoseValid[hand])
+			{
+				// Throw momentum comes from the same visible hand bone used by melee.
+				// Keep it body-relative so locomotion is not mistaken for a throw.
+				const glm::fvec3 handDeltaM = handRelativePositionM
+					- throwableProbePreviousWorldPositions[hand];
+				instantaneousVelocityMps = handDeltaM / delta;
+				if (IsFiniteVector(instantaneousVelocityMps)
+					&& glm::length(instantaneousVelocityMps) <= 20.0f)
+				{
+					velocitySampleValid = true;
+					throwableProbeSmoothedVelocityMps[hand] =
+						throwableProbeSmoothedVelocityMps[hand] * 0.25f
+						+ instantaneousVelocityMps * 0.75f;
+				}
+				glm::fquat deltaRotation = glm::normalize(worldRotation
+					* glm::inverse(throwableProbePreviousWorldRotations[hand]));
+				if (deltaRotation.w < 0.0f)
+					deltaRotation = glm::fquat::wxyz(-deltaRotation.w,
+						-deltaRotation.x, -deltaRotation.y, -deltaRotation.z);
+				const float clampedW = (std::clamp)(deltaRotation.w, -1.0f, 1.0f);
+				const float angle = 2.0f * std::acos(clampedW);
+				const float sinHalf = std::sqrt((std::max)(0.0f, 1.0f - clampedW * clampedW));
+				if (std::isfinite(angle) && sinHalf > 0.0001f)
+				{
+					const glm::fvec3 axis(deltaRotation.x / sinHalf,
+						deltaRotation.y / sinHalf, deltaRotation.z / sinHalf);
+					const glm::fvec3 instantaneousAngularVelocity = axis * (angle / delta);
+					if (IsFiniteVector(instantaneousAngularVelocity)
+						&& glm::length(instantaneousAngularVelocity) <= 50.0f)
+					{
+						throwableProbeSmoothedAngularVelocity[hand] =
+							throwableProbeSmoothedAngularVelocity[hand] * 0.25f
+							+ instantaneousAngularVelocity * 0.75f;
+					}
+				}
+			}
+			else
+			{
+				throwableProbeSmoothedVelocityMps[hand] = glm::fvec3(0.0f);
+				throwableProbeSmoothedAngularVelocity[hand] = glm::fvec3(0.0f);
+				throwableProbePoseValid[hand] = true;
+			}
+			if (IsFiniteVector(handRelativePositionM))
+			{
+				const size_t sampleIndex = throwableProbeVelocityHistoryCursor[hand]
+					% ThrowableVelocityHistorySize;
+				throwableProbePositionHistoryM[hand][sampleIndex] = handRelativePositionM;
+				throwableProbePositionHistoryTimes[hand][sampleIndex] = now;
+				throwableProbeVelocityHistoryMps[hand][sampleIndex] =
+					velocitySampleValid ? instantaneousVelocityMps : glm::fvec3(0.0f);
+				throwableProbeVelocityHistoryTimes[hand][sampleIndex] = now;
+				++throwableProbeVelocityHistoryCursor[hand];
+			}
+			throwableProbeLastPoseFromVisibleBone[hand] = usedVisibleBone;
+			throwableProbePreviousWorldPositions[hand] = handRelativePositionM;
+			throwableProbeLastWorldPositions[hand] = worldPosition;
+			throwableProbeLastDirections[hand] = direction;
+			throwableProbePreviousWorldRotations[hand] = worldRotation;
+			throwableProbeLastWorldRotations[hand] = worldRotation;
+			++throwableProbeSampleCounts[hand];
+		}
+	}
+
+	if (!throwableProbeReleasePending.exchange(false, std::memory_order_acq_rel))
+		return;
+
+	const uint32_t sequence = throwableProbeReleaseSequence.load(std::memory_order_relaxed);
+	const uint8_t releaseHandMask = throwableProbeReleaseHandMask.load(std::memory_order_relaxed) & 3U;
+	const uint8_t releaseGripMask = throwableProbeReleaseGripMask.load(std::memory_order_relaxed) & 3U;
+	const uint32_t holdMilliseconds = throwableProbeReleaseHoldMilliseconds.load(std::memory_order_relaxed);
+	const int luaWeaponId = throwableProbeReleaseLuaWeapon.load(std::memory_order_relaxed);
+	if (!throwableProbeActive || sequence != throwableProbeSequence)
+		return;
+
+	throwableProbeHandMask |= static_cast<uint8_t>(releaseHandMask & releaseGripMask);
+	throwableProbeGripMask |= releaseGripMask;
+	const uint8_t releasedHandMask = static_cast<uint8_t>(releaseHandMask & releaseGripMask);
+	int selectedHand = -1;
+	// Prefer the hand whose grip actually released. The configured primary hand
+	// is only a fallback; choosing it first can discard the moving hand when both
+	// hands were held during the same throwable interaction.
+	if (releasedHandMask != 0)
+	{
+		if ((releasedHandMask & 1U) != 0 && (releasedHandMask & 2U) == 0)
+			selectedHand = 0;
+		else if ((releasedHandMask & 2U) != 0 && (releasedHandMask & 1U) == 0)
+			selectedHand = 1;
+		else if (motionConfiguredFirstHand >= 0 && motionConfiguredFirstHand <= 1
+			&& (releasedHandMask & (1U << motionConfiguredFirstHand)) != 0)
+			selectedHand = motionConfiguredFirstHand;
+	}
+	if (selectedHand < 0)
+		selectedHand = motionConfiguredFirstHand;
+	if (selectedHand < 0 || selectedHand > 1
+		|| (throwableProbeHandMask & (1U << selectedHand)) == 0)
+	{
+		selectedHand = (throwableProbeHandMask & 1U) != 0 ? 0
+			: ((throwableProbeHandMask & 2U) != 0 ? 1 : -1);
+	}
+	if (selectedHand >= 0)
+	{
+		glm::fvec3 oldestPositionM(0.0f);
+		glm::fvec3 newestPositionM(0.0f);
+		ULONGLONG oldestSampleTime = (std::numeric_limits<ULONGLONG>::max)();
+		ULONGLONG newestSampleTime = 0;
+		for (size_t sample = 0; sample < ThrowableVelocityHistorySize; ++sample)
+		{
+			const ULONGLONG sampleTime = throwableProbePositionHistoryTimes[
+				static_cast<size_t>(selectedHand)][sample];
+			if (sampleTime == 0 || now - sampleTime > 120)
+				continue;
+			const glm::fvec3 samplePosition = throwableProbePositionHistoryM[
+				static_cast<size_t>(selectedHand)][sample];
+			if (!IsFiniteVector(samplePosition))
+				continue;
+			if (sampleTime < oldestSampleTime)
+			{
+				oldestSampleTime = sampleTime;
+				oldestPositionM = samplePosition;
+			}
+			if (sampleTime > newestSampleTime)
+			{
+				newestSampleTime = sampleTime;
+				newestPositionM = samplePosition;
+			}
+		}
+		const ULONGLONG windowMilliseconds = newestSampleTime > oldestSampleTime
+			? newestSampleTime - oldestSampleTime : 0;
+		if (windowMilliseconds >= 25 && windowMilliseconds <= 120)
+		{
+			const float windowSeconds = static_cast<float>(windowMilliseconds) * 0.001f;
+			const glm::fvec3 windowVelocity =
+				(newestPositionM - oldestPositionM) / windowSeconds;
+			if (IsFiniteVector(windowVelocity)
+				&& glm::length(windowVelocity) <= 20.0f)
+			{
+				// Use actual displacement across the release window instead of the
+				// single fastest sample. This preserves throw direction while rejecting
+				// one-frame controller/bone noise.
+				throwableProbeSmoothedVelocityMps[static_cast<size_t>(selectedHand)] =
+					windowVelocity;
+			}
+		}
+	}
+	for (int hand = 0; hand < 2; ++hand)
+	{
+		const uint8_t bit = static_cast<uint8_t>(1U << hand);
+		if ((throwableProbeHandMask & bit) == 0)
+			continue;
+		if (!throwableProbePoseValid[hand])
+		{
+			uevr::API::get()->log_info(
+				"[ThrowableProbe] release seq=%u weapon=%d luaWeapon=%d hand=%s hold_ms=%u grips=%u pose=unavailable native=unchanged correlation=pending",
+				sequence, static_cast<int>(currentWeaponEquipped), luaWeaponId,
+				hand == 0 ? "left" : "right",
+				holdMilliseconds, static_cast<unsigned int>(throwableProbeGripMask));
+			continue;
+		}
+		const auto& position = throwableProbeLastWorldPositions[hand];
+		const auto& direction = throwableProbeLastDirections[hand];
+		const auto& velocity = throwableProbeSmoothedVelocityMps[hand];
+		uevr::API::get()->log_info(
+			"[ThrowableProbe] release seq=%u weapon=%d luaWeapon=%d hand=%s hold_ms=%u grips=%u samples=%u poseSource=%s anchorUE=(%.2f %.2f %.2f) direction=(%.4f %.4f %.4f) velocity_mps=(%.3f %.3f %.3f) speed=%.3f native=%s correlation=pending",
+			sequence, static_cast<int>(currentWeaponEquipped), luaWeaponId,
+			hand == 0 ? "left" : "right",
+			holdMilliseconds, static_cast<unsigned int>(throwableProbeGripMask),
+			throwableProbeSampleCounts[hand],
+			throwableProbeLastPoseFromVisibleBone[hand] ? "visible-bone" : "controller-fallback",
+			position.x, position.y, position.z,
+			direction.x, direction.y, direction.z,
+			velocity.x, velocity.y, velocity.z, glm::length(velocity),
+			motionEnabled && hand == selectedHand
+				? ((currentWeaponEquipped == Grenade || currentWeaponEquipped == Molotov)
+					? "custom-flight-candidate" : "override-candidate")
+				: "unchanged");
+	}
+
+	if (motionEnabled && selectedHand >= 0
+		&& throwableProbePoseValid[static_cast<size_t>(selectedHand)]
+		&& memoryManager != nullptr)
+	{
+		const glm::fvec3 position = throwableProbeLastWorldPositions[static_cast<size_t>(selectedHand)];
+		const glm::fvec3 forward = NormalizeOrZero(
+			throwableProbeLastDirections[static_cast<size_t>(selectedHand)]);
+		const glm::fvec3 handVelocity =
+			throwableProbeSmoothedVelocityMps[static_cast<size_t>(selectedHand)];
+		if (currentWeaponEquipped == Grenade || currentWeaponEquipped == Molotov)
+		{
+			const float measuredSpeed = glm::length(handVelocity);
+			const bool drop = !std::isfinite(measuredSpeed) || measuredSpeed < 0.35f;
+			// The visible hand displacement is intentionally conservative because it
+			// is measured over a short bone window. Apply a bounded VR assist so a
+			// normal arm throw produces a readable flight without inventing a fixed
+			// forward direction.
+			// Both physical throwables should carry normal arm motion farther than the
+			// conservative visible-bone sample. Molotovs remain only slightly slower
+			// than grenades; gravity and drag stay identical so they do not feel heavy.
+			const float velocityScale = currentWeaponEquipped == Grenade ? 4.0f : 3.6f;
+			const float maximumLaunchSpeed = currentWeaponEquipped == Grenade ? 42.0f : 38.0f;
+			glm::fvec3 launchVelocity = drop
+				? glm::fvec3(0.0f) : handVelocity * velocityScale;
+			const char* launchMode = drop ? "drop" : "hand-impulse";
+			if (IsFiniteVector(launchVelocity))
+			{
+				const float launchSpeed = glm::length(launchVelocity);
+				if (std::isfinite(launchSpeed) && launchSpeed > maximumLaunchSpeed)
+					launchVelocity *= maximumLaunchSpeed / launchSpeed;
+			}
+			else
+			{
+				launchVelocity = glm::fvec3(0.0f);
+				launchMode = "drop";
+			}
+			const glm::fvec3 originOffset = forward * 8.0f;
+			const glm::fvec3 originUE = position + originOffset;
+			const glm::fquat rotation =
+				throwableProbeLastWorldRotations[static_cast<size_t>(selectedHand)];
+			const glm::fvec3 angularVelocity =
+				throwableProbeSmoothedAngularVelocity[static_cast<size_t>(selectedHand)];
+			uevr::API::get()->log_info(
+				"[MotionThrowableFlight] launch-adjust seq=%u weapon=%d hand=%s raw_speed=%.3f raw_velocity=(%.3f %.3f %.3f) scale=%.2f cap=%.1f launch_mode=%s launch_velocity=(%.3f %.3f %.3f) origin_offset=(%.1f %.1f %.1f)",
+				sequence, static_cast<int>(currentWeaponEquipped),
+				selectedHand == 0 ? "left" : "right", measuredSpeed,
+				handVelocity.x, handVelocity.y, handVelocity.z,
+				velocityScale, maximumLaunchSpeed, launchMode,
+				launchVelocity.x, launchVelocity.y, launchVelocity.z,
+				originOffset.x, originOffset.y, originOffset.z);
+			const bool started = StartMotionThrowableFlight(sequence,
+				static_cast<int>(currentWeaponEquipped), selectedHand, originUE,
+				rotation, launchVelocity, angularVelocity);
+			if (!started)
+			{
+				uevr::API::get()->log_warn(
+					"[MotionThrowableFlight] begin rejected seq=%u weapon=%d hand=%s reason=visual-or-pose",
+					sequence, static_cast<int>(currentWeaponEquipped),
+					selectedHand == 0 ? "left" : "right");
+			}
+			else if (!drop)
+			{
+				// The custom hand-velocity flight owns the entire throw. Native GTA is
+				// intentionally entered only by the impact adapter after collision;
+				// never queue a second native projectile on release.
+				uevr::API::get()->log_info(
+					"[MotionThrowable] custom flight owns release seq=%u weapon=%d; native launch disabled",
+					sequence, static_cast<int>(currentWeaponEquipped));
+			}
+		}
+		else
+		{
+		const float speed = std::clamp(glm::length(handVelocity), 0.0f, 20.0f);
+		const glm::fvec3 motionDirection = speed > 0.15f
+			? NormalizeOrZero(handVelocity) : forward;
+		const float motionWeight = std::clamp((speed - 0.15f) / 0.50f, 0.0f, 0.95f);
+		glm::fvec3 launchDirection = NormalizeOrZero(
+			forward * (1.0f - motionWeight) + motionDirection * motionWeight);
+		if (glm::length(launchDirection) <= 0.5f)
+			launchDirection = forward;
+
+		const float strength = std::clamp(speed / 4.0f, 0.05f, 1.0f);
+		const float horizontalScale = 0.22f * strength + 0.15f;
+		const float verticalAssist = 0.04f + 0.10f * strength;
+		const glm::fvec3 originUE = position + forward * 8.0f;
+		const glm::fvec3 originNative(
+			originUE.x * 0.01f, -originUE.y * 0.01f, originUE.z * 0.01f);
+		const glm::fvec3 directionNative = NormalizeOrZero(glm::fvec3(
+			launchDirection.x, -launchDirection.y, launchDirection.z));
+		const glm::fvec3 velocityNative = directionNative * horizontalScale
+			+ glm::fvec3(0.0f, 0.0f, verticalAssist);
+		const bool armed = IsFiniteVector(originNative)
+			&& IsFiniteVector(velocityNative)
+			&& memoryManager->SetNativeThrowableMotionOverride(
+				{ originNative.x, originNative.y, originNative.z },
+				{ velocityNative.x, velocityNative.y, velocityNative.z },
+				static_cast<int>(currentWeaponEquipped), sequence);
+		if (armed)
+		{
+			throwableMotionOverrideSequence = sequence;
+			throwableMotionOverrideWeapon = static_cast<int>(currentWeaponEquipped);
+			throwableMotionOverrideExpiresAt = now + 800;
+			if (firstWeaponMesh != nullptr && uevr::API::UObjectHook::exists(firstWeaponMesh))
+			{
+				throwableMotionHiddenMesh = firstWeaponMesh;
+				SetComponentVisibility(throwableMotionHiddenMesh, false);
+				throwableMotionVisualRestoreAt = now + 900;
+			}
+			uevr::API::get()->log_info(
+				"[MotionThrowable] override armed seq=%u weapon=%d hand=%s speed=%.3f strength=%.3f origin=(%.3f %.3f %.3f) velocity=(%.3f %.3f %.3f)",
+				sequence, throwableMotionOverrideWeapon,
+				selectedHand == 0 ? "left" : "right", speed, strength,
+				originNative.x, originNative.y, originNative.z,
+				velocityNative.x, velocityNative.y, velocityNative.z);
+		}
+		else
+		{
+			memoryManager->ClearNativeThrowableMotionOverride();
+			uevr::API::get()->log_warn(
+				"[MotionThrowable] override rejected seq=%u weapon=%d reason=invalid-payload",
+				sequence, static_cast<int>(currentWeaponEquipped));
+		}
+		}
+	}
+	ResetPhysicalThrowableProbe("release-complete", false);
+}
+
 void WeaponManager::ProcessMotionMelee(float delta)
 {
 	// Contact is deliberately narrower than the old synthetic-trigger path:
@@ -7361,6 +11556,13 @@ void WeaponManager::ProcessMotionMelee(float delta)
 	constexpr float SwingMinimumDisplacement = 0.025f;
 	constexpr float MaximumPlausibleSwingSpeed = 20.0f;
 	constexpr float MinimumContactQueryDisplacement = 0.008f;
+	// Native-world geometry also moves when CJ walks into a target. Require real
+	// tracking-space hand motion for fists/knuckles so a stationary clenched hand
+	// cannot damage a pedestrian merely because either body is moving.
+	constexpr float FistTriggerControllerSpeed = 0.90f;
+	constexpr float FistTriggerControllerDisplacement = 0.008f;
+	constexpr float FistContactControllerSpeed = 0.30f;
+	constexpr float FistContactControllerDisplacement = 0.003f;
 	const bool unarmed = currentWeaponEquipped == Unarmed;
 	const bool nativeMeleeWeapon = static_cast<int>(currentWeaponEquipped) >= static_cast<int>(Unarmed)
 		&& static_cast<int>(currentWeaponEquipped) <= static_cast<int>(Cane);
@@ -7419,6 +11621,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		motionMeleeLowSpeedDwellRemaining = { 0.0f, 0.0f };
 		motionMeleeInterSwingCooldownRemaining = { 0.0f, 0.0f };
 		motionMeleeContactWindowRemaining = { 0.0f, 0.0f };
+		motionMeleeHandGeometryMode = { -1, -1 };
 		for (auto& entities : motionMeleeContactEntities)
 			entities.clear();
 		motionMeleeRejectedContactDiagnostics.clear();
@@ -7432,6 +11635,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 	// opening the weapon wheel, changing weapon/grip, or a bad frame interval.
 	if (!meleeEligible || delta <= 0.001f || delta > 0.1f)
 	{
+		HideMotionMeleeDebugAxis();
 		motionMeleeControllerPositionValid = { false, false };
 		motionMeleeContactPoseValid = { false, false };
 		motionMeleeSwingArmed = { true, true };
@@ -7439,6 +11643,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		motionMeleeInterSwingCooldownRemaining = { 0.0f, 0.0f };
 		motionMeleeContactWindowRemaining = { 0.0f, 0.0f };
 		motionMeleeHandActiveState = { false, false };
+		motionMeleeHandGeometryMode = { -1, -1 };
 		motionMeleeContactSwingGeneration = { 0, 0 };
 		for (auto& entities : motionMeleeContactEntities)
 			entities.clear();
@@ -7481,7 +11686,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		// One brief, low-amplitude pulse on the actual striking controller.
 		vr->trigger_haptic_vibration(0.0f, 0.08f, 120.0f, 0.35f, source);
 	};
-	const auto processMeleeContactSweep = [this, &pulseMeleeContactHaptic](size_t handIndex, int hand,
+	const auto processMeleeContactSweep = [this, &pulseMeleeContactHaptic, delta](size_t handIndex, int hand,
 		const glm::fvec3& previousBase, const glm::fvec3& previousTip,
 		const glm::fvec3& base, const glm::fvec3& tip, float radius,
 		bool shortHandGeometry, int damageWeaponType, uint32_t sequence) -> bool {
@@ -7497,7 +11702,8 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		// observed poses, while the quarter points preserve temporal coverage along
 		// the full bat/club length. The lattice stays bounded and single-contact.
 		constexpr size_t SweepSampleCount = 5;
-		constexpr size_t SweepSegmentCount = 10;
+		constexpr size_t BaseSweepSegmentCount = 10;
+		constexpr size_t MaximumSweepSegmentCount = 13;
 		const glm::fvec3 previousCenter = (previousBase + previousTip) * 0.5f;
 		const glm::fvec3 currentCenter = (base + tip) * 0.5f;
 		const float previousLength = glm::length(previousTip - previousBase);
@@ -7544,9 +11750,9 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		}
 
 		const std::array<float, 5> sectionFractions{ 0.0f, 0.25f, 0.5f, 0.75f, 1.0f };
-		std::array<glm::fvec3, SweepSegmentCount> starts{};
-		std::array<glm::fvec3, SweepSegmentCount> ends{};
-		std::array<glm::fvec3, SweepSegmentCount> segmentDirections{};
+		std::array<glm::fvec3, MaximumSweepSegmentCount> starts{};
+		std::array<glm::fvec3, MaximumSweepSegmentCount> ends{};
+		std::array<glm::fvec3, MaximumSweepSegmentCount> segmentDirections{};
 		size_t segmentCount = 0;
 		const auto appendSegment = [&](const glm::fvec3& start, const glm::fvec3& end,
 			const glm::fvec3& direction) {
@@ -7576,7 +11782,32 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		for (size_t sample = 1; sample + 1 < SweepSampleCount; ++sample)
 			appendSegment(sampleBases[sample], sampleTips[sample], sampleDirections[sample]);
 
-		if (segmentCount != SweepSegmentCount)
+		// Engine-tick hand poses can trail the rendered fist. For short fist/knuckle
+		// geometry only, add a 10 ms translational prediction capped at 4 cm. These
+		// three lanes extend the sweep in the measured direction of travel without
+		// enlarging the fist radius, shifting its normal geometry, or affecting bats.
+		bool predictedShortHandPose = false;
+		if (shortHandGeometry && delta > 0.001f && delta <= 0.1f)
+		{
+			glm::fvec3 prediction = (currentCenter - previousCenter) * (0.010f / delta);
+			const float predictionLength = glm::length(prediction);
+			if (IsFiniteVector(prediction) && std::isfinite(predictionLength)
+				&& predictionLength > 0.0005f)
+			{
+				if (predictionLength > 0.04f)
+					prediction *= 0.04f / predictionLength;
+				const glm::fvec3 predictedBase = base + prediction;
+				const glm::fvec3 predictedTip = tip + prediction;
+				appendSegment(base, predictedBase, currentRodDirection);
+				appendSegment(tip, predictedTip, currentRodDirection);
+				appendSegment(predictedBase, predictedTip, currentRodDirection);
+				predictedShortHandPose = true;
+			}
+		}
+
+		const size_t expectedSegmentCount = BaseSweepSegmentCount
+			+ (predictedShortHandPose ? 3U : 0U);
+		if (segmentCount != expectedSegmentCount)
 			return false;
 		constexpr size_t SweepLaneCount = 5;
 		const float laneRadius = (std::max)(0.0f, radius * 0.70f);
@@ -7619,6 +11850,8 @@ void WeaponManager::ProcessMotionMelee(float delta)
 				int appliedDamage = 0;
 				const bool applied = memoryManager->ApplyNativeMeleeContactDamage(
 					contact, damageWeaponType, appliedDamage);
+				const bool impactAudioPlayed = PlayMotionMeleeImpactAudio(
+					contact, damageWeaponType);
 				if (applied
 					&& contact.damageResult == MemoryManager::NativeMeleeDamageResult::Accepted
 					&& (contact.entityType == 2 || contact.entityType == 3))
@@ -7646,7 +11879,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 						break;
 					}
 					uevr::API::get()->log_info(
-						"[MotionMelee] contact seq=%u generation=%u hand=%s weapon=%d damageWeapon=%d lane=%zu segment=%zu entity=0x%llX type=%u piece=%u point=(%.3f %.3f %.3f) native_damage=%s damage=%d fx_source=upstream-unresolved",
+						"[MotionMelee] contact seq=%u generation=%u hand=%s weapon=%d damageWeapon=%d lane=%zu segment=%zu entity=0x%llX type=%u piece=%u point=(%.3f %.3f %.3f) native_damage=%s damage=%d fx_source=%s",
 						sequence, motionMeleeTransitionGeneration,
 						hand == 0 ? "left" : "right", static_cast<int>(currentWeaponEquipped),
 						damageWeaponType, lane, segment,
@@ -7654,7 +11887,9 @@ void WeaponManager::ProcessMotionMelee(float delta)
 						static_cast<unsigned int>(contact.entityType),
 						static_cast<unsigned int>(contact.piece),
 						contact.point[0], contact.point[1], contact.point[2],
-						damageResult, appliedDamage);
+						damageResult, appliedDamage,
+						impactAudioPlayed ? (contact.entityType == 3
+							? "basic-ped" : "basic-vehicle") : "none");
 				}
 				return true;
 			}
@@ -7672,6 +11907,8 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		return false;
 	};
 
+	// The swept contact visualizer was useful while establishing collision, but
+	// normal gameplay deliberately runs without creating debug geometry.
 	for (int hand = 0; hand < 2; ++hand)
 	{
 		const size_t handIndex = static_cast<size_t>(hand);
@@ -7680,27 +11917,39 @@ void WeaponManager::ProcessMotionMelee(float delta)
 			&& magneticGripHand <= 1
 			&& magneticGripWeaponId == static_cast<int>(currentWeaponEquipped)
 			&& magneticGripAttached;
-		// Shoulder/grip state is the only melee arming input. Knuckles use the
-		// selected held hand even when their native mesh is absent; mesh-backed
-		// weapons retain the existing magnetic attachment gate for safe ownership.
+		const bool weaponHand = magneticGripOwnsWeapon && magneticGripHand == hand;
+		const bool offHandFist = magneticGripOwnsWeapon && magneticGripHand != hand;
+		// Shoulder/grip state is the only melee arming input. Unarmed and knuckle
+		// fighting may use both hands. For other melee weapons, the magnetic owner
+		// keeps the weapon geometry while the opposite held hand is an independent
+		// bare fist, so bat+fist and knife+fist combinations remain possible.
 		const bool handActive = motionWeaponTrackingEnabled && gripHeld
-			&& (handGeometryWeapon
-				|| (magneticGripOwnsWeapon && magneticGripHand == hand));
+			&& (handGeometryWeapon || weaponHand || offHandFist);
+		const bool useHandGeometry = handGeometryWeapon || offHandFist;
+		const int8_t geometryMode = handActive
+			? static_cast<int8_t>(useHandGeometry ? 0 : 1)
+			: static_cast<int8_t>(-1);
 		// The visible brass-knuckle mesh remains owned by the magnetic primary
 		// hand. Its opposite controller is an independently damaging bare fist.
-		const int damageWeaponType = currentWeaponEquipped == BrassKnuckles
-			? (magneticGripOwnsWeapon && magneticGripHand == hand
-				? static_cast<int>(BrassKnuckles) : static_cast<int>(Unarmed))
-			: static_cast<int>(currentWeaponEquipped);
-		if (handActive != motionMeleeHandActiveState[handIndex])
+		const int damageWeaponType = weaponHand
+			? static_cast<int>(currentWeaponEquipped)
+			: (unarmed ? static_cast<int>(Unarmed)
+				: (currentWeaponEquipped == BrassKnuckles && !magneticGripOwnsWeapon
+					? static_cast<int>(Unarmed)
+					: (offHandFist ? static_cast<int>(Unarmed)
+						: static_cast<int>(currentWeaponEquipped))));
+		if (handActive != motionMeleeHandActiveState[handIndex]
+			|| geometryMode != motionMeleeHandGeometryMode[handIndex])
 		{
 			motionMeleeHandActiveState[handIndex] = handActive;
+			motionMeleeHandGeometryMode[handIndex] = geometryMode;
 			resetMeleeHandState(handIndex);
-			uevr::API::get()->log_info("[MotionMelee] %s hand=%s weapon=%d mode=%s generation=%u",
+			uevr::API::get()->log_info("[MotionMelee] %s hand=%s weapon=%d role=%s damageWeapon=%d generation=%u",
 				handActive ? "armed" : "disarmed",
 				hand == 0 ? "left" : "right",
 				static_cast<int>(currentWeaponEquipped),
-				unarmed ? "unarmed" : "melee",
+				geometryMode == 1 ? "weapon" : (geometryMode == 0 ? "fist" : "none"),
+				damageWeaponType,
 				motionMeleeTransitionGeneration);
 		}
 		if (!handActive)
@@ -7720,8 +11969,22 @@ void WeaponManager::ProcessMotionMelee(float delta)
 			resetMeleeHandState(handIndex);
 			continue;
 		}
+		const bool previousControllerPositionValid =
+			motionMeleeControllerPositionValid[handIndex];
+		const float controllerLocalDisplacement = previousControllerPositionValid
+			? glm::length(controllerPosition
+				- motionMeleePreviousControllerPositions[handIndex])
+			: 0.0f;
+		const float controllerLocalSpeed = previousControllerPositionValid
+			? controllerLocalDisplacement / delta : 0.0f;
 		motionMeleePreviousControllerPositions[handIndex] = controllerPosition;
 		motionMeleeControllerPositionValid[handIndex] = true;
+		if (!std::isfinite(controllerLocalDisplacement)
+			|| !std::isfinite(controllerLocalSpeed))
+		{
+			resetMeleeHandState(handIndex);
+			continue;
+		}
 
 		// Prefer the live mesh for long melee weapons. Unarmed and brass knuckles
 		// deliberately use the known controller/hand pose so they do not depend on
@@ -7736,7 +11999,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		float meshRadius = 0.0f;
 		bool meshGeometryValid = false;
 		bool meshBoundsFallbackAllowed = !meshAvailable;
-		if (meshAvailable && !handGeometryWeapon)
+		if (meshAvailable && !useHandGeometry)
 		{
 			if (ReadCurrentWeaponWorldTransform(meshPosition, meshRotation))
 			{
@@ -7744,7 +12007,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 					meshPosition, meshRotation, meshBase, meshTip, meshRadius);
 				meshBoundsFallbackAllowed = !meshGeometryValid;
 			}
-			else if (!handGeometryWeapon)
+			else if (!useHandGeometry)
 			{
 				resetMeleeHandState(handIndex);
 				continue;
@@ -7755,18 +12018,18 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		glm::fvec3 tipUE{};
 		float radiusUE = 0.0f;
 		bool geometryValid = false;
-		if (meshGeometryValid && !handGeometryWeapon)
+		if (meshGeometryValid && !useHandGeometry)
 		{
 			baseUE = meshBase;
 			tipUE = meshTip;
 			radiusUE = meshRadius;
 			geometryValid = true;
 		}
-		else if (handGeometryWeapon || meshBoundsFallbackAllowed)
+		else if (useHandGeometry || meshBoundsFallbackAllowed)
 		{
 			geometryValid = ReadMotionMeleeHandGeometry(
 				hand, controllerPosition, controllerRotation, baseUE, tipUE, radiusUE);
-			if (!geometryValid && handGeometryWeapon && meshGeometryValid)
+			if (!geometryValid && useHandGeometry && meshGeometryValid)
 			{
 				baseUE = meshBase;
 				tipUE = meshTip;
@@ -7828,12 +12091,17 @@ void WeaponManager::ProcessMotionMelee(float delta)
 				motionMeleeContactWindowRemaining[handIndex] > 0.0f;
 			if (contactWindowActive)
 			{
+				const bool fistContactMotionMeaningful = !useHandGeometry
+					|| (controllerLocalSpeed >= FistContactControllerSpeed
+						&& controllerLocalDisplacement
+							>= FistContactControllerDisplacement);
 				const bool contactMotionMeaningful = displacement
 					>= MinimumContactQueryDisplacement
+					&& fistContactMotionMeaningful
 					&& motionMeleeContactEntities[handIndex].empty();
 				if (contactMotionMeaningful && processMeleeContactSweep(handIndex, hand,
 					previousBase, previousTip, base, tip, contactRadius,
-					handGeometryWeapon, damageWeaponType,
+					useHandGeometry, damageWeaponType,
 					motionMeleeContactSwingGeneration[handIndex]))
 				{
 					// The sweep has already recorded the first confirmed entity. Do not
@@ -7875,7 +12143,11 @@ void WeaponManager::ProcessMotionMelee(float delta)
 			if (motionMeleeSwingArmed[handIndex]
 				&& motionMeleeInterSwingCooldownRemaining[handIndex] <= 0.0f
 				&& speed >= SwingTriggerSpeed
-				&& displacement >= SwingMinimumDisplacement)
+				&& displacement >= SwingMinimumDisplacement
+				&& (!useHandGeometry
+					|| (controllerLocalSpeed >= FistTriggerControllerSpeed
+						&& controllerLocalDisplacement
+							>= FistTriggerControllerDisplacement)))
 			{
 				motionMeleeSwingArmed[handIndex] = false;
 				motionMeleeLowSpeedDwellRemaining[handIndex] = 0.0f;
@@ -7887,15 +12159,16 @@ void WeaponManager::ProcessMotionMelee(float delta)
 					std::memory_order_acq_rel) + 1;
 				motionMeleeContactSwingGeneration[handIndex] = sequence;
 				uevr::API::get()->log_info(
-					"[MotionMelee] contact swing seq=%u generation=%u hand=%s weapon=%d damageWeapon=%d speed=%.2f displacement=%.3f baseMove=%.3f tipMove=%.3f radius=%.3f base=(%.3f %.3f %.3f) tip=(%.3f %.3f %.3f)",
+					"[MotionMelee] contact swing seq=%u generation=%u hand=%s weapon=%d damageWeapon=%d speed=%.2f displacement=%.3f controllerSpeed=%.2f controllerMove=%.3f baseMove=%.3f tipMove=%.3f radius=%.3f base=(%.3f %.3f %.3f) tip=(%.3f %.3f %.3f)",
 					sequence, motionMeleeTransitionGeneration,
 					hand == 0 ? "left" : "right", static_cast<int>(currentWeaponEquipped),
-					damageWeaponType, speed, displacement, baseDisplacement,
+					damageWeaponType, speed, displacement,
+					controllerLocalSpeed, controllerLocalDisplacement, baseDisplacement,
 					tipDisplacement, contactRadius,
 					base.x, base.y, base.z, tip.x, tip.y, tip.z);
 				const bool contactConfirmed = processMeleeContactSweep(handIndex, hand,
 					previousBase, previousTip, base, tip, contactRadius,
-					handGeometryWeapon, damageWeaponType, sequence);
+					useHandGeometry, damageWeaponType, sequence);
 				motionMeleeContactWindowRemaining[handIndex] = contactConfirmed
 					? 0.0f
 					: (std::max)(0.0f,
@@ -7922,9 +12195,10 @@ void WeaponManager::SetFreeAimWeaponHandsPresentationActive(bool active)
 
 bool WeaponManager::IsFreeAimHandsEligibleWeapon() const
 {
-	// Controller-held melee, firearms, and the tested spray-can utility share the
-	// split-hand presentation. Other utilities/throwables retain native hands.
+	// Controller-held melee, physical throwables, firearms, and the tested
+	// spray-can utility share the split-hand presentation.
 	return (currentWeaponEquipped >= BrassKnuckles && currentWeaponEquipped <= Cane)
+		|| (currentWeaponEquipped >= Grenade && currentWeaponEquipped <= Molotov)
 		|| (currentWeaponEquipped >= Pistol && currentWeaponEquipped <= Minigun)
 		|| IsControllerHeldUtility();
 }
@@ -7962,10 +12236,34 @@ bool WeaponManager::CreateFreeAimFakeHands()
 	auto skeletalMeshClass = uevr::API::get()->find_uobject<uevr::API::UClass>(L"Class /Script/Engine.SkeletalMeshComponent");
 	if (skeletalMeshClass == nullptr)
 		return failCreation("skeletal-component-class");
+	auto staticMeshClass = uevr::API::get()->find_uobject<uevr::API::UClass>(
+		L"Class /Script/Engine.StaticMeshComponent");
+	const auto destroyTransientComponent = [this](uevr::API::UObject*& component)
+	{
+		if (component == nullptr)
+			return;
+		if (uevr::API::UObjectHook::exists(component))
+		{
+			uevr::API::UObjectHook::remove_motion_controller_state(component);
+			SetComponentVisibility(component, false);
+			auto* componentClass = component->get_class();
+			auto* destroy = componentClass != nullptr
+				? componentClass->find_function(L"DestroyComponent") : nullptr;
+			if (destroy != nullptr)
+			{
+				std::vector<uint8_t> params(destroy->get_properties_size());
+				SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+				destroy->call(component, params.data());
+			}
+		}
+		component = nullptr;
+	};
 	auto skeletalMesh = playerManager->handScaleHands->get_property<uevr::API::UObject*>(L"SkeletalMesh");
 	if (skeletalMesh == nullptr)
 		return failCreation("skeletal-mesh-property");
 
+	// Keep the proven split skeletal clones authoritative for tracking,
+	// calibration, weapon-local attachment, the forearms and watch.
 	freeAimFakeLeftHand = AddSkeletalComponent(playerManager->playerCharacter, skeletalMeshClass);
 	freeAimFakeRightHand = AddSkeletalComponent(playerManager->playerCharacter, skeletalMeshClass);
 	if (freeAimFakeLeftHand == nullptr || freeAimFakeRightHand == nullptr)
@@ -7973,6 +12271,54 @@ bool WeaponManager::CreateFreeAimFakeHands()
 	if (!CallSetSkeletalMesh(freeAimFakeLeftHand, skeletalMesh)
 		|| !CallSetSkeletalMesh(freeAimFakeRightHand, skeletalMesh))
 		return failCreation("set-skeletal-mesh");
+
+	// The baked assets contain one hand each, so clenching one side can never
+	// reveal a second hand driven by the same controller. Asset failure is a
+	// presentation-only fallback: the proven ordinary hands remain usable.
+	freeAimClenchedLeftMesh = LoadStaticMeshAssetBlocking(
+		L"/Game/SAVRHands/SAVR_HandGrip_L.SAVR_HandGrip_L");
+	freeAimClenchedRightMesh = LoadStaticMeshAssetBlocking(
+		L"/Game/SAVRHands/SAVR_HandGrip_R.SAVR_HandGrip_R");
+	if (staticMeshClass != nullptr && freeAimClenchedLeftMesh != nullptr
+		&& freeAimClenchedRightMesh != nullptr)
+	{
+		auto nativeHandMaterial = ReadComponentMaterial(playerManager->handScaleHands, 0);
+		freeAimClenchedLeftHand = AddSkeletalComponent(
+			playerManager->playerCharacter, staticMeshClass);
+		freeAimClenchedRightHand = AddSkeletalComponent(
+			playerManager->playerCharacter, staticMeshClass);
+		// AddComponent returns visible components. Hide both before any asset or
+		// material setup so a partial respawn-time failure can never flash or strand
+		// the baked Vice-derived hand at its registration transform.
+		SetComponentVisibility(freeAimClenchedLeftHand, false);
+		SetComponentVisibility(freeAimClenchedRightHand, false);
+		if (freeAimClenchedLeftHand == nullptr || freeAimClenchedRightHand == nullptr
+			|| !CallSetStaticMesh(freeAimClenchedLeftHand, freeAimClenchedLeftMesh)
+			|| !CallSetStaticMesh(freeAimClenchedRightHand, freeAimClenchedRightMesh)
+			|| nativeHandMaterial == nullptr
+			|| !SetComponentMaterial(freeAimClenchedLeftHand, 0, nativeHandMaterial)
+			|| !SetComponentMaterial(freeAimClenchedLeftHand, 1, nativeHandMaterial)
+			|| !SetComponentMaterial(freeAimClenchedRightHand, 0, nativeHandMaterial)
+			|| !SetComponentMaterial(freeAimClenchedRightHand, 1, nativeHandMaterial))
+		{
+			destroyTransientComponent(freeAimClenchedLeftHand);
+			destroyTransientComponent(freeAimClenchedRightHand);
+		}
+		else
+		{
+			uevr::API::get()->log_info(
+				"[ClenchedHands] native material applied object=%p name=%ls",
+				nativeHandMaterial, nativeHandMaterial->get_full_name().c_str());
+		}
+	}
+	if ((freeAimClenchedLeftHand == nullptr || freeAimClenchedRightHand == nullptr)
+		&& !freeAimClenchedAssetFailureLogged)
+	{
+		uevr::API::get()->log_warn(
+			"[ClenchedHands] baked assets unavailable class=%p meshes=%p/%p; ordinary hands retained",
+			staticMeshClass, freeAimClenchedLeftMesh, freeAimClenchedRightMesh);
+		freeAimClenchedAssetFailureLogged = true;
+	}
 
 	// Capability probe only: determine whether the existing native/fake hand
 	// classes expose reflected poseable-bone setters. Do not invoke any setter;
@@ -8017,7 +12363,7 @@ bool WeaponManager::CreateFreeAimFakeHands()
 		{
 			freeAimFakeWatch = AddSkeletalComponent(playerManager->playerCharacter, skeletalMeshClass);
 			if (freeAimFakeWatch == nullptr || !CallSetSkeletalMesh(freeAimFakeWatch, watchMesh))
-				freeAimFakeWatch = nullptr;
+				destroyTransientComponent(freeAimFakeWatch);
 		}
 	}
 
@@ -8025,6 +12371,8 @@ bool WeaponManager::CreateFreeAimFakeHands()
 	// succeed, preventing four-hand flashes during deferred initialization.
 	SetComponentVisibility(freeAimFakeLeftHand, false);
 	SetComponentVisibility(freeAimFakeRightHand, false);
+	SetComponentVisibility(freeAimClenchedLeftHand, false);
+	SetComponentVisibility(freeAimClenchedRightHand, false);
 	SetComponentVisibility(freeAimFakeWatch, false);
 	freeAimFakeHandsCharacter = playerManager->playerCharacter;
 	freeAimFakeHandsReady = true;
@@ -8033,12 +12381,16 @@ bool WeaponManager::CreateFreeAimFakeHands()
 	freeAimFakeHandsWarmupFrames = 1;
 	freeAimFakeHandsAlignmentFramesRemaining = 30;
 	freeAimFakeHandsActive = false;
+	freeAimClenchedHandsReady = false;
+	freeAimClenchedVisibleMask = 0;
 	freeAimHandsCreationBlocked = false;
 	freeAimHandsBlockedCharacter = nullptr;
 	freeAimHandsOffsetsLogged = false;
 	freeAimHandsFailureLogged = false;
-	uevr::API::get()->log_info("[FreeAimHands] fake copies created character=%p asset=%p left=%p right=%p pose=none init=deferred",
-		playerManager->playerCharacter, skeletalMesh, freeAimFakeLeftHand, freeAimFakeRightHand);
+	uevr::API::get()->log_info(
+		"[FreeAimHands] fake copies created character=%p asset=%p left=%p right=%p clenchedStatic=%p/%p pose=none init=deferred",
+		playerManager->playerCharacter, skeletalMesh, freeAimFakeLeftHand,
+		freeAimFakeRightHand, freeAimClenchedLeftHand, freeAimClenchedRightHand);
 	return true;
 }
 
@@ -8118,6 +12470,28 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 		}
 		freeAimFakeLeftHandBoneName = leftHand.name;
 		freeAimFakeRightHandBoneName = rightHand.name;
+		freeAimClenchedHandsReady = freeAimClenchedLeftHand != nullptr
+			&& freeAimClenchedRightHand != nullptr
+			&& uevr::API::UObjectHook::exists(freeAimClenchedLeftHand)
+			&& uevr::API::UObjectHook::exists(freeAimClenchedRightHand)
+			&& AttachStaticHandToDriver(freeAimClenchedLeftHand,
+				freeAimFakeLeftHand, freeAimFakeLeftHandBoneName)
+			&& AttachStaticHandToDriver(freeAimClenchedRightHand,
+				freeAimFakeRightHand, freeAimFakeRightHandBoneName);
+		if (!freeAimClenchedHandsReady)
+		{
+			SetComponentVisibility(freeAimClenchedLeftHand, false);
+			SetComponentVisibility(freeAimClenchedRightHand, false);
+			uevr::API::get()->log_warn(
+				"[ClenchedHands] static attachment unavailable; ordinary hands retained");
+		}
+		else
+		{
+			uevr::API::get()->log_info(
+				"[ClenchedHands] independent static hands ready left=%p right=%p drivers=%p/%p",
+				freeAimClenchedLeftHand, freeAimClenchedRightHand,
+				freeAimFakeLeftHand, freeAimFakeRightHand);
+		}
 		freeAimFakeWatchHandBoneName = uevr::API::FName{};
 		if (freeAimFakeWatch != nullptr && ResolveBone(freeAimFakeWatch, L"L_Hand", watchLeftHand)
 			&& watchLeftHand.index >= 0)
@@ -8135,6 +12509,8 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 		{
 			SetComponentVisibility(freeAimFakeLeftHand, false);
 			SetComponentVisibility(freeAimFakeRightHand, false);
+			SetComponentVisibility(freeAimClenchedLeftHand, false);
+			SetComponentVisibility(freeAimClenchedRightHand, false);
 			SetComponentVisibility(freeAimFakeWatch, false);
 			return false;
 		}
@@ -8147,6 +12523,14 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 	// current weapon role. Keep this anatomical correction active for free,
 	// primary, and watch presentation; role-specific calibration remains separate.
 	constexpr bool leftAnatomicalCorrection = true;
+	const uint8_t heldGripMask = gripStateMask.load(std::memory_order_acquire);
+	const bool meleeClenchContext = !playerManager->isInVehicle
+		&& currentWeaponEquipped >= Unarmed && currentWeaponEquipped <= Cane;
+	const bool throwableClenchContext = !playerManager->isInVehicle
+		&& currentWeaponEquipped >= Grenade && currentWeaponEquipped <= Molotov;
+	const uint8_t desiredClenchedMask = freeAimClenchedHandsReady
+		&& (meleeClenchContext || throwableClenchContext)
+		? static_cast<uint8_t>(heldGripMask & 0x03U) : 0;
 	const int primaryHandForSupport = twoHandPrimaryHand.load(std::memory_order_acquire);
 	const int supportHand = twoHandSupportActive && (primaryHandForSupport == 0 || primaryHandForSupport == 1)
 		? 1 - primaryHandForSupport : -1;
@@ -8229,6 +12613,8 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 		&& freeAimAppliedVehicleRightOnly == vehicleRightOnly
 		&& freeAimAppliedTwoHandWristOverrideActive == twoHandWristOverrideActive
 		&& freeAimAppliedPrimaryGripAttachmentActive == primaryHandAttachmentDesired
+		&& freeAimClenchedVisibleMask == desiredClenchedMask
+		&& desiredClenchedMask == 0
 		&& !twoHandWristOverrideActive
 		&& (!supportContactDesired || freeAimSupportHandAttached)
 		&& (!primaryHandAttachmentDesired || freeAimPrimaryHandAttached))
@@ -8322,6 +12708,24 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 		&& applyComponent(freeAimFakeRightHand, freeAimFakeRightHandBoneName, 1, false);
 	if (applied)
 	{
+		uint8_t visibleClenchedMask = freeAimClenchedVisibleMask;
+		const bool staticHandsValid = freeAimClenchedHandsReady
+			&& freeAimClenchedLeftHand != nullptr && freeAimClenchedRightHand != nullptr
+			&& uevr::API::UObjectHook::exists(freeAimClenchedLeftHand)
+			&& uevr::API::UObjectHook::exists(freeAimClenchedRightHand);
+		const uint8_t requestedMask = staticHandsValid ? desiredClenchedMask : 0;
+		if (requestedMask != freeAimClenchedVisibleMask)
+		{
+			const bool leftClosed = (requestedMask & 0x01U) != 0;
+			const bool rightClosed = (requestedMask & 0x02U) != 0;
+			// Hiding the hand bone deforms vertices blended between Hand and ForeArm
+			// into a long wrist spike. Keep the driver pose intact and hide the
+			// entire driver locally instead; its attached static fist remains visible.
+			UnhideBone(freeAimFakeLeftHand, freeAimFakeLeftHandBoneName);
+			UnhideBone(freeAimFakeRightHand, freeAimFakeRightHandBoneName);
+			visibleClenchedMask = static_cast<uint8_t>(
+				(leftClosed ? 0x01U : 0U) | (rightClosed ? 0x02U : 0U));
+		}
 		if (primaryHandAttachmentDesired && !freeAimPrimaryHandAttached
 			&& freeAimPrimaryAttachPrimeHand == primaryHandForSupport
 			&& freeAimPrimaryAttachPrimeWeapon == firstWeaponMesh
@@ -8349,9 +12753,22 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 				freeAimWatchFailureLogged = true;
 			}
 		}
-		SetComponentVisibility(freeAimFakeLeftHand, !vehicleRightOnly);
-		SetComponentVisibility(freeAimFakeRightHand, true);
+		SetComponentVisibility(freeAimFakeLeftHand,
+			!vehicleRightOnly && (visibleClenchedMask & 0x01U) == 0, false);
+		SetComponentVisibility(freeAimFakeRightHand,
+			(visibleClenchedMask & 0x02U) == 0, false);
+		SetComponentVisibility(freeAimClenchedLeftHand,
+			!vehicleRightOnly && (visibleClenchedMask & 0x01U) != 0);
+		SetComponentVisibility(freeAimClenchedRightHand,
+			(visibleClenchedMask & 0x02U) != 0);
 		SetComponentVisibility(freeAimFakeWatch, vehicleRightOnly ? false : freeAimWatchActive);
+		if (freeAimClenchedVisibleMask != visibleClenchedMask)
+			uevr::API::get()->log_info(
+				"[ClenchedHands] static visibility mask=%u weapon=%d grips=%u",
+				static_cast<unsigned int>(visibleClenchedMask),
+				static_cast<int>(currentWeaponEquipped),
+				static_cast<unsigned int>(heldGripMask));
+		freeAimClenchedVisibleMask = visibleClenchedMask;
 		freeAimHandsOffsetsLogged = true;
 		freeAimLeftPalmOffsetApplied = leftAnatomicalCorrection;
 		freeAimAppliedSupportContactActive = supportContactDesired && freeAimSupportHandAttached;
@@ -8372,6 +12789,8 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 	uevr::API::UObjectHook::remove_motion_controller_state(freeAimFakeRightHand);
 	SetComponentVisibility(freeAimFakeLeftHand, false);
 	SetComponentVisibility(freeAimFakeRightHand, false);
+	SetComponentVisibility(freeAimClenchedLeftHand, false);
+	SetComponentVisibility(freeAimClenchedRightHand, false);
 	if (freeAimFakeHandsAlignmentFramesRemaining > 0)
 	{
 		--freeAimFakeHandsAlignmentFramesRemaining;
@@ -8388,9 +12807,17 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 
 void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 {
-	const bool hadComponents = freeAimFakeLeftHand != nullptr || freeAimFakeRightHand != nullptr;
+	const bool hadComponents = freeAimFakeLeftHand != nullptr || freeAimFakeRightHand != nullptr
+		|| freeAimClenchedLeftHand != nullptr || freeAimClenchedRightHand != nullptr
+		|| freeAimFakeWatch != nullptr;
+	int destroyedComponentCount = 0;
+	int hiddenOnlyComponentCount = 0;
 	RestoreSupportFakeHandAttachment();
 	RestorePrimaryFakeHandAttachment();
+	if (freeAimFakeLeftHand != nullptr && freeAimFakeLeftHandBoneName.comparison_index != 0)
+		UnhideBone(freeAimFakeLeftHand, freeAimFakeLeftHandBoneName);
+	if (freeAimFakeRightHand != nullptr && freeAimFakeRightHandBoneName.comparison_index != 0)
+		UnhideBone(freeAimFakeRightHand, freeAimFakeRightHandBoneName);
 
 	const auto removeComponent = [&](uevr::API::UObject*& component)
 	{
@@ -8400,12 +12827,34 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 		{
 			uevr::API::UObjectHook::remove_motion_controller_state(component);
 			SetComponentVisibility(component, false);
+			if (destroyComponents)
+			{
+				auto componentClass = component->get_class();
+				auto destroy = componentClass != nullptr
+					? componentClass->find_function(L"DestroyComponent") : nullptr;
+				if (destroy != nullptr)
+				{
+					std::vector<uint8_t> params(destroy->get_properties_size());
+					SetReflectedBoolParameter(destroy, params, L"bPromoteChildren", false);
+					destroy->call(component, params.data());
+					++destroyedComponentCount;
+				}
+				else
+				{
+					// Hiding remains the fail-closed fallback, but retain a diagnostic:
+					// clearing a live pointer without destroying the component is what
+					// allowed an old clenched hand to survive player respawn.
+					++hiddenOnlyComponentCount;
+				}
+			}
 		}
 		if (destroyComponents)
 			component = nullptr;
 	};
 	removeComponent(freeAimFakeLeftHand);
 	removeComponent(freeAimFakeRightHand);
+	removeComponent(freeAimClenchedLeftHand);
+	removeComponent(freeAimClenchedRightHand);
 	removeComponent(freeAimFakeWatch);
 	if (playerManager->handScaleWatch != nullptr
 		&& uevr::API::UObjectHook::exists(playerManager->handScaleWatch))
@@ -8414,6 +12863,7 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 	freeAimFakeHandsActive = false;
 	freeAimAppliedSupportContactActive = false;
 	freeAimAppliedPrimaryGripAttachmentActive = false;
+	freeAimClenchedVisibleMask = 0;
 	ApplyVehicleNativeRightArmPresentation(false);
 	if (destroyComponents)
 	{
@@ -8429,6 +12879,10 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 		freeAimFakeLeftHandBoneName = uevr::API::FName{};
 		freeAimFakeRightHandBoneName = uevr::API::FName{};
 		freeAimFakeWatchHandBoneName = uevr::API::FName{};
+		freeAimClenchedHandsReady = false;
+		freeAimClenchedLeftMesh = nullptr;
+		freeAimClenchedRightMesh = nullptr;
+		freeAimClenchedAssetFailureLogged = false;
 		freeAimLeftPalmOffsetApplied = false;
 		freeAimAppliedVehicleRightOnly = false;
 		freeAimAppliedTwoHandWristOverrideActive = false;
@@ -8436,12 +12890,102 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 		freeAimPrimaryAttachFailureDiagnosticLogged = false;
 		freeAimBareHandCapabilityProbeLogged = false;
 		if (hadComponents)
-			uevr::API::get()->log_info("[FreeAimHands] transient copies hidden and motion states removed");
+		{
+			uevr::API::get()->log_info(
+				"[FreeAimHands] transient copies destroyed=%d hiddenOnly=%d motionStatesRemoved=true",
+				destroyedComponentCount, hiddenOnlyComponentCount);
+		}
 	}
+}
+
+void WeaponManager::ProcessNativeVehicleHandPoseTrace()
+{
+	const bool inVehicle = playerManager != nullptr && playerManager->isInVehicle;
+	if (!inVehicle)
+	{
+		nativeVehicleHandPoseTraceWasInVehicle = false;
+		nativeVehicleHandPoseTraceAt = 0;
+		return;
+	}
+
+	const uint64_t now = GetTickCount64();
+	if (!nativeVehicleHandPoseTraceWasInVehicle)
+	{
+		nativeVehicleHandPoseTraceWasInVehicle = true;
+		if (!nativeVehicleHandPoseTraceCaptured)
+		{
+			nativeVehicleHandPoseTraceAt = now + 1500;
+			uevr::API::get()->log_info(
+				"[NativeHandPose] armed source=vehicle-entry settle_ms=1500 weapon=%d",
+				static_cast<int>(currentWeaponEquipped));
+		}
+	}
+	if (nativeVehicleHandPoseTraceCaptured || nativeVehicleHandPoseTraceAt == 0
+		|| now < nativeVehicleHandPoseTraceAt)
+		return;
+
+	auto nativeHands = playerManager->handScaleHands;
+	if (nativeHands == nullptr || !uevr::API::UObjectHook::exists(nativeHands)
+		|| nativeHands->get_class() == nullptr)
+	{
+		// Player presentation can initialize a frame later than vehicle state.
+		nativeVehicleHandPoseTraceAt = now + 250;
+		return;
+	}
+
+	int32_t boneCount = -1;
+	if (!ReadBoneCount(nativeHands, boneCount) || boneCount <= 0)
+	{
+		uevr::API::get()->log_warn(
+			"[NativeHandPose] capture postponed reason=bone-count-unavailable class=%ls",
+			nativeHands->get_class()->get_full_name().c_str());
+		nativeVehicleHandPoseTraceAt = now + 500;
+		return;
+	}
+
+	const int32_t cappedCount = (std::min)(boneCount, 256);
+	int32_t loggedCount = 0;
+	uevr::API::get()->log_info(
+		"[NativeHandPose] capture begin class=%ls object=%ls bones=%d weapon=%d vehicleFreeAim=%d space=component",
+		nativeHands->get_class()->get_full_name().c_str(), nativeHands->get_full_name().c_str(),
+		cappedCount, static_cast<int>(currentWeaponEquipped), IsVehicleFreeAimActive() ? 1 : 0);
+	for (int32_t index = 0; index < cappedCount; ++index)
+	{
+		std::wstring boneText;
+		uevr::API::FName boneName{};
+		if (!ReadBoneNameAtIndex(nativeHands, index, boneText, &boneName))
+			continue;
+		glm::fvec3 position{};
+		glm::fquat rotation{};
+		if (!ReadBoneTransform(nativeHands, boneName, position, rotation, 2))
+		{
+			uevr::API::get()->log_info(
+				"[NativeHandPose] bone index=%d name=%ls readable=0", index, boneText.c_str());
+			continue;
+		}
+		uevr::API::get()->log_info(
+			"[NativeHandPose] bone index=%d name=%ls p=(%.6f %.6f %.6f) q=(%.7f %.7f %.7f %.7f)",
+			index, boneText.c_str(), position.x, position.y, position.z,
+			rotation.x, rotation.y, rotation.z, rotation.w);
+		++loggedCount;
+	}
+
+	if (loggedCount <= 0)
+	{
+		uevr::API::get()->log_warn("[NativeHandPose] capture postponed reason=no-readable-transforms");
+		nativeVehicleHandPoseTraceAt = now + 500;
+		return;
+	}
+	nativeVehicleHandPoseTraceCaptured = true;
+	nativeVehicleHandPoseTraceAt = 0;
+	uevr::API::get()->log_info(
+		"[NativeHandPose] capture complete logged=%d total=%d space=component",
+		loggedCount, cappedCount);
 }
 
 void WeaponManager::ProcessFreeAimWeaponHands(bool force)
 {
+	ProcessNativeVehicleHandPoseTrace();
 	const bool fakeHandsWereActive = freeAimFakeHandsActive;
 	const bool firstWeaponReady = HasUsableWeapon(true);
 	const bool unarmedFreeTracking = currentWeaponEquipped == Unarmed;
@@ -8498,6 +13042,9 @@ void WeaponManager::ProcessFreeAimWeaponHands(bool force)
 
 void WeaponManager::RestoreFreeAimWeaponHands()
 {
+	RemoveCustomAkimboVisual("presentation-restore");
+	ResetMotionThrowableFlight("presentation-restore", true);
+	ResetPhysicalThrowableProbe("presentation-restore", false);
 	ResetRuntimeHandState("hand-presentation-restore", true, true);
 	SuspendMagneticIdleSlot();
 	RemoveFreeAimFakeHands(true);
@@ -8655,6 +13202,12 @@ void WeaponManager::ProcessWeaponHandling(float delta)
 		positionRecoilForce = { 0.0f, -0.005f, -1.5f };
 		rotationRecoilForceEuler = { -0.01f, 0.0f, 0.0f };
 		break;
+	case Grenade:
+	case Teargas:
+	case Molotov:
+		// The motion-controller transform is already owned by the normal tracked
+		// weapon path. Do not run firearm recoil or the default native unhook.
+		return;
 	case Detonator:
 		return;
 	case SprayCan:

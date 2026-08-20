@@ -9,6 +9,7 @@
 #include "Utilities.h"
 #include <string>
 #include <exception>
+#include <stdexcept>
 #include <chrono>
 #include <cstdint>
 #include <atomic>
@@ -609,7 +610,16 @@ public:
 		state->Gamepad.wButtons = buttons;
 		// A body-anchored gun is visible inventory, not an active weapon. Keep
 		// native trigger input blocked until a proximity-qualified grip has attached it.
-		if (!playerManager.isInVehicle && weaponManager.ShouldBlockWeaponTriggerInput())
+		// Native throwables are different: the Molotov release pulse is deliberately
+		// generated after Lua has taken ownership of the grip/release gesture. Do not
+		// let the stale magnetic-weapon snapshot erase that one native action before
+		// GTA's projectile-creation path sees it.
+		const int authoritativeWeaponId = static_cast<int>(weaponManager.currentWeaponEquipped);
+		const bool nativeThrowableOnFoot = !playerManager.isInVehicle
+			&& authoritativeWeaponId >= WeaponManager::Grenade
+			&& authoritativeWeaponId <= WeaponManager::Molotov;
+		if (!nativeThrowableOnFoot && !playerManager.isInVehicle
+			&& weaponManager.ShouldBlockWeaponTriggerInput())
 		{
 			state->Gamepad.bLeftTrigger = 0;
 			state->Gamepad.bRightTrigger = 0;
@@ -687,6 +697,11 @@ public:
 			memoryManager.ApplyCombatAssistPatches();
 		if (settingsManager.enableDualGripAimFire)
 			memoryManager.ApplyPlayerSemiAutoFireGatePatch();
+		if (settingsManager.enableCustomAkimbo)
+			memoryManager.ApplyCustomAkimboFirePatch();
+		if (settingsManager.enableMotionThrowables
+			|| settingsManager.enableThrowableMotionProbe)
+			memoryManager.ApplyNativeThrowableMotionPatch();
 		if (settingsManager.activeManualReloadMode)
 			memoryManager.ApplyManualReloadCapturePatch();
 		Utilities::InitHelperClasses();
@@ -754,6 +769,69 @@ public:
 				show ? "true" : "false");
 			return;
 		}
+		if (eventName == "DUALGRIP.ThrowableProbe")
+		{
+			if (!settingsManager.enableMotionThrowables
+				&& !settingsManager.enableThrowableMotionProbe)
+				return;
+			const std::string payload(event_data);
+			auto readField = [&](const char* key) -> std::string {
+				const std::string prefix = std::string(key) + "=";
+				const size_t start = payload.find(prefix);
+				if (start == std::string::npos)
+					return {};
+				const size_t valueStart = start + prefix.size();
+				const size_t valueEnd = payload.find(';', valueStart);
+				return payload.substr(valueStart,
+					valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart);
+			};
+			try
+			{
+				const std::string type = readField("type");
+				const int eventType = type == "edge" ? 1
+					: (type == "release" ? 2 : (type == "cancel" ? 3 : 0));
+				if (eventType == 0)
+					throw std::invalid_argument("unknown throwable event");
+				weaponManager.QueuePhysicalThrowableProbeEvent(
+					eventType,
+					static_cast<uint32_t>(std::stoul(readField("seq"))),
+					static_cast<uint8_t>(std::stoul(readField("hands"))),
+					static_cast<uint8_t>(std::stoul(readField("grips"))),
+					static_cast<uint32_t>(std::stoul(readField("holdms"))),
+					std::stoi(readField("weapon")));
+			}
+			catch (const std::exception&)
+			{
+				API::get()->log_warn("[ThrowableProbe] rejected malformed Lua event payload");
+			}
+			return;
+		}
+
+		if (eventName == "DUALGRIP.AkimboInput")
+		{
+			const std::string payload(event_data);
+			const auto readInt = [&payload](const char* key, int fallback) {
+				const std::string prefix = std::string(key) + "=";
+				const size_t start = payload.find(prefix);
+				if (start == std::string::npos)
+					return fallback;
+				const size_t valueStart = start + prefix.size();
+				const size_t valueEnd = payload.find(';', valueStart);
+				try {
+					return std::stoi(payload.substr(valueStart,
+						valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart));
+				}
+				catch (const std::exception&) {
+					return fallback;
+				}
+			};
+			weaponManager.SetCustomAkimboInputState(
+				static_cast<uint8_t>(readInt("held", 0) & 0x03),
+				static_cast<uint8_t>(readInt("edge", 0) & 0x03),
+				readInt("weapon", -1));
+			return;
+		}
+
 		if (eventName == "DUALGRIP.TriggerTiming")
 		{
 			if (weaponManager.ShouldBlockNativeMeleeTriggerInput())
@@ -1030,6 +1108,30 @@ public:
 		}
 		if (flagName == "EnableDualGripAimFire" && enabled)
 			memoryManager.ApplyPlayerSemiAutoFireGatePatch();
+		if (flagName == "EnableCustomAkimbo")
+		{
+			if (enabled)
+				memoryManager.ApplyCustomAkimboFirePatch();
+			else
+				memoryManager.ClearCustomAkimboState();
+		}
+		if (flagName == "EnableMotionThrowables"
+			|| flagName == "EnableThrowableMotionProbe")
+		{
+			if (settingsManager.enableMotionThrowables
+				|| settingsManager.enableThrowableMotionProbe)
+				memoryManager.ApplyNativeThrowableMotionPatch();
+			else
+				memoryManager.ClearNativeThrowableMotionOverride();
+		}
+		if (flagName == "EnableNativeMolotovMode")
+		{
+			// Native mode must never inherit a pending custom launch override.
+			// The engine-thread throwable state machine sees the mode on its next
+			// tick and tears down any custom proxy/flight state.
+			memoryManager.ClearNativeThrowableMotionOverride();
+			API::get()->log_info("[MotionThrowable] mode=%s", enabled ? "native" : "custom");
+		}
 		if (flagName == "EnableHudAutoHide")
 		{
 			lastHudAutoHideEnabled = enabled;
@@ -1046,6 +1148,11 @@ public:
 				memoryManager.ApplyCombatAssistPatches();
 				if (settingsManager.enableDualGripAimFire)
 					memoryManager.ApplyPlayerSemiAutoFireGatePatch();
+				if (settingsManager.enableCustomAkimbo)
+					memoryManager.ApplyCustomAkimboFirePatch();
+				if (settingsManager.enableMotionThrowables
+					|| settingsManager.enableThrowableMotionProbe)
+					memoryManager.ApplyNativeThrowableMotionPatch();
 				if (settingsManager.activeManualReloadMode)
 					memoryManager.ApplyManualReloadCapturePatch();
 			}
@@ -1054,6 +1161,11 @@ public:
 				memoryManager.RestoreCombatAssistPatches();
 				if (settingsManager.enableDualGripAimFire)
 					memoryManager.ApplyPlayerSemiAutoFireGatePatch();
+				if (settingsManager.enableCustomAkimbo)
+					memoryManager.ApplyCustomAkimboFirePatch();
+				if (settingsManager.enableMotionThrowables
+					|| settingsManager.enableThrowableMotionProbe)
+					memoryManager.ApplyNativeThrowableMotionPatch();
 				if (settingsManager.activeManualReloadMode)
 					memoryManager.ApplyManualReloadCapturePatch();
 			}
@@ -1163,9 +1275,11 @@ public:
 				weaponManager.SetMotionWeaponTrackingEnabled(true);
 			}
 			weaponManager.UpdateActualWeaponMesh();
+			weaponManager.ProcessPhysicalThrowableProbe(delta);
 			weaponManager.ProcessMagneticIdleWeapon();
 			weaponManager.ProcessMotionMelee(delta);
 			weaponManager.ProcessTwoHandStabilization(delta);
+			weaponManager.ProcessCustomAkimboState();
 			const auto poseContactEnd = collectInteractionPerf
 				? InteractionPerfClock::now()
 				: InteractionPerfClock::time_point{};
@@ -1180,10 +1294,13 @@ public:
 				cameraController.ProcessCameraMatrix(delta);
 				cameraController.ProcessHookedHeadPosition(delta);
 				const bool hasSecondWeapon = weaponManager.HasUsableWeapon(false);
-				const bool updateFirstWeapon = !weaponManager.firstWeaponShotDone || !hasSecondWeapon;
+				const bool customAkimboActive = weaponManager.IsCustomAkimboActive();
+				const bool updateFirstWeapon = customAkimboActive
+					|| !weaponManager.firstWeaponShotDone || !hasSecondWeapon;
 				weaponManager.UpdateShootingState(updateFirstWeapon);
 				memoryManager.FlushTriggerTimingNativeShot(static_cast<int>(weaponManager.currentWeaponEquipped), playerManager.isInVehicle);
-				const bool primaryFirstWeapon = !(weaponManager.firstWeaponShotDone && weaponManager.HasUsableWeapon(false));
+				const bool primaryFirstWeapon = customAkimboActive
+					|| !(weaponManager.firstWeaponShotDone && weaponManager.HasUsableWeapon(false));
 				weaponManager.ProcessAiming(primaryFirstWeapon,
 					settingsManager.enableAimAlignment && weaponManager.IsGameplayWeaponTrackingActive()
 					&& !weaponManager.IsGripCalibrationActive());
@@ -1414,6 +1531,7 @@ public:
 	int candidateDrivingVehicleModelSamples = 0;
 	int activeDrivingVehicleModelId = -1;
 	int lastDrivingVehicleModelIdSentToLua = -1;
+	int lastWeaponIdSentToLua = -1;
 	bool meleeNativeTriggerBlockStateInitialized = false;
 	bool lastMeleeNativeTriggerBlockSentToLua = false;
 	std::string queuedCheat;
@@ -2456,6 +2574,13 @@ public:
 
 	void SendStatesToLua()
 	{
+		const int authoritativeWeaponId = static_cast<int>(weaponManager.currentWeaponEquipped);
+		if (authoritativeWeaponId != lastWeaponIdSentToLua)
+		{
+			lastWeaponIdSentToLua = authoritativeWeaponId;
+			API::get()->dispatch_lua_event("currentWeapon",
+				std::to_string(authoritativeWeaponId));
+		}
 		const bool meleeNativeTriggerBlocked = weaponManager.ShouldBlockNativeMeleeTriggerInput();
 		if (!meleeNativeTriggerBlockStateInitialized
 			|| meleeNativeTriggerBlocked != lastMeleeNativeTriggerBlockSentToLua)

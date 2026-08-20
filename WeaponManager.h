@@ -34,10 +34,39 @@ private:
 	std::vector<uevr::API::UObject*> firstWeaponPreviousParticles;
 	std::vector<uevr::API::UObject*> secondWeaponPreviousParticles;
 	bool shotHierarchyProbeLogged = false;
+	std::atomic<uint8_t> customAkimboHeldMaskSnapshot{ 0 };
+	std::atomic<uint8_t> customAkimboEdgeMaskPending{ 0 };
+	std::atomic<int> customAkimboInputWeapon{ -1 };
+	bool customAkimboActive = false;
+	int customAkimboLastRejection = -1;
+	// Preserve the hand that owned GTA's live mesh when the second controller
+	// joins. Magnetic suspension clears its normal primary-hand latch.
+	int customAkimboPrimaryHand = -1;
+	std::array<glm::fvec3, 2> customAkimboMuzzleWorld{};
+	uint8_t customAkimboMuzzleValidMask = 0;
+	uint8_t customAkimboFlashAlternateHand = 0;
+	glm::fvec3 customAkimboLastEffectMuzzleWorld{};
+	bool customAkimboLastEffectMuzzleValid = false;
+	// GTA emits a muzzle particle only for its one authoritative weapon mesh.
+	// Cache that native effect template and use it for the presentation-only
+	// left lane after the corresponding native shot has been accepted.
+	uevr::API::UObject* customAkimboMuzzleEffectTemplate = nullptr;
+	std::vector<uevr::API::UObject*> customAkimboMuzzleEffectTemplates;
+	std::vector<glm::fvec3> customAkimboMuzzleEffectScales;
+	int customAkimboMuzzleEffectTemplateWeapon = -1;
+	uint8_t customAkimboPendingEffectHandMask = 0;
+	uint64_t customAkimboPendingEffectSince = 0;
+	bool customAkimboMissingEffectTemplateLogged = false;
 
 	//Weapon infos
 	uevr::API::UObject* firstWeaponMesh = nullptr;
 	uevr::API::UObject* secondWeaponMesh = nullptr;
+	// Presentation-only duplicate for custom akimbo. GTA's single native weapon
+	// entry remains authoritative for ammo, cooldown, damage, audio and effects.
+	uevr::API::UObject* customAkimboVisualMesh = nullptr;
+	uevr::API::UObject* customAkimboVisualStaticMesh = nullptr;
+	uevr::API::UObject* customAkimboVisualCharacter = nullptr;
+	int customAkimboVisualWeapon = -1;
 	// The weapon actor/component that owns the moved mesh. Native smoke/trail
 	// components may be siblings of the mesh rather than its children.
 	uevr::API::UObject* firstWeaponContainer = nullptr;
@@ -213,6 +242,10 @@ private:
 	std::array<float, 2> motionMeleeInterSwingCooldownRemaining{};
 	std::array<float, 2> motionMeleeContactWindowRemaining{};
 	std::array<bool, 2> motionMeleeHandActiveState{ false, false };
+	// 0 = short hand/fist geometry, 1 = held weapon mesh, -1 = inactive.
+	// Reset when ownership changes so a weapon-to-fist role transfer can never
+	// sweep between two unrelated geometry spaces.
+	std::array<int8_t, 2> motionMeleeHandGeometryMode{ -1, -1 };
 	// Raw physical trigger state is presentation-only for physical melee. The
 	// authoritative engine-thread snapshot below prevents those triggers from
 	// leaking into GTA's native fight/fire input while retaining both clenches.
@@ -222,6 +255,60 @@ private:
 	uint32_t interactionEngineTickGeneration = 0;
 	std::atomic<uint32_t> motionMeleeContactSequence{ 0 };
 	std::unordered_set<uintptr_t> motionMeleeRejectedContactDiagnostics{};
+	uevr::API::UObject* motionMeleeDebugAxisComponent = nullptr;
+	uevr::API::UObject* motionMeleeDebugAxisCharacter = nullptr;
+	bool motionMeleeDebugAxisCreationFailed = false;
+	uevr::API::UObject* motionMeleePedImpactSound = nullptr;
+	uevr::API::UObject* motionMeleeFistImpactSound = nullptr;
+	uevr::API::UObject* motionMeleeBluntImpactSound = nullptr;
+	uevr::API::UObject* motionMeleeSharpImpactSound = nullptr;
+	uevr::API::UObject* motionMeleeVehicleImpactSound = nullptr;
+	bool motionMeleeImpactSoundLoadAttempted = false;
+	bool motionMeleeImpactAudioFailureLogged = false;
+	uevr::API::UObject* motionThrowableMolotovImpactEffect = nullptr;
+	uevr::API::UObject* motionThrowableMolotovFlameEffect = nullptr;
+	uevr::API::UObject* motionThrowableSmokeEffect = nullptr;
+	uevr::API::UObject* motionThrowableVehicleImpactEffect = nullptr;
+	uevr::API::UObject* motionThrowableVehicleExplosionEffect = nullptr;
+	uevr::API::UObject* motionThrowableImpactSound = nullptr;
+	// The game's own Molotov-impact Blueprint. Custom flight owns the bottle
+	// until a measured collision, then this actor owns the native fire behavior.
+	uevr::API::UClass* motionThrowableNativeExplosionClass = nullptr;
+	// BP_Fire is the persistent native fire owner. The custom bottle remains
+	// responsible for flight; this class is spawned only after collision.
+	uevr::API::UClass* motionThrowableNativeFireClass = nullptr;
+	uevr::API::UClass* motionThrowableNativeSpawnLibraryClass = nullptr;
+	uevr::API::UObject* motionThrowableNativeMolotovDebrisTemplate = nullptr;
+	uint8_t motionThrowableNativeMolotovTypeByte = 0;
+	bool motionThrowableNativeMolotovSelectionResolved = false;
+	bool motionThrowableImpactAssetsLoadAttempted = false;
+	bool motionThrowableNativeExplosionLoadAttempted = false;
+	bool motionThrowableImpactFailureLogged = false;
+	struct MotionThrowableImpactVisual
+	{
+		uevr::API::UObject* fire = nullptr;
+		uevr::API::UObject* smoke = nullptr;
+		ULONGLONG expiresAt = 0;
+	};
+	std::vector<MotionThrowableImpactVisual> motionThrowableImpactVisuals;
+	struct MotionThrowableNativeImpactActors
+	{
+		uevr::API::UObject* explosion = nullptr;
+		uevr::API::UObject* fire = nullptr;
+		ULONGLONG explosionExpiresAt = 0;
+		ULONGLONG fireExpiresAt = 0;
+		bool extinguishCalled = false;
+	};
+	std::vector<MotionThrowableNativeImpactActors> motionThrowableNativeImpactActors;
+	struct MotionThrowableVehicleBurn
+	{
+		uintptr_t entity = 0;
+		std::array<float, 3> nativePoint{};
+		ULONGLONG expiresAt = 0;
+		ULONGLONG nextDamageAt = 0;
+		uint32_t ticks = 0;
+	};
+	std::vector<MotionThrowableVehicleBurn> motionThrowableVehicleBurns;
 	uevr::API::UObject* motionMeleeGeometryMesh = nullptr;
 	int motionMeleeGeometryWeapon = -1;
 	int motionMeleeGeometryPrincipalAxis = -1;
@@ -229,6 +316,113 @@ private:
 	glm::fvec3 motionMeleeGeometryLocalTip{};
 	float motionMeleeGeometryLocalRadius = 0.0f;
 	bool motionMeleeGeometryValid = false;
+	// Per-hand physical throwable sampling. Lua publishes raw input transitions;
+	// pose sampling and authoritative weapon/state validation remain engine-thread
+	// owned. A release can arm one verified native launch override.
+	std::atomic<bool> throwableProbeEdgePending{ false };
+	std::atomic<bool> throwableProbeReleasePending{ false };
+	std::atomic<bool> throwableProbeCancelPending{ false };
+	std::atomic<uint32_t> throwableProbeEdgeSequence{ 0 };
+	std::atomic<uint8_t> throwableProbeEdgeHandMask{ 0 };
+	std::atomic<uint8_t> throwableProbeEdgeGripMask{ 0 };
+	std::atomic<int> throwableProbeEdgeLuaWeapon{ -1 };
+	std::atomic<uint32_t> throwableProbeReleaseSequence{ 0 };
+	std::atomic<uint8_t> throwableProbeReleaseHandMask{ 0 };
+	std::atomic<uint8_t> throwableProbeReleaseGripMask{ 0 };
+	std::atomic<uint32_t> throwableProbeReleaseHoldMilliseconds{ 0 };
+	std::atomic<int> throwableProbeReleaseLuaWeapon{ -1 };
+	bool throwableProbeActive = false;
+	uint32_t throwableProbeSequence = 0;
+	uint8_t throwableProbeHandMask = 0;
+	uint8_t throwableProbeGripMask = 0;
+	std::array<bool, 2> throwableProbePoseValid{ false, false };
+	std::array<bool, 2> throwableProbeLastPoseFromVisibleBone{ false, false };
+	std::array<glm::fvec3, 2> throwableProbePreviousWorldPositions{};
+	std::array<glm::fvec3, 2> throwableProbeLastWorldPositions{};
+	std::array<glm::fvec3, 2> throwableProbeLastDirections{};
+	std::array<glm::fquat, 2> throwableProbePreviousWorldRotations{
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f),
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f) };
+	std::array<glm::fquat, 2> throwableProbeLastWorldRotations{
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f),
+		glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f) };
+	std::array<glm::fvec3, 2> throwableProbeSmoothedVelocityMps{};
+	std::array<glm::fvec3, 2> throwableProbeSmoothedAngularVelocity{};
+	std::array<uint32_t, 2> throwableProbeSampleCounts{};
+	static constexpr size_t ThrowableVelocityHistorySize = 12;
+	std::array<std::array<glm::fvec3, ThrowableVelocityHistorySize>, 2>
+		throwableProbeVelocityHistoryMps{};
+	std::array<std::array<ULONGLONG, ThrowableVelocityHistorySize>, 2>
+		throwableProbeVelocityHistoryTimes{};
+	std::array<std::array<glm::fvec3, ThrowableVelocityHistorySize>, 2>
+		throwableProbePositionHistoryM{};
+	std::array<std::array<ULONGLONG, ThrowableVelocityHistorySize>, 2>
+		throwableProbePositionHistoryTimes{};
+	std::array<size_t, 2> throwableProbeVelocityHistoryCursor{};
+	uint32_t throwableMotionOverrideSequence = 0;
+	ULONGLONG throwableMotionOverrideExpiresAt = 0;
+	int throwableMotionOverrideWeapon = -1;
+	uevr::API::UObject* throwableMotionHiddenMesh = nullptr;
+	ULONGLONG throwableMotionVisualRestoreAt = 0;
+	// A custom proxy owns the released bottle visual until the next accepted
+	// grip.  The native source mesh is body-attached, so restoring it at proxy
+	// impact makes an unused Molotov jog with the hidden character body.
+	bool motionThrowableSourceHidden = false;
+	struct MotionThrowableFlight
+	{
+		bool active = false;
+		uint32_t sequence = 0;
+		uint32_t generation = 0;
+		int weaponType = -1;
+		int hand = -1;
+		uevr::API::UObject* ownerCharacter = nullptr;
+		uevr::API::UObject* sourceMesh = nullptr;
+		uevr::API::UObject* visual = nullptr;
+		uevr::API::UObject* collisionProxy = nullptr;
+		glm::fvec3 position{};
+		glm::fvec3 previousPosition{};
+		glm::fvec3 linearVelocityUE{};
+		glm::fvec3 angularVelocity{};
+		glm::fquat rotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+		float ageSeconds = 0.0f;
+		uint32_t bounceCount = 0;
+		bool settled = false;
+		bool earlyDiagnosticLogged = false;
+		bool midDiagnosticLogged = false;
+	};
+	MotionThrowableFlight motionThrowableFlight{};
+	// A new grip may begin before the prior proxy reaches a surface. Keep a
+	// small bounded set of detached flights alive so rapid throws do not destroy
+	// the older bottle or lose its collision/effect opportunity.
+	std::vector<MotionThrowableFlight> motionThrowableDetachedFlights;
+	bool processingDetachedThrowableFlights = false;
+	bool motionThrowableWorldSweepReadyLogged = false;
+	bool motionThrowableWorldSweepFailureLogged = false;
+	int motionThrowableWorldTraceChannel = -1;
+	uint8_t motionThrowableWorldTraceProbeCursor = 0;
+	void ResetPhysicalThrowableProbe(const char* reason, bool logCancellation);
+	void ResetMotionThrowableFlight(const char* reason, bool logResult);
+	void DestroyMotionThrowableFlightVisual(MotionThrowableFlight& flight);
+	void DestroyMotionThrowableImpactVisual(MotionThrowableImpactVisual& visual);
+	void DestroyMotionThrowableNativeImpactActors(
+		MotionThrowableNativeImpactActors& actors, bool destroyExplosion,
+		bool destroyFire);
+	void ProcessMotionThrowableImpactVisuals();
+	void StartMotionThrowableVehicleBurn(
+		const MemoryManager::NativeMeleeContact& contact);
+	void ProcessMotionThrowableVehicleBurns();
+	void EnsureMotionThrowableVisualRenderable(uevr::API::UObject* component);
+	bool StartMotionThrowableFlight(uint32_t sequence, int weaponType, int hand,
+		const glm::fvec3& position, const glm::fquat& rotation,
+		const glm::fvec3& linearVelocityMps, const glm::fvec3& angularVelocity);
+	void ProcessMotionThrowableFlight(float delta);
+	bool SetMotionThrowableVisualTransform(uevr::API::UObject* component,
+		const glm::fvec3& position, const glm::fquat& rotation,
+		bool sweep = false) const;
+	bool ReadMotionMeleeHandWorldPose(int controllerHand,
+		const glm::fvec3& controllerPosition, const glm::fquat& controllerRotation,
+		glm::fvec3& worldPosition, glm::fquat& worldRotation,
+		bool& usedVisibleBone) const;
 	bool ReadMotionMeleeControllerWorldPose(int controllerHand,
 		const glm::fvec3& controllerPosition, const glm::fquat& controllerRotation,
 		glm::fvec3& worldPosition, glm::fquat& worldRotation) const;
@@ -238,6 +432,15 @@ private:
 	bool ReadMotionMeleeContactGeometry(const glm::fvec3& meshPosition,
 		const glm::fquat& meshRotation, glm::fvec3& baseUE, glm::fvec3& tipUE,
 		float& radiusUE);
+	bool EnsureMotionMeleeDebugAxis();
+	void UpdateMotionMeleeDebugAxis(const glm::fvec3& startUE,
+		const glm::fvec3& endUE, float radiusUE);
+	void HideMotionMeleeDebugAxis();
+	bool PlayMotionMeleeImpactAudio(const MemoryManager::NativeMeleeContact& contact,
+		int damageWeaponType);
+	bool PlayMotionThrowableImpactEffect(int weaponType,
+		const glm::fvec3& impactPoint,
+		const MemoryManager::NativeMeleeContact* contact = nullptr);
 	bool vehicleFreeAimPresentationActive = false;
 	// Engine-thread diagnostic state only; never retain a vehicle UObject here.
 	int vehicleFreeAimLastRejection = -1;
@@ -357,6 +560,13 @@ private:
 	uevr::API::UObject* freeAimFakeHandsCharacter = nullptr;
 	uevr::API::UObject* freeAimFakeLeftHand = nullptr;
 	uevr::API::UObject* freeAimFakeRightHand = nullptr;
+	// Independent, baked single-hand meshes render only the closed hand. Each is
+	// parented to its proven split skeletal clone, so existing controller/weapon
+	// tracking stays authoritative without duplicating the opposite arm/hand.
+	uevr::API::UObject* freeAimClenchedLeftHand = nullptr;
+	uevr::API::UObject* freeAimClenchedRightHand = nullptr;
+	uevr::API::UObject* freeAimClenchedLeftMesh = nullptr;
+	uevr::API::UObject* freeAimClenchedRightMesh = nullptr;
 	uevr::API::UObject* freeAimFakeWatch = nullptr;
 	bool freeAimFakeHandsReady = false;
 	bool freeAimFakeHandsInitialized = false;
@@ -366,6 +576,9 @@ private:
 	uevr::API::FName freeAimFakeLeftHandBoneName{};
 	uevr::API::FName freeAimFakeRightHandBoneName{};
 	uevr::API::FName freeAimFakeWatchHandBoneName{};
+	bool freeAimClenchedHandsReady = false;
+	uint8_t freeAimClenchedVisibleMask = 0;
+	bool freeAimClenchedAssetFailureLogged = false;
 	bool freeAimFakeHandsActive = false;
 	bool freeAimSupportHandAttached = false;
 	bool freeAimSupportWatchAttached = false;
@@ -390,6 +603,9 @@ private:
 	bool freeAimSupportContactDiagnosticLogged = false;
 	bool freeAimPrimaryAttachFailureDiagnosticLogged = false;
 	bool freeAimBareHandCapabilityProbeLogged = false;
+	bool nativeVehicleHandPoseTraceWasInVehicle = false;
+	bool nativeVehicleHandPoseTraceCaptured = false;
+	uint64_t nativeVehicleHandPoseTraceAt = 0;
 	bool freeAimLeftPalmOffsetApplied = false;
 	bool freeAimAppliedTwoHandWristOverrideActive = false;
 	int freeAimAppliedCalibrationWeaponId = -1;
@@ -408,6 +624,7 @@ private:
 	bool CreateFreeAimFakeHands();
 	bool ApplyFreeAimFakeHandPresentation();
 	void RemoveFreeAimFakeHands(bool destroyComponents = false);
+	void ProcessNativeVehicleHandPoseTrace();
 	bool firstSpreadProbeShotActive = false;
 	bool secondSpreadProbeShotActive = false;
 	struct AimCalibrationResidual {
@@ -422,7 +639,8 @@ private:
 	uint32_t aimCalibrationGeneralSamples = 0;
 	uint32_t aimCalibrationScopedSamples = 0;
 	bool aimCalibrationWasEnabled = false;
-	void SetComponentVisibility(uevr::API::UObject* object, bool visible);
+	void SetComponentVisibility(uevr::API::UObject* object, bool visible,
+		bool propagateToChildren = true);
 
 	// Primary and support calibration are stored independently for each hand.
 	// Reflection is used only to seed a missing side; it never couples later edits.
@@ -583,6 +801,9 @@ public:
 	bool firstWeaponShotDone = false;
 	
 	void UpdateActualWeaponMesh();
+	bool EnsureCustomAkimboVisual();
+	void RemoveCustomAkimboVisual(const char* reason);
+	void CacheCustomAkimboEffectTemplate(uevr::API::UObject* component);
 	bool HideBulletTrace();
 	void UpdateShootingState(bool firstWeapon);
 	void RedirectWorldShotEffects(bool firstWeapon);
@@ -602,7 +823,14 @@ public:
 	void ProcessMagneticIdleWeapon();
 	void BeginInteractionEngineTick();
 	void ProcessMotionMelee(float delta);
+	void QueuePhysicalThrowableProbeEvent(int eventType, uint32_t sequence,
+		uint8_t handMask, uint8_t gripMask, uint32_t holdMilliseconds,
+		int luaWeaponId);
+	void ProcessPhysicalThrowableProbe(float delta);
 	void SetMeleeClenchState(bool leftTriggerHeld, bool rightTriggerHeld);
+	void SetCustomAkimboInputState(uint8_t heldMask, uint8_t edgeMask, int luaWeaponId);
+	void ProcessCustomAkimboState();
+	bool IsCustomAkimboActive() const { return customAkimboActive; }
 	void SetVehicleFaceButtonState(bool held);
 	bool IsVehicleFreeAimActive() const;
 	void SetFreeAimWeaponHandsPresentationActive(bool active);

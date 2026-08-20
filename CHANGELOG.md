@@ -1,6 +1,31 @@
 # Changelog
 
-## v0.2.0-beta — San Andreas VR Definitive Edition Latest Beta
+## v0.3.0-beta — Motion Throwables and Independent Akimbo
+
+This beta adds two of the largest interaction upgrades yet while preserving GTA's native combat ownership wherever it matters.
+
+### Physics-based grenades and Molotovs
+
+- Added controller-momentum physical throwing for grenades and Molotovs: grip, swing, and release without using the native trigger curve.
+- Kept the visible bottle/grenade flight custom and responsive while handing the resolved impact point to GTA's native explosion lifecycle.
+- Restored native Molotov fire, spreading ground flames, damage, sound, smoke, reactions, and vehicle/ped effects at the custom impact location.
+- Added grenade-specific launch speed and native explosion behavior, with Molotovs tuned slightly slower but still easy to throw naturally.
+- Added impact collision handling, rapid re-arm, visibility/lifecycle cleanup, and death/respawn restoration without reintroducing native animated-hand artifacts.
+
+### Independent VR akimbo
+
+- Added custom akimbo support for Pistol, Sawn-off Shotgun, Micro Uzi, and Tec-9.
+- Both guns are controller-driven rather than attaching one side to CJ's native body animation.
+- Each physical trigger owns its corresponding hand, aim ray, accepted shot, visible muzzle, smoke, and presentation sequence.
+- Native GTA ammo, damage, weapon cadence, audio, and impact handling remain authoritative.
+- Corrected first-grip native-model flashes, one-sided muzzle effects, pistol flash-size imbalance, and Micro Uzi/Tec-9 muzzle placement.
+
+### Release polish
+
+- Preserved the animated/clenched split-hand assets, launch race guard, A+X settings guard, physical melee/audio refinements, magnetic holsters, and tested graphics/profile settings from the preceding candidate.
+- Updated the control guide, feature documentation, release staging, and stable-name package metadata for v0.3.
+
+## v0.2.0-beta — San Andreas VR Definitive Edition Beta
 
 This beta brings the tested interaction, presentation, control, graphics, and packaging improvements together in one easier-to-install release.
 

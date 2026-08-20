@@ -31,6 +31,7 @@ local sections = {
         title = "VR CONTROLS",
         flags = {
             { key = "EnableDualGripAimFire", label = "Side-matched grip aim and trigger fire [Recommended]" },
+			{ key = "EnableCustomAkimbo", label = "Independent per-hand akimbo firing [Experimental]" },
             { key = "EnableAlternateWeaponHandsVisibility", label = "Hide idle weapon and aiming hands [Recommended]" },
             { key = "EnableTwoHandStabilization", label = "Two-hand weapon stabilization" },
             { key = "EnableGripCalibration", label = "Weapon hand-placement calibration" },
@@ -73,6 +74,7 @@ local values = {
     EnableBulletDamageResistance = true,
     EnableAimAlignment = true,
     EnableDualGripAimFire = true,
+	EnableCustomAkimbo = false,
     EnableAlternateWeaponHandsVisibility = true,
     EnableTwoHandStabilization = false,
     EnableGripCalibration = false,

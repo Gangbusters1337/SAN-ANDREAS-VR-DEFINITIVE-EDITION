@@ -6,6 +6,8 @@
 - Per-weapon, per-hand grip calibration records.
 - Two-hand long-gun support with independently calibrated primary and barrel hands.
 - Left- and right-hand weapon presentation, one-hand firing, recoil handling, and magnetic waist storage.
+- Independent custom akimbo for Pistol, Sawn-off Shotgun, Micro Uzi, and Tec-9, with separate hand intent, visible muzzles, traces, and effects while native ammo/damage/cadence remain authoritative.
+- Controller-momentum grenade and Molotov throwing with custom visible flight and native GTA impact explosions, fire, damage, sound, and reactions.
 - Dynamic front-waist weapon release placement with per-weapon recall.
 - VR sniper scope with a repositioned scope lens and stabilized two-hand handling.
 - Compact reticle and optional aim/combat-assistance settings.
@@ -50,3 +52,4 @@
 - Alternate left-handed input modes.
 - Additional body visibility and clipping controls.
 - Experimental diagnostics and calibration probes (disabled by default).
+- Native Molotov throw A/B mode and throwable diagnostics (disabled by default).

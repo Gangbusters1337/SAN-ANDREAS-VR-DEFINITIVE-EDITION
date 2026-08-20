@@ -23,7 +23,9 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Pull either trigger to fire an ordinary firearm. The held grip/trigger selects the active side.
 - Grips are weapon ownership/presentation controls; they do not cycle weapons.
 - Left Quest X cycles to the next weapon. It emits one bounded native cycle pulse and consumes the X hold.
-- Grenades, tear gas, and Molotovs retain GTA's native cook/throw interaction.
+- Grenades and Molotovs: hold either grip to take ownership, move the controller naturally, and release the grip to throw with hand momentum. No trigger is required.
+- Tear gas, satchel charges, and the detonator retain GTA's native interaction.
+- Pistol, Sawn-off Shotgun, Micro Uzi, and Tec-9 support independent akimbo when the option is enabled: grip each weapon and use that hand's trigger to fire its own side.
 
 ## On foot: fists and melee
 

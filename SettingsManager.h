@@ -35,6 +35,9 @@ public:
 	bool enableBodyVisibility = true;
 	bool enableBulletTraceHidden = true;
 	bool enableDualGripAimFire = true;
+	// Experimental: independent left/right firing requests routed through GTA's
+	// native per-hand FireGun boundary while keeping one authoritative inventory.
+	bool enableCustomAkimbo = false;
 	bool enableTwoHandStabilization = false;
 	bool enableAlternateWeaponHandsVisibility = true;
 	bool enableFreeAimWeaponHands = false;
@@ -53,6 +56,22 @@ public:
 	bool enableVehicleFaceButtonFire = true;
 	bool enableAircraftNativeControls = true;
 	bool enableR3LeftStickDpad = false;
+	// Experimental Molotov-only grip-release proxy flight and impact probe.
+	// Grenades and tear gas remain on GTA's native path for this iteration.
+	bool enableMotionThrowables = true;
+	// Additional passive release/pose instrumentation. Native explosion, ammo,
+	// damage, crime and mission state remain unchanged by the prototype.
+	bool enableThrowableMotionProbe = false;
+	// A/B test: let GTA own the complete Molotov throw path instead of the
+	// experimental grip-release motion flight. Other throwable behavior is
+	// unchanged.
+	bool enableNativeMolotovMode = false;
+	// Basic fallback feedback for confirmed motion-melee contacts. Native GTA
+	// surface-aware collision audio remains authoritative when it is available.
+	bool enableMotionMeleeImpactAudio = true;
+	// Begin GTA's ordinary firearm ready task while a physical weapon grip is
+	// held, so the first trigger press does not pay the full stance transition.
+	bool enableFireTaskPrewarm = true;
 	bool debugInputLayerProbe = false;
 	bool enableShowUiAtStartup = true;
 	bool enableHudHiddenByDefault = true;

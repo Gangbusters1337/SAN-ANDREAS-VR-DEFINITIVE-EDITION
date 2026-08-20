@@ -12,7 +12,7 @@ if (Test-Path -LiteralPath $test) { Remove-Item -LiteralPath $test -Recurse -For
 New-Item -ItemType Directory -Force -Path $test | Out-Null
 
 $installerExtract = Join-Path $test "installer-extracted"
-Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-v0.1-Installer.zip") -DestinationPath $installerExtract
+Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-Installer.zip") -DestinationPath $installerExtract
 $installer = Get-ChildItem -LiteralPath $installerExtract -Recurse -Filter "Install-SAVR.ps1" | Select-Object -First 1
 if (-not $installer) { throw "Installer script missing from archive." }
 
@@ -35,6 +35,14 @@ function Test-Installer([string]$Name, [string]$Mode) {
     if ($LASTEXITCODE -ne 0) { throw "$Mode installer test failed." }
 
     $payload = Join-Path $installer.DirectoryName "Payload"
+    $guardedLauncher = Join-Path $profile "SAVR-Launch.ps1"
+    if (-not (Test-Path -LiteralPath $guardedLauncher -PathType Leaf)) {
+        throw "Missing $Mode guarded launcher."
+    }
+    $launcherText = Get-Content -LiteralPath $guardedLauncher -Raw
+    if ($launcherText -notmatch 'SAVR_SanAndreas_SingleLaunch' -or $launcherText -notmatch 'SAVR-last-launch') {
+        throw "$Mode guarded launcher is missing its single-instance or settings-recovery protection."
+    }
     foreach ($pair in @(
         @{ Source = Join-Path $payload "UnrealVRMod\SanAndreas"; Target = $profile },
         @{ Source = Join-Path $payload "GameFolder"; Target = $game }
@@ -76,7 +84,7 @@ Test-Installer "auto" "Auto"
 Test-Installer "manual" "Manual"
 
 $manualExtract = Join-Path $test "manual-extracted"
-Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-v0.1-Manual.zip") -DestinationPath $manualExtract
+Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-Manual.zip") -DestinationPath $manualExtract
 $sumFile = Get-ChildItem -LiteralPath $manualExtract -Recurse -Filter "SHA256SUMS.txt" | Select-Object -First 1
 if (-not $sumFile) { throw "Manual package checksum manifest missing." }
 $root = $sumFile.DirectoryName
@@ -87,3 +95,16 @@ foreach ($line in Get-Content -LiteralPath $sumFile.FullName) {
     if ((Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Manual checksum mismatch: $($Matches[2])" }
 }
 Write-Host "Manual archive manifest PASS"
+
+$expectedVersion = (Get-Content -LiteralPath (Join-Path $RepoRoot "RELEASE_VERSION.txt") -Raw).Trim()
+foreach ($archiveRoot in @($root, $installer.DirectoryName)) {
+    $versionFile = Join-Path $archiveRoot "VERSION.txt"
+    if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) { throw "Package VERSION.txt missing: $archiveRoot" }
+    if (-not (Select-String -LiteralPath $versionFile -SimpleMatch "Version: $expectedVersion" -Quiet)) {
+        throw "Package version mismatch in $versionFile"
+    }
+    if (-not (Select-String -LiteralPath $versionFile -SimpleMatch "UEVR_GTASADE.dll SHA-256:" -Quiet)) {
+        throw "Plugin hash missing from $versionFile"
+    }
+}
+Write-Host "Stable package names and VERSION.txt PASS"

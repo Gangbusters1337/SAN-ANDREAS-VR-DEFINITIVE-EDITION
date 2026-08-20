@@ -226,10 +226,53 @@ try {
         $desktop = [Environment]::GetFolderPath("Desktop")
         $shell = New-Object -ComObject WScript.Shell
         $gameExe = Join-Path $GamePath "Gameface\Binaries\Win64\SanAndreas.exe"
-        $gameShortcut = $shell.CreateShortcut((Join-Path $desktop "GTA San Andreas DE VR.lnk"))
-        $gameShortcut.TargetPath = $gameExe
-        $gameShortcut.WorkingDirectory = Split-Path -Parent $gameExe
-        $gameShortcut.Save()
+        $guardedLauncher = Join-Path $ProfilePath "SAVR-Launch.ps1"
+        if (-not (Test-Path -LiteralPath $guardedLauncher -PathType Leaf)) {
+            throw "Guarded launcher is missing: $guardedLauncher"
+        }
+        $powershellExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        function Set-GuardedGameShortcut([string]$ShortcutPath, [string]$OriginalArguments = "") {
+            $shortcut = $shell.CreateShortcut($ShortcutPath)
+            $shortcut.TargetPath = $powershellExe
+            $escapedOriginalArguments = $OriginalArguments.Replace('"', '`"')
+            $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$guardedLauncher`" -GameExe `"$gameExe`""
+            if (-not [string]::IsNullOrWhiteSpace($escapedOriginalArguments)) {
+                $shortcut.Arguments += " -GameArguments `"$escapedOriginalArguments`""
+            }
+            $shortcut.WorkingDirectory = Split-Path -Parent $gameExe
+            $shortcut.IconLocation = "$gameExe,0"
+            $shortcut.Save()
+        }
+
+        Set-GuardedGameShortcut (Join-Path $desktop "GTA San Andreas DE VR.lnk")
+        $startMenuFolder = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs"
+        New-Item -ItemType Directory -Force -Path $startMenuFolder | Out-Null
+        Set-GuardedGameShortcut (Join-Path $startMenuFolder "GTA San Andreas DE VR.lnk")
+
+        # Retarget existing user-owned desktop, Start-menu and taskbar links that
+        # point to this exact executable. This also upgrades an older raw-EXE pin.
+        $shortcutFolders = @(
+            [Environment]::GetFolderPath("Desktop"),
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),
+            (Join-Path $env:APPDATA "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar")
+        ) | Select-Object -Unique
+        foreach ($shortcutFolder in $shortcutFolders) {
+            if (-not (Test-Path -LiteralPath $shortcutFolder -PathType Container)) { continue }
+            foreach ($shortcutFile in Get-ChildItem -LiteralPath $shortcutFolder -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue) {
+                try {
+                    $existingShortcut = $shell.CreateShortcut($shortcutFile.FullName)
+                    $existingTarget = [Environment]::ExpandEnvironmentVariables($existingShortcut.TargetPath)
+                    $targetsInstalledGame = -not [string]::IsNullOrWhiteSpace($existingTarget) `
+                        -and [IO.Path]::GetFullPath($existingTarget) -ieq [IO.Path]::GetFullPath($gameExe)
+                    if ($targetsInstalledGame) {
+                        Set-GuardedGameShortcut $shortcutFile.FullName $existingShortcut.Arguments
+                    }
+                }
+                catch {
+                    Write-Warning "Could not protect shortcut: $($shortcutFile.FullName)"
+                }
+            }
+        }
         $settings = Join-Path $ProfilePath "SAImprovedSettings\SA-Improved-Settings.bat"
         if (Test-Path -LiteralPath $settings) {
             $settingsShortcut = $shell.CreateShortcut((Join-Path $desktop "SA Improved Settings.lnk"))
@@ -240,7 +283,8 @@ try {
     }
 
     Write-Step "Installation complete"
-    Write-Host "Launch GTA San Andreas DE, then inject UEVR using OpenXR." -ForegroundColor Green
+    Write-Host "Use the GTA San Andreas DE VR desktop shortcut; it blocks accidental duplicate game instances." -ForegroundColor Green
+    Write-Host "Then inject UEVR using OpenXR." -ForegroundColor Green
     exit 0
 }
 catch {

@@ -160,6 +160,7 @@ void SettingsManager::FetchPluginSettings()
 	enableBodyVisibility = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableBodyVisibility", true);
 	enableBulletTraceHidden = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableBulletTraceHidden", true);
 	enableDualGripAimFire = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableDualGripAimFire", true);
+	enableCustomAkimbo = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableCustomAkimbo", false);
 	enableTwoHandStabilization = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableTwoHandStabilization", false);
 	enableAlternateWeaponHandsVisibility = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableAlternateWeaponHandsVisibility", true);
 	enableFreeAimWeaponHands = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableFreeAimWeaponHands", false);
@@ -176,6 +177,11 @@ void SettingsManager::FetchPluginSettings()
 	enableVehicleFaceButtonFire = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableVehicleFaceButtonFire", true);
 	enableAircraftNativeControls = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableAircraftNativeControls", true);
 	enableR3LeftStickDpad = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableR3LeftStickDpad", false);
+	enableMotionThrowables = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableMotionThrowables", true);
+	enableThrowableMotionProbe = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableThrowableMotionProbe", false);
+	enableNativeMolotovMode = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableNativeMolotovMode", false);
+	enableMotionMeleeImpactAudio = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableMotionMeleeImpactAudio", true);
+	enableFireTaskPrewarm = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableFireTaskPrewarm", true);
 	debugInputLayerProbe = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "DebugInputLayerProbe", false);
 	enableHudHiddenByDefault = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableHudHiddenByDefault", true);
 	enableShowUiAtStartup = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableShowUiAtStartup", !enableHudHiddenByDefault);
@@ -254,6 +260,7 @@ void SettingsManager::EnsureVisibleFeatureFlagConfigValues()
 	addIfMissing("EnableCompactWeaponReticle", enableCompactWeaponReticle);
 	addIfMissing("EnableBulletTraceHidden", enableBulletTraceHidden);
 	addIfMissing("EnableDualGripAimFire", enableDualGripAimFire);
+	addIfMissing("EnableCustomAkimbo", enableCustomAkimbo);
 	addIfMissing("EnableTwoHandStabilization", enableTwoHandStabilization);
 	addIfMissing("EnableAlternateWeaponHandsVisibility", enableAlternateWeaponHandsVisibility);
 	addIfMissing("EnableFreeAimWeaponHands", enableFreeAimWeaponHands);
@@ -264,6 +271,11 @@ void SettingsManager::EnsureVisibleFeatureFlagConfigValues()
 	addIfMissing("EnableChordHudToggle", enableChordHudToggle);
 	addIfMissing("EnableVehicleFaceButtonFire", enableVehicleFaceButtonFire);
 	addIfMissing("EnableAircraftNativeControls", enableAircraftNativeControls);
+	addIfMissing("EnableMotionThrowables", enableMotionThrowables);
+	addIfMissing("EnableThrowableMotionProbe", enableThrowableMotionProbe);
+	addIfMissing("EnableNativeMolotovMode", enableNativeMolotovMode);
+	addIfMissing("EnableMotionMeleeImpactAudio", enableMotionMeleeImpactAudio);
+	addIfMissing("EnableFireTaskPrewarm", enableFireTaskPrewarm);
 	addIfMissing("EnablePauseUiAutoShow", enablePauseUiAutoShow);
 	addIfMissing("EnableHudAutoHide", enableHudAutoHide);
 	addIfMissing("EnableShowUiAtStartup", enableShowUiAtStartup);
@@ -313,6 +325,7 @@ void SettingsManager::DispatchFeatureFlagsToLua() const
 	dispatchFlag("EnableNativeShotOriginRedirects", enableNativeShotOriginRedirects, true);
 	dispatchFlag("EnableBulletTraceHidden", enableBulletTraceHidden, false);
 	dispatchFlag("EnableDualGripAimFire", enableDualGripAimFire, true);
+	dispatchFlag("EnableCustomAkimbo", enableCustomAkimbo, true);
 	dispatchFlag("EnableTwoHandStabilization", enableTwoHandStabilization, true);
 	dispatchFlag("EnableAlternateWeaponHandsVisibility", enableAlternateWeaponHandsVisibility, true);
 	dispatchFlag("EnableFreeAimWeaponHands", enableFreeAimWeaponHands, true);
@@ -329,6 +342,10 @@ void SettingsManager::DispatchFeatureFlagsToLua() const
 	dispatchFlag("EnableVehicleFaceButtonFire", enableVehicleFaceButtonFire, true);
 	dispatchFlag("EnableAircraftNativeControls", enableAircraftNativeControls, true);
 	dispatchFlag("EnableR3LeftStickDpad", enableR3LeftStickDpad, true);
+	dispatchFlag("EnableMotionThrowables", enableMotionThrowables, true);
+	dispatchFlag("EnableThrowableMotionProbe", enableThrowableMotionProbe, true);
+	dispatchFlag("EnableNativeMolotovMode", enableNativeMolotovMode, true);
+	dispatchFlag("EnableFireTaskPrewarm", enableFireTaskPrewarm, true);
 	dispatchFlag("DebugInputLayerProbe", debugInputLayerProbe, true);
 	dispatchFlag("EnableShowUiAtStartup", enableShowUiAtStartup, true);
 }
@@ -565,6 +582,11 @@ bool SettingsManager::SetFeatureFlagFromUi(const std::string& name, bool value, 
 		liveApply = true;
 		SetBoolValueToFile(pluginConfigFilePath, "EnableDualGripAimFire", value);
 	}
+	else if (name == "EnableCustomAkimbo") {
+		enableCustomAkimbo = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableCustomAkimbo", value);
+	}
 	else if (name == "EnableTwoHandStabilization") {
 		enableTwoHandStabilization = value;
 		liveApply = true;
@@ -644,6 +666,31 @@ bool SettingsManager::SetFeatureFlagFromUi(const std::string& name, bool value, 
 		enableR3LeftStickDpad = value;
 		liveApply = true;
 		SetBoolValueToFile(pluginConfigFilePath, "EnableR3LeftStickDpad", value);
+	}
+	else if (name == "EnableMotionThrowables") {
+		enableMotionThrowables = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableMotionThrowables", value);
+	}
+	else if (name == "EnableThrowableMotionProbe") {
+		enableThrowableMotionProbe = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableThrowableMotionProbe", value);
+	}
+	else if (name == "EnableNativeMolotovMode") {
+		enableNativeMolotovMode = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableNativeMolotovMode", value);
+	}
+	else if (name == "EnableMotionMeleeImpactAudio") {
+		enableMotionMeleeImpactAudio = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableMotionMeleeImpactAudio", value);
+	}
+	else if (name == "EnableFireTaskPrewarm") {
+		enableFireTaskPrewarm = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableFireTaskPrewarm", value);
 	}
 	else if (name == "EnableShowUiAtStartup") {
 		enableShowUiAtStartup = value;
@@ -728,6 +775,7 @@ void SettingsManager::WriteFeatureFlagStatus(const std::string& reason)
 	writeFlag("EnableCameraProfiles", enableCameraProfiles, enableCameraProfiles, "LiveOnConfigReload", "VR comfort and camera", "Camera profiles");
 	writeFlag("EnableBodyVisibility", enableBodyVisibility, enableBodyVisibility, "LiveOnConfigReload", "VR comfort and camera", "Body visibility");
 	writeFlag("EnableDualGripAimFire", enableDualGripAimFire, enableDualGripAimFire, "LiveOnConfigReload", "VR controls", "Dual grip aim/fire");
+	writeFlag("EnableCustomAkimbo", enableCustomAkimbo, enableCustomAkimbo, "LiveOnConfigReload", "VR controls", "Independent per-hand akimbo firing [experimental]");
 	writeFlag("EnableTwoHandStabilization", enableTwoHandStabilization, enableTwoHandStabilization, "LiveOnConfigReload", "Core combat feel", "Two-hand long-gun stabilization [experimental]");
 	writeFlag("EnableAlternateWeaponHandsVisibility", enableAlternateWeaponHandsVisibility, enableAlternateWeaponHandsVisibility, "LiveOnConfigReload", "VR controls", "Alternate hands/weapon visibility");
 	writeFlag("EnableFreeAimWeaponHands", enableFreeAimWeaponHands, enableFreeAimWeaponHands, "LiveOnConfigReload", "VR controls", "Animated hands attached to controllers for unarmed and controller-driven weapons [experimental]");
@@ -744,6 +792,11 @@ void SettingsManager::WriteFeatureFlagStatus(const std::string& reason)
 	writeFlag("EnableVehicleFaceButtonFire", enableVehicleFaceButtonFire, enableVehicleFaceButtonFire, "LiveOnConfigReload", "VR controls", "Vehicle live-lap weapon on right controller [ordinary driving prototype]");
 	writeFlag("EnableAircraftNativeControls", enableAircraftNativeControls, enableAircraftNativeControls, "LiveOnConfigReload", "VR controls", "Aircraft native controls [recommended on, experimental]");
 	writeFlag("EnableR3LeftStickDpad", enableR3LeftStickDpad, enableR3LeftStickDpad, "LiveOnConfigReload", "VR controls", "R3 + left stick D-pad [experimental]");
+	writeFlag("EnableMotionThrowables", enableMotionThrowables, enableMotionThrowables, "LiveOnConfigReload", "Core combat feel", "Grip-release grenade/Molotov physical flight with DE-native impact lifecycle [experimental]");
+	writeFlag("EnableThrowableMotionProbe", enableThrowableMotionProbe, enableThrowableMotionProbe, "LiveOnConfigReload", "Diagnostics", "Passive Molotov release and momentum probe");
+	writeFlag("EnableNativeMolotovMode", enableNativeMolotovMode, enableNativeMolotovMode, "LiveOnConfigReload", "Core combat feel", "Use GTA's native Molotov throw path instead of custom motion flight [A/B test]");
+	writeFlag("EnableMotionMeleeImpactAudio", enableMotionMeleeImpactAudio, enableMotionMeleeImpactAudio, "LiveOnConfigReload", "Core combat feel", "Basic ped/vehicle motion-melee impact audio");
+	writeFlag("EnableFireTaskPrewarm", enableFireTaskPrewarm, enableFireTaskPrewarm, "LiveOnConfigReload", "Core combat feel", "Prewarm native firearm task while gripping for faster first shot");
 	writeFlag("DebugInputLayerProbe", debugInputLayerProbe, debugInputLayerProbe, "LiveOnConfigReload", "Diagnostics", "Control stack input log");
 	writeFlag("EnableShowUiAtStartup", enableShowUiAtStartup, activeShowUiAtStartup, "RestartOrReinject", "HUD and camera", "Show HUD when game starts");
 	writeFlag("EnableBulletTraceHidden", enableBulletTraceHidden, activeBulletTraceHidden, "RestartOrReinject", "Restart/reinject required", "Hide bullet trace");
@@ -1200,6 +1253,7 @@ bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& file
 			"EnableCompactWeaponReticle=true\n"
 			"EnableVrScope=true\n"
 			"EnableDualGripAimFire=true\n"
+			"EnableCustomAkimbo=false\n"
 			"EnableTwoHandStabilization=false\n"
 			"EnableAlternateWeaponHandsVisibility=true\n"
 			"EnableFreeAimWeaponHands=false\n"
@@ -1213,6 +1267,11 @@ bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& file
 			"EnableFirstPersonCameraLock=true\n"
 			"EnableVehicleFaceButtonFire=true\n"
 			"EnableAircraftNativeControls=true\n"
+			"EnableMotionThrowables=true\n"
+			"EnableThrowableMotionProbe=false\n"
+			"EnableNativeMolotovMode=false\n"
+			"EnableMotionMeleeImpactAudio=true\n"
+			"EnableFireTaskPrewarm=true\n"
 			"EnableShowUiAtStartup=true\n"
 			"EnableCameraProfiles=true\n"
 			"EnableBodyVisibility=true\n"

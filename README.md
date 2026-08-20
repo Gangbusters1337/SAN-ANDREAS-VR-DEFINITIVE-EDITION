@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.2** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -15,6 +15,8 @@ The included profile is tuned for sharp visuals and good performance, with plent
 The big difference is how physical the game feels:
 
 - **All aimable weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
+- **Independent VR akimbo:** dual-wield supported pistols, sawn-off shotguns, Micro Uzis, and Tec-9s with separate trigger, muzzle, and aim ownership for each hand.
+- **Physics-based throwables:** grip and physically throw grenades and Molotovs with controller momentum while GTA retains the native explosion, fire, damage, sound, and reaction package at impact.
 - **Two-handed aiming and stabilization:** grip rifles and shotguns with both hands, steady the rear grip, and use the forward hand to guide the barrel.
 - **Animated VR hands:** controller-tracked open, grip, trigger, and clenched-hand poses keep the hands feeling connected to what you are doing.
 - **Refined, accurate melee:** swing bats and melee weapons, punch with either fist, and fight with a melee weapon in one hand while the other hand fights freely.
@@ -38,17 +40,16 @@ This is still beta software, so back up your existing UEVR `SanAndreas` profile 
 
 ## Downloads
 
-The latest release has separate downloads for VRHub and regular users:
+The release uses stable download names so links do not change between updates:
 
-- **`San-Andreas-VR-DE-v0.2-LATEST-Manual.zip`** - versioned manual download.
-- **`San-Andreas-VR-DE-v0.2-LATEST-Installer.zip`** - versioned installer with `Auto Detect` and `Manual Path` modes.
-- **`San-Andreas-VR-DE-Manual.zip`** - plain manual filename for VRHub automation.
+- **`San-Andreas-VR-DE-Manual.zip`** - manual installation and VRHub automation.
+- **`San-Andreas-VR-DE-Installer.zip`** - installer with `Auto Detect` and `Manual Path` modes.
 
 Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA256SUMS.txt` covers every packaged file.
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3 change list.
 
 ## What you get in VR
 
@@ -57,6 +58,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 - **All aimable weapons are motion tracked:** point, aim, and fire with your controllers instead of dragging a flat-screen crosshair around.
 - **Two-handed aiming and stabilization:** grip rifles, shotguns, and other long weapons with both hands and steady the rear grip while the forward hand guides the barrel.
 - **Animated controller-tracked hands:** open, grip, trigger, and clenched-hand poses follow what you are actually doing.
+- **Independent akimbo:** Pistol, Sawn-off Shotgun, Micro Uzi, and Tec-9 can be held and fired independently in both hands with per-hand aim and muzzle presentation.
+- **Motion throwables:** physically throw grenades and Molotovs from either controller; hand momentum drives the visible flight and GTA supplies the native explosion, fire, damage, audio, and world reactions at impact.
 - **Refined physical melee:** fists, brass knuckles, bats, and melee weapons support independent left/right hand fighting, including a melee weapon in one hand and a fist in the other.
 - **Punch and melee weapon sound FX:** clear contact feedback for fists, knuckles, blunt weapons, sharp weapons, and vehicle impacts.
 - **Natural holsters:** drop weapons into lowered magnetic waist positions, keep their remembered per-weapon placement, and regrip without losing the correct hand relationship.
@@ -79,7 +82,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.2 change list.
 - **Sharper high-definition VR:** improved textures, scope and reticle clarity, cleaner effects, better muzzle flashes, and graphics settings with headroom for stronger PCs.
 - **Installer safety:** Auto Detect and Manual Path modes, OneDrive-aware profile handling, backups, guarded single-instance launching, and package hashes help protect existing settings.
 
-Physical grenade/Molotov throwing is not enabled in this beta; throwables retain GTA's native handling while the motion implementation remains under development.
+Physical grenade and Molotov throwing is enabled in this beta. Tear gas, satchel charges, and the detonator remain on their native GTA paths.
 
 ## Installer
 
@@ -170,7 +173,7 @@ The same full-resolution layout is included under `Documentation` and in the UEV
 3. The included profile, bindings, plugin, and Lua scripts load automatically.
 4. Use the separate SA Improved Settings utility for optional and experimental flags.
 
-See [CONTROLS.md](CONTROLS.md), [FEATURES.md](FEATURES.md), and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+See [CONTROLS.md](CONTROLS.md) and [FEATURES.md](FEATURES.md).
 
 ## Questions and bug reports
 

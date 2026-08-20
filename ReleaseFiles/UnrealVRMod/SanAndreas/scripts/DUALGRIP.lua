@@ -49,6 +49,26 @@ local vehicleFaceFireLastProofAt = -math.huge
 local VEHICLE_FACE_FIRE_PROOF_INTERVAL_SECONDS = 0.5
 local enableAircraftNativeControls = true
 local enableR3LeftStickDpad = false
+local enableMotionThrowables = true
+local enableThrowableMotionProbe = false
+local enableNativeMolotovMode = false
+-- Keep all throwable probe/pulse state in one table. UEVR's Lua runtime limits
+-- the main chunk to 200 locals; adding the motion-throwable diagnostics had
+-- pushed this script to 201 even though the states are logically one feature.
+local motionThrowableState = {
+    nativePulseSequence = 0,
+    probeSequence = 0,
+    probeActive = false,
+    probeStartedAt = nil,
+    probePreviousGripMask = 0,
+    probeLeftTriggerSeen = false,
+    probeRightTriggerSeen = false,
+    probeNativeTriggerSeen = false,
+    probeLeftGripSeen = false,
+    probeRightGripSeen = false,
+}
+local enableFireTaskPrewarm = false
+local fireTaskPrewarmActive = false
 -- The C++ XInput layer owns this remap now. Keep the old Lua implementation
 -- disabled so it cannot duplicate or overwrite the final synthetic pulse.
 local enableDualGripDpad = false
@@ -105,6 +125,7 @@ local controlGuideVisible = false
 local controlGuideInputArmed = false
 local controlGuideStickLatched = false
 local controlGuideToggleHeld = false
+local controlGuideTogglePending = false
 local chordPauseHeldLastFrame = false
 local chordPausePulseUntil = nil
 local chordPauseCaptureUntil = nil
@@ -117,7 +138,17 @@ local VEHICLE_PAUSE_CHORD_WINDOW_SECONDS = 0.07
 local VEHICLE_SINGLE_BUTTON_REPLAY_SECONDS = 0.08
 local lastInputProbeSignature = nil
 local previousFireInputHeld = false
+local previousGateFireHeld = false
+local semiAutoBufferUntil = nil
+local SEMI_AUTO_BUFFER_SECONDS = 0.35
 local triggerTimingSequence = 0
+SAVRCustomAkimboInput = SAVRCustomAkimboInput or {
+	enabled = false,
+	leftHeld = false,
+    rightHeld = false,
+    lastHeldMask = -1,
+    lastWeapon = -1
+}
 local LEFT_SYSTEM_SHORT_PRESS_SECONDS = 0.35
 local DPAD_STICK_THRESHOLD = 16000
 local DPAD_STICK_RELEASE_THRESHOLD = 8000
@@ -345,6 +376,112 @@ local function dispatch_trigger_timing(eventType, sequence, side, weapon, aimReq
     elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
         uevr.params.functions.dispatch_custom_event("DUALGRIP.TriggerTiming", payload)
     end
+end
+
+dispatch_akimbo_input = function(heldMask, edgeMask, weapon)
+    local payload = string.format("held=%d;edge=%d;weapon=%d",
+        tonumber(heldMask) or 0, tonumber(edgeMask) or 0, tonumber(weapon) or -1)
+    if uevr and uevr.api and uevr.api.dispatch_custom_event then
+        uevr.api:dispatch_custom_event("DUALGRIP.AkimboInput", payload)
+    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
+        uevr.params.functions.dispatch_custom_event("DUALGRIP.AkimboInput", payload)
+    end
+end
+
+local function dispatch_throwable_probe(eventType, sequence, handMask, gripMask, holdMilliseconds, now)
+    local payload = string.format(
+        "type=%s;seq=%d;hands=%d;grips=%d;holdms=%d;weapon=%d;lua=%.6f",
+        eventType,
+        tonumber(sequence) or 0,
+        tonumber(handMask) or 0,
+        tonumber(gripMask) or 0,
+        tonumber(holdMilliseconds) or 0,
+        tonumber(currentWeaponId) or 0,
+        tonumber(now) or 0.0)
+    if uevr and uevr.api and uevr.api.dispatch_custom_event then
+        uevr.api:dispatch_custom_event("DUALGRIP.ThrowableProbe", payload)
+    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
+        uevr.params.functions.dispatch_custom_event("DUALGRIP.ThrowableProbe", payload)
+    end
+end
+
+local function reset_throwable_probe_state()
+    motionThrowableState.probeActive = false
+    motionThrowableState.probeStartedAt = nil
+    motionThrowableState.probePreviousGripMask = 0
+    motionThrowableState.probeLeftTriggerSeen = false
+    motionThrowableState.probeRightTriggerSeen = false
+    motionThrowableState.probeNativeTriggerSeen = false
+    motionThrowableState.probeLeftGripSeen = false
+    motionThrowableState.probeRightGripSeen = false
+end
+
+local function update_throwable_probe(buttons, nativeTriggerHeld, now)
+    if (enableNativeMolotovMode and currentWeaponId == 18)
+        or (not enableMotionThrowables and not enableThrowableMotionProbe)
+        or (currentWeaponId ~= 16 and currentWeaponId ~= 18) then
+        reset_throwable_probe_state()
+        return
+    end
+	-- Lua's weapon event can lag the engine weapon state, so do not use it as the
+	-- throwable authority. C++ accepts an edge only when the engine-thread weapon
+	-- is exactly 16..18; this layer only suppresses non-gameplay contexts.
+	if not playerInputEnabled or isPlayerDriving or isPlayerAircraft then
+		if motionThrowableState.probeActive then
+			local handMask = (motionThrowableState.probeLeftGripSeen and 1 or 0)
+				+ (motionThrowableState.probeRightGripSeen and 2 or 0)
+			local gripMask = (motionThrowableState.probeLeftGripSeen and 1 or 0)
+				+ (motionThrowableState.probeRightGripSeen and 2 or 0)
+			dispatch_throwable_probe(
+				"cancel", motionThrowableState.probeSequence, handMask, gripMask, 0, now)
+		end
+		reset_throwable_probe_state()
+		return
+	end
+
+    local leftGripHeld = has_button(buttons, LEFT_SHOULDER)
+    local rightGripHeld = has_button(buttons, RIGHT_SHOULDER)
+    local gripMask = (leftGripHeld and 1 or 0) + (rightGripHeld and 2 or 0)
+
+    if not motionThrowableState.probeActive and motionThrowableState.probePreviousGripMask == 0 and gripMask ~= 0 then
+        motionThrowableState.probeSequence = motionThrowableState.probeSequence + 1
+        motionThrowableState.probeActive = true
+        motionThrowableState.probeStartedAt = now
+        motionThrowableState.probeLeftTriggerSeen = false
+        motionThrowableState.probeRightTriggerSeen = false
+        motionThrowableState.probeNativeTriggerSeen = nativeTriggerHeld
+        motionThrowableState.probeLeftGripSeen = leftGripHeld
+        motionThrowableState.probeRightGripSeen = rightGripHeld
+        dispatch_throwable_probe(
+            "edge",
+            motionThrowableState.probeSequence,
+            gripMask,
+            gripMask,
+            0,
+            now)
+    elseif motionThrowableState.probeActive then
+        motionThrowableState.probeNativeTriggerSeen = motionThrowableState.probeNativeTriggerSeen or nativeTriggerHeld
+        motionThrowableState.probeLeftGripSeen = motionThrowableState.probeLeftGripSeen or leftGripHeld
+        motionThrowableState.probeRightGripSeen = motionThrowableState.probeRightGripSeen or rightGripHeld
+        if gripMask == 0 and motionThrowableState.probePreviousGripMask ~= 0 then
+            local handMask = (motionThrowableState.probeLeftGripSeen and 1 or 0)
+                + (motionThrowableState.probeRightGripSeen and 2 or 0)
+            local gripMask = (motionThrowableState.probeLeftGripSeen and 1 or 0)
+                + (motionThrowableState.probeRightGripSeen and 2 or 0)
+            local heldSeconds = motionThrowableState.probeStartedAt ~= nil
+                and math.max(0.0, now - motionThrowableState.probeStartedAt) or 0.0
+            -- A trigger-held Molotov is the native GTA path. Never let the
+            -- later grip release also launch a second custom bottle.
+            dispatch_throwable_probe(
+                motionThrowableState.probeNativeTriggerSeen and "cancel" or "release",
+                motionThrowableState.probeSequence, handMask, gripMask,
+                math.floor(heldSeconds * 1000.0 + 0.5), now)
+            reset_throwable_probe_state()
+            return
+        end
+    end
+
+    motionThrowableState.probePreviousGripMask = gripMask
 end
 
 local function dispatch_hud_toggle()
@@ -814,6 +951,7 @@ local function apply_chord_controls(state, buttons, now)
             controlGuideInputArmed = false
             controlGuideStickLatched = false
             controlGuideToggleHeld = true
+            controlGuideTogglePending = false
             dispatch_control_guide(controlGuideVisible)
             log_chord(controlGuideVisible and "A+X control guide opened" or "A+X control guide closed", now)
         end
@@ -840,7 +978,16 @@ local function apply_chord_controls(state, buttons, now)
                 controlGuideStickLatched = true
             end
             if guideToggleHeld and not controlGuideToggleHeld and not abHeld then
+                -- Commit option changes on A release. If X joins while A is
+                -- held, the A+X close chord cancels this pending selection.
+                controlGuideTogglePending = true
+            end
+            if abHeld then
+                controlGuideTogglePending = false
+            elseif controlGuideTogglePending and controlGuideToggleHeld
+                and not guideToggleHeld then
                 dispatch_control_guide_navigation("toggle")
+                controlGuideTogglePending = false
             end
             controlGuideToggleHeld = guideToggleHeld
         end
@@ -856,6 +1003,8 @@ local function apply_chord_controls(state, buttons, now)
         state.Gamepad.sThumbRY = 0
         return true
     end
+
+    controlGuideTogglePending = false
 
     if xyHeld then
         if chordPauseCaptureStartedAt ~= nil then
@@ -1136,6 +1285,7 @@ local function reset_dualgrip_state()
     leftGripCycleFireSeen = false
     cancel_held_visual_grace()
     clear_cycle_pulse()
+    fireTaskPrewarmActive = false
 end
 
 local function reset_phone_answer_state()
@@ -1272,15 +1422,61 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
     local buttons = state.Gamepad.wButtons
     log_input_layer(buttons, state)
     local now = os.clock()
-    local triggerTimingLeftTriggerHeld = state.Gamepad.bLeftTrigger > 30
-    local triggerTimingRightTriggerHeld = state.Gamepad.bRightTrigger > 30
+    local triggerTimingLeftTriggerValue = tonumber(state.Gamepad.bLeftTrigger) or 0
+    local triggerTimingRightTriggerValue = tonumber(state.Gamepad.bRightTrigger) or 0
+    -- This is already a shallow physical threshold (about 12% of XInput's
+    -- 0..255 range). Keep it below half travel; the first-shot delay is GTA's
+    -- cold fire task, not failure to recognize the physical trigger.
+    local triggerTimingLeftTriggerHeld = triggerTimingLeftTriggerValue > 30
+    local triggerTimingRightTriggerHeld = triggerTimingRightTriggerValue > 30
+	local customAkimboWeapon = currentWeaponId == 22 or currentWeaponId == 26
+		or currentWeaponId == 28 or currentWeaponId == 32
+	local customAkimboEligible = SAVRCustomAkimboInput.enabled
+		and customAkimboWeapon and playerInputEnabled
+		and not isPlayerDriving and not isPlayerAircraft
+		and has_button(buttons, LEFT_SHOULDER)
+		and has_button(buttons, RIGHT_SHOULDER)
+	local customAkimboLeftHeld = customAkimboEligible and triggerTimingLeftTriggerHeld
+	local customAkimboRightHeld = customAkimboEligible and triggerTimingRightTriggerHeld
+	-- Match CTaskSimpleUseGun's native flag layout: bit 0 is right, bit 1 is left.
+	local customAkimboHeldMask = (customAkimboRightHeld and 1 or 0)
+		+ (customAkimboLeftHeld and 2 or 0)
+	local customAkimboEdgeMask = (customAkimboRightHeld
+		and not SAVRCustomAkimboInput.rightHeld and 1 or 0)
+		+ (customAkimboLeftHeld and not SAVRCustomAkimboInput.leftHeld and 2 or 0)
+	if customAkimboEdgeMask ~= 0
+		or customAkimboHeldMask ~= SAVRCustomAkimboInput.lastHeldMask
+		or currentWeaponId ~= SAVRCustomAkimboInput.lastWeapon then
+		dispatch_akimbo_input(customAkimboHeldMask, customAkimboEdgeMask, currentWeaponId)
+		SAVRCustomAkimboInput.lastHeldMask = customAkimboHeldMask
+		SAVRCustomAkimboInput.lastWeapon = currentWeaponId
+	end
+	SAVRCustomAkimboInput.leftHeld = customAkimboLeftHeld
+	SAVRCustomAkimboInput.rightHeld = customAkimboRightHeld
+    update_throwable_probe(buttons, triggerTimingLeftTriggerHeld or triggerTimingRightTriggerHeld, now)
     local triggerTimingFireHeld = triggerTimingLeftTriggerHeld or triggerTimingRightTriggerHeld
 	local meleeClenchTiming = authoritativeMeleeTriggerBlock
 		or (currentWeaponId >= 0 and currentWeaponId <= 15)
+	local semiAutoGateWeapon = (currentWeaponId >= 22 and currentWeaponId <= 27)
+		or currentWeaponId == 33 or currentWeaponId == 34
 	local firingTriggerEdge = not meleeClenchTiming
-		and triggerTimingFireHeld and not previousFireInputHeld
-	local firingTriggerRelease = not meleeClenchTiming
-		and not triggerTimingFireHeld and previousFireInputHeld
+		and ((triggerTimingFireHeld and not previousFireInputHeld)
+			or (customAkimboEligible and customAkimboEdgeMask ~= 0))
+	if firingTriggerEdge and semiAutoGateWeapon and playerInputEnabled
+		and not isPlayerDriving and not isPlayerAircraft then
+		-- Retain only the newest unaccepted semi-auto pull for a short bounded
+		-- window. The native-shot observation clears its C++ permit; this Lua hold
+		-- merely lets a quick tap survive GTA's current weapon cooldown.
+		semiAutoBufferUntil = now + SEMI_AUTO_BUFFER_SECONDS
+	elseif meleeClenchTiming or not semiAutoGateWeapon or not playerInputEnabled
+		or isPlayerDriving or isPlayerAircraft then
+		semiAutoBufferUntil = nil
+	end
+	local bufferedSemiAutoFireHeld = semiAutoBufferUntil ~= nil
+		and now <= semiAutoBufferUntil
+	local gateFireHeld = not meleeClenchTiming
+		and (triggerTimingFireHeld or bufferedSemiAutoFireHeld)
+	local firingTriggerRelease = not gateFireHeld and previousGateFireHeld
 
     if firingTriggerEdge then
         triggerTimingSequence = triggerTimingSequence + 1
@@ -1305,6 +1501,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 	-- C++ independently validates the authoritative engine weapon state before
 	-- clearing native triggers, so a stale Lua weapon event cannot leak a punch.
 	previousFireInputHeld = meleeClenchTiming and false or triggerTimingFireHeld
+	previousGateFireHeld = gateFireHeld
 
 	if apply_chord_controls(state, buttons, now) then
         previousQuestXCycleHeld = has_button(buttons, BUTTON_B)
@@ -1395,22 +1592,64 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
         return
     end
 
-	-- Grenades, tear gas, and Molotovs retain GTA's complete native throw state.
-	-- Their release/cook animation is not compatible with the firearm magnetic
-	-- ownership path, so do not consume grip/trigger input or request fake-hand
-	-- presentation for only half of that interaction.
-	if currentWeaponId >= 16 and currentWeaponId <= 18 then
+	-- Grenades and default Molotov mode support physical grip-release flight.
+	-- Either trigger still passes through GTA's native throw for comparison.
+	-- A trigger seen during a grip hold cancels that custom release instead of
+	-- producing a second projectile. Tear gas remains fully native.
+	if currentWeaponId >= 16 and currentWeaponId <= 18
+		and not (currentWeaponId == 18 and enableNativeMolotovMode) then
 		cancel_held_visual_grace()
 		clear_cycle_pulse()
-		set_visibility_state("default")
-		return
+		if not enableMotionThrowables
+			or (currentWeaponId ~= 16 and currentWeaponId ~= 18) then
+			set_visibility_state("default")
+			return
+		end
+
+		local leftGripHeld = rawLeftGripHeld
+		local rightGripHeld = rawRightGripHeld
+		local selectedSide = activeHandSide
+		if leftGripHeld and triggerTimingLeftTriggerHeld then
+			selectedSide = "left"
+		elseif rightGripHeld and triggerTimingRightTriggerHeld then
+			selectedSide = "right"
+		elseif leftGripHeld and not rightGripHeld then
+			selectedSide = "left"
+		elseif rightGripHeld and not leftGripHeld then
+			selectedSide = "right"
+		end
+		if selectedSide ~= "left" and selectedSide ~= "right" then
+			selectedSide = "right"
+		end
+		if leftGripHeld or rightGripHeld then
+			set_hand_side(selectedSide)
+			set_visibility_state("active")
+		else
+			set_visibility_state("default")
+		end
+
+		buttons = clear_button(buttons, LEFT_SHOULDER)
+		buttons = clear_button(buttons, RIGHT_SHOULDER)
+		state.Gamepad.wButtons = buttons
+		-- The generic output below maps either physical trigger to GTA's native
+		-- RT throw. Clear the raw LT first so a left-hand throw cannot also request
+		-- GTA's ready/aim state.
+		state.Gamepad.bLeftTrigger = 0
+		if not triggerTimingFireHeld then
+			-- Grip-only interaction belongs exclusively to the custom flight.
+			motionThrowableState.nativePulseSequence = 0
+			state.Gamepad.bRightTrigger = 0
+			return
+		end
+		-- Do not return here. The ordinary input output below maps either physical
+		-- trigger to GTA's native RT throw without restoring a shoulder/aim input.
 	end
 
     local leftGripHeld = has_button(buttons, LEFT_SHOULDER)
     local rightGripHeld = phoneRightGripHeld
 	local leftTriggerHeld = state.Gamepad.bLeftTrigger > 30
 	local rightTriggerHeld = state.Gamepad.bRightTrigger > 30
-	local fireTriggerPulse = triggerTimingFireHeld
+	local fireTriggerPulse = gateFireHeld
 	local leftGripAimHeld = leftGripHeld
 	local manualReloadAimHeld = manual_reload_aim_pulse_active(now)
 	local nativeSpecialWeapon = native_special_weapon_active()
@@ -1439,6 +1678,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 	end
 
 	if not leftGripHeld and not rightGripHeld and not leftTriggerHeld and not rightTriggerHeld
+		and not fireTriggerPulse
         and not manualReloadAimHeld then
 		leftGripPressedAt = nil
 		leftGripHeldLongEnough = false
@@ -1489,20 +1729,45 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 
 	state.Gamepad.wButtons = buttons
 
-	-- Ordinary VR firearms use the physical weapon ray without forcing GTA's
-	-- native LT aiming stance. Keep the native ready path only for special
-	-- weapons and the optional manual-reload compatibility pulse.
+	-- GTA's first RT shot enters its native firearm task before it can dispatch,
+	-- producing a visible stance transition and a much slower first shot. When
+	-- enabled, begin that ready task while either physical weapon grip is held.
+	-- This deliberately preserves native ammo/cadence/audio/damage; it merely
+	-- moves the unavoidable task warm-up ahead of the trigger edge.
+	local ordinaryFirearm = currentWeaponId >= 22 and currentWeaponId <= 33
+	-- Prewarm only sidearms and SMGs. Keeping GTA's ready task active for
+	-- shotguns/rifles caused their native slow-walk stance while merely gripping.
+	local lightweightPrewarmFirearm = (currentWeaponId >= 22 and currentWeaponId <= 24)
+		or currentWeaponId == 28 or currentWeaponId == 29 or currentWeaponId == 32
+	local fireTaskPrewarmRequested = enableFireTaskPrewarm and lightweightPrewarmFirearm
+		and (leftGripHeld or rightGripHeld)
 	if manualReloadAimHeld
 		or (nativeSpecialWeapon and (leftGripHeld or rightGripHeld or fireTriggerPulse))
-		or (freeFireRocket and fireTriggerPulse) then
+		or (freeFireRocket and fireTriggerPulse)
+		or fireTaskPrewarmRequested then
 		state.Gamepad.bLeftTrigger = 255
-	elseif currentWeaponId >= 22 and currentWeaponId <= 36 then
+	elseif ordinaryFirearm then
 		state.Gamepad.bLeftTrigger = 0
+	end
+	if fireTaskPrewarmRequested ~= fireTaskPrewarmActive then
+		fireTaskPrewarmActive = fireTaskPrewarmRequested
+		log(string.format("fire task prewarm %s weapon=%d", fireTaskPrewarmActive and "armed" or "cleared", currentWeaponId))
 	end
 
 	if fireTriggerPulse and not meleeClenchTiming then
 		state.Gamepad.bRightTrigger = 255
     end
+	if firingTriggerEdge and ordinaryFirearm then
+		local physicalSide = triggerTimingLeftTriggerHeld and triggerTimingRightTriggerHeld and "both"
+			or (triggerTimingLeftTriggerHeld and "left" or "right")
+		log(string.format(
+			"fire output edge seq=%d physical=%s rawLT=%d rawRT=%d weapon=%d nativeLT=%d nativeRT=%d prewarm=%s",
+			triggerTimingSequence, physicalSide,
+			triggerTimingLeftTriggerValue, triggerTimingRightTriggerValue,
+			currentWeaponId,
+			state.Gamepad.bLeftTrigger, state.Gamepad.bRightTrigger,
+			fireTaskPrewarmRequested and "true" or "false"))
+	end
 
 	-- Physical melee contact is still proof-only. Do not let unarmed/melee grip
 	-- transitions leak into GTA's native aim/attack inputs and cause stray hits.
@@ -1575,10 +1840,16 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
             previousVehicleFaceFireHeld = false
         end
         log_control_debug(string.format("vehicle free-aim state=%s", tostring(vehicleFreeAimActive)))
-    elseif event_name == "meleeNativeTriggerBlockState" then
+	elseif event_name == "meleeNativeTriggerBlockState" then
 		authoritativeMeleeTriggerBlock = event_string == "true"
 		if authoritativeMeleeTriggerBlock then
 			previousFireInputHeld = false
+		end
+	elseif event_name == "motionThrowableNativePulse" then
+		local sequence = tonumber(event_string) or 0
+		if sequence > 0 then
+			motionThrowableState.nativePulseSequence = sequence
+			log(string.format("Molotov native throw pulse queued seq=%d", sequence))
 		end
     elseif event_name == "currentWeapon" then
         local nextWeaponId = tonumber(event_string) or 0
@@ -1691,6 +1962,7 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
 					controlGuideInputArmed = false
 					controlGuideStickLatched = false
 					controlGuideToggleHeld = false
+					controlGuideTogglePending = false
 					dispatch_control_guide(false)
 				end
             end
@@ -1707,8 +1979,38 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
             if enableAircraftNativeControls and isPlayerAircraft then
                 reset_dualgrip_state()
             end
-        elseif name == "EnableR3LeftStickDpad" then
-            enableR3LeftStickDpad = parse_bool(value)
+		elseif name == "EnableR3LeftStickDpad" then
+			enableR3LeftStickDpad = parse_bool(value)
+		elseif name == "EnableMotionThrowables" then
+			enableMotionThrowables = parse_bool(value)
+			if not enableMotionThrowables and not enableThrowableMotionProbe then
+				reset_throwable_probe_state()
+			end
+		elseif name == "EnableThrowableMotionProbe" then
+			enableThrowableMotionProbe = parse_bool(value)
+			if not enableThrowableMotionProbe and not enableMotionThrowables then
+				reset_throwable_probe_state()
+            end
+		elseif name == "EnableNativeMolotovMode" then
+			enableNativeMolotovMode = parse_bool(value)
+			motionThrowableState.nativePulseSequence = 0
+			reset_throwable_probe_state()
+			if enableNativeMolotovMode then
+				set_visibility_state("default")
+			end
+		elseif name == "EnableCustomAkimbo" then
+			SAVRCustomAkimboInput.enabled = parse_bool(value)
+			if not SAVRCustomAkimboInput.enabled then
+				dispatch_akimbo_input(0, 0, currentWeaponId)
+				SAVRCustomAkimboInput.leftHeld = false
+				SAVRCustomAkimboInput.rightHeld = false
+				SAVRCustomAkimboInput.lastHeldMask = 0
+			end
+		elseif name == "EnableFireTaskPrewarm" then
+            enableFireTaskPrewarm = parse_bool(value)
+            if not enableFireTaskPrewarm then
+                fireTaskPrewarmActive = false
+            end
         elseif name == "DebugInputLayerProbe" then
             debugInputLayerProbe = parse_bool(value)
             lastInputProbeSignature = nil

@@ -145,6 +145,12 @@ private:
 	bool nativeLineTraceContactDisabledLogged = false;
 	bool nativeMeleeDamageDisabled = false;
 	bool nativeMeleeDamageFailureLogged = false;
+	bool nativeThrowableDamageDisabled = false;
+	bool nativeThrowableDamageFailureLogged = false;
+	bool nativeThrowableImpactDisabled = false;
+	bool nativeThrowableImpactFailureLogged = false;
+	bool nativeThrowableExplosionDisabled = false;
+	bool nativeThrowableExplosionFailureLogged = false;
 	// The DE weapon-fire path also passes a separate start/end pair to the
 	// native weapon-effect/tracer routine. Keep a distinct probe so this path
 	// cannot be confused with the collision trace above.
@@ -159,6 +165,41 @@ private:
 	LONG lastReadNativeShotEffectSequence = 0;
 	volatile LONG playerBulletDamageReductionCount = 0;
 	bool playerBulletDamageReductionLogged = false;
+	// One-shot local-player projectile launch override. C++ publishes a complete
+	// origin/velocity pair before GTA processes the physical trigger release; the
+	// verified AddProjectile convergence hook consumes it exactly once for weapon
+	// types 16..18. Native ammo, fuse, ownership, projectile and explosion logic
+	// remain untouched.
+	volatile LONG nativeThrowableMotionOverrideActive = 0;
+	volatile LONG nativeThrowableMotionWeapon = 0;
+	volatile LONG nativeThrowableMotionPublishSequence = 0;
+	volatile LONG nativeThrowableMotionConsumedSequence = 0;
+	std::array<volatile LONG, 3> nativeThrowableMotionOriginBits{};
+	std::array<volatile LONG, 3> nativeThrowableMotionVelocityBits{};
+	// Captured at the already-proven local-player weapon-fire prologue. The
+	// native impact path requires the real live CWeapon entry; a type-only stub
+	// can reach generic damage code but cannot reproduce Molotov ownership.
+	volatile LONG64 nativeThrowableLiveWeaponEntry = 0;
+	volatile LONG nativeThrowableLiveWeaponSequence = 0;
+	bool nativeThrowableMotionPatchApplyAttempted = false;
+	// The custom Molotov flight does not require a native launch interception.
+	// Keep this false until a launch ABI is proved for the exact game build.
+	bool nativeThrowableMotionPatchInstalled = false;
+	LONG lastReadNativeThrowableMotionConsumedSequence = 0;
+	// Passive capture at the native throwable launch convergence point. This is
+	// deliberately separate from the custom origin/velocity override state so
+	// native and custom release paths can be compared without changing either.
+	volatile LONG nativeThrowableLaunchProbeSequence = 0;
+	volatile LONG nativeThrowableLaunchProbeWeapon = 0;
+	volatile LONG nativeThrowableLaunchProbeOverridden = 0;
+	std::array<volatile LONG, 3> nativeThrowableLaunchProbeOriginBits{};
+	std::array<volatile LONG, 3> nativeThrowableLaunchProbeVelocityBits{};
+	std::array<volatile LONG, 3> nativeThrowableLaunchProbeDirectionBits{};
+	volatile LONG nativeThrowableLaunchProbeForceBits = 0;
+	volatile LONG64 nativeThrowableLaunchProbeDirectionPointer = 0;
+	volatile LONG64 nativeThrowableLaunchProbeTarget = 0;
+	bool nativeThrowableLaunchProbePatchInstalled = false;
+	LONG lastReadNativeThrowableLaunchProbeSequence = 0;
 	ULONGLONG lastCombatAssistWeaponInfoReadyCheckTime = 0;
 	ULONGLONG lastCombatAssistWeaponInfoVerifyTime = 0;
 	ULONGLONG lastCombatAssistWeaponInfoOverwriteLogTime = 0;
@@ -186,6 +227,24 @@ private:
 	volatile LONG playerSemiAutoPullWeaponType = 0;
 	volatile LONG playerSemiAutoShotPermit = 0;
 	volatile LONG playerSemiAutoBlockedCount = 0;
+	bool customAkimboFirePatchApplyAttempted = false;
+	bool customAkimboFirePatchInstalled = false;
+	volatile LONG customAkimboEnabled = 0;
+	volatile LONG customAkimboWeaponType = 0;
+	// Native CTaskSimpleUseGun flags are bit 0=right and bit 1=left.
+	volatile LONG customAkimboHeldMask = 0;
+	volatile LONG customAkimboPendingMask = 0;
+	volatile LONG customAkimboTaskFireMask = 0;
+	volatile LONG customAkimboActiveHand = -1;
+	volatile LONG customAkimboTraceValidMask = 0;
+	volatile LONG customAkimboTaskInjectionSequence = 0;
+	volatile LONG customAkimboAcceptedShotSequence = 0;
+	// Controller-hand bits: bit 0=left, bit 1=right. Consumed by the visual
+	// layer only; native damage/ammo ownership remains independent of effects.
+	volatile LONG customAkimboAcceptedHandMask = 0;
+	volatile LONG64 customAkimboTaskPointer = 0;
+	std::array<std::array<volatile LONG, 3>, 2> customAkimboTraceOriginBits{};
+	std::array<std::array<volatile LONG, 3>, 2> customAkimboTraceTargetBits{};
 	bool manualReloadStageActive = false;
 	uintptr_t manualReloadStageEntry = 0;
 	uint32_t manualReloadStageWeaponType = 0;
@@ -272,6 +331,18 @@ public:
 		uint32_t sequence = 0;
 	};
 
+	struct NativeThrowableLaunchProbe {
+		std::array<float, 3> rawOrigin{};
+		std::array<float, 3> rawVelocity{};
+		std::array<float, 3> rawDirection{};
+		float force = 0.0f;
+		uintptr_t target = 0;
+		bool directionSupplied = false;
+		int weaponType = 0;
+		bool overridden = false;
+		uint32_t sequence = 0;
+	};
+
 	enum class NativeMeleeDamageResult : uint8_t {
 		Rejected,
 		Attempted,
@@ -282,8 +353,15 @@ public:
 	struct NativeMeleeContact {
 		uintptr_t entity = 0;
 		std::array<float, 3> point{};
+		std::array<float, 3> normal{ 0.0f, 0.0f, 1.0f };
 		uint8_t piece = 0;
 		uint8_t entityType = 0;
+		// Preserve the native CColPoint bytes returned by the synchronous LOS
+		// query. The impact dispatcher consumes more than position/piece fields.
+		alignas(16) std::array<uint8_t, 0x48> nativeCollisionPoint{};
+		bool nativeCollisionPointValid = false;
+		float targetHealthBefore = -1.0f;
+		float targetHealthAfter = -1.0f;
 		NativeMeleeDamageResult damageResult = NativeMeleeDamageResult::Rejected;
 	};
 
@@ -315,6 +393,8 @@ public:
 	void ApplyCombatAssistPatches();
 	void ApplyManualReloadCapturePatch();
 	void ApplyPlayerSemiAutoFireGatePatch();
+	void ApplyCustomAkimboFirePatch();
+	void ApplyNativeThrowableMotionPatch();
 	void MaintainManualReloadMode();
 	void RestoreManualReloadState();
 	void MaintainCombatAssistValues();
@@ -336,17 +416,40 @@ public:
 	void ResetTriggerTimingProbe();
 	static void CaptureNativeShotObservation(uintptr_t instructionAddress);
 	bool SetNativeShotTraceOverride(const std::array<float, 3>& origin, const std::array<float, 3>& target);
+	void SetCustomAkimboState(bool enabled, int weaponType, uint8_t heldMask, uint8_t edgeMask);
+	bool SetCustomAkimboHandTrace(int hand, const std::array<float, 3>& origin,
+		const std::array<float, 3>& target);
+	void ClearCustomAkimboState();
+	uint8_t ConsumeCustomAkimboAcceptedHandMask();
+	bool SetNativeThrowableMotionOverride(const std::array<float, 3>& origin,
+		const std::array<float, 3>& velocity, int weaponType, uint32_t sequence);
+	void ClearNativeThrowableMotionOverride();
+	bool ConsumeNativeThrowableMotionApplied(uint32_t& sequence);
+	bool ReadLatestNativeThrowableLaunchProbe(NativeThrowableLaunchProbe& probe);
 	// Definitive Edition LOS entry at module+0x13F89A0. Targeted caller tracing
 	// proves RCX/RDX are start/end CVector pointers, R8 is an opaque hit-result
 	// output, and R9 is CEntity**. Used only by the engine-thread melee sweep.
 	bool QueryNativeLineOfSightEntity(const std::array<float, 3>& start,
-		const std::array<float, 3>& end, NativeMeleeContact& contact);
+		const std::array<float, 3>& end, NativeMeleeContact& contact,
+		bool requireEntity = true);
 	// Applies one already-contact-qualified hit through GTA's own ped damage-event
 	// or vehicle damage function. Returns true only for a proven native acceptance;
 	// the void-return vehicle path records UnverifiedVehicleDispatch. No health
 	// values are written by the plugin.
 	bool ApplyNativeMeleeContactDamage(NativeMeleeContact& contact,
 		int weaponType, int& appliedDamage);
+	// One bounded native impact event for the custom Molotov flight. This is
+	// deliberately separate from melee damage so projectile/fire behavior cannot
+	// inherit melee combo lookup or hand-swing state.
+	bool ApplyNativeThrowableImpactDamage(NativeMeleeContact& contact,
+		int weaponType, int& appliedDamage, int requestedDamage = 0);
+	// Impact-only native handoff for the custom Molotov flight. This does not
+	// create, move, or launch a projectile.
+	bool ApplyNativeThrowableImpactEvent(NativeMeleeContact& contact, int weaponType);
+	// Invokes DE's own grenade/Molotov explosion lifecycle at an already-resolved
+	// native point. Custom hand flight and collision remain owned by WeaponManager.
+	bool ApplyNativeThrowableExplosion(const std::array<float, 3>& impactPoint,
+		int weaponType);
 	void SetVehicleShotTraceOverrideArmed(bool armed);
 	void SetVehicleShotTraceModeActive(bool active);
 	uint32_t GetNativeShotTraceSequenceSnapshot() const;

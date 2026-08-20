@@ -33,6 +33,15 @@ namespace {
 	constexpr uint32_t FirstBulletWeaponType = 0x16; // pistol
 	constexpr uint32_t LastStandardBulletWeaponType = 0x22; // sniper rifle
 	constexpr uint32_t MinigunWeaponType = 0x26;
+	volatile LONG* gPlayerSemiAutoPullHeld = nullptr;
+	volatile LONG* gPlayerSemiAutoShotPermit = nullptr;
+	volatile LONG* gCustomAkimboEnabled = nullptr;
+	volatile LONG* gCustomAkimboWeaponType = nullptr;
+	volatile LONG* gCustomAkimboPendingMask = nullptr;
+	volatile LONG* gCustomAkimboTaskFireMask = nullptr;
+	volatile LONG* gCustomAkimboActiveHand = nullptr;
+	volatile LONG* gCustomAkimboAcceptedShotSequence = nullptr;
+	volatile LONG* gCustomAkimboAcceptedHandMask = nullptr;
 	bool IsPlayerSemiAutoGateWeapon(uint32_t weaponType) {
 		return (weaponType >= 22 && weaponType <= 27) || weaponType == 33 || weaponType == 34;
 	}
@@ -74,8 +83,10 @@ namespace {
 	constexpr uint8_t MeleeComboCount = 12;
 	constexpr size_t NativeEntityTypeOffset = 0x6A;
 	constexpr uint8_t NativeEntityTypeMask = 0x07;
+	constexpr uint8_t NativeEntityTypeWorld = 1;
 	constexpr uint8_t NativeEntityTypeVehicle = 2;
 	constexpr uint8_t NativeEntityTypePed = 3;
+	constexpr size_t NativePedHealthOffset = 0x76C;
 	constexpr size_t NativeVehicleHealthOffset = 0x79C;
 	constexpr size_t NativeMeleeContactPieceOffset = 0x24;
 	constexpr uintptr_t NativeLineOfSightRva = 0x13F89A0;
@@ -84,9 +95,33 @@ namespace {
 	constexpr uintptr_t NativeLineOfSightIgnoreEntityRva = 0x523A8D8;
 	constexpr uintptr_t NativePedDamageRva = 0x13F1150;
 	constexpr uintptr_t NativeVehicleDamageRva = 0x13C96B0;
+	// Proven native weapon-impact dispatcher. Its callers pass the live weapon
+	// entry, attacker, victim, start/end vectors, a CColPoint, and a positive
+	// impact factor. It owns the downstream native reaction/effect path.
+	constexpr uintptr_t NativeThrowableImpactRva = 0x13F16A0;
+	// CWeapon::Fire routes grenade, tear-gas, Molotov, and satchel through this
+	// common native projectile constructor. The first seven bytes are a stable
+	// stack/register prologue in the currently supported executable hash.
+	constexpr uintptr_t NativeThrowableAddProjectileRva = 0x13EADF0;
+	constexpr std::array<uint8_t, 7> NativeThrowableAddProjectilePrologue{
+		0x4C, 0x8B, 0xDC, 0x49, 0x89, 0x5B, 0x08
+	};
+	constexpr int NativeMolotovWeaponType = 18;
+	// Native weapon-18 projectile impact calls this exact CExplosion::AddExplosion
+	// entry with explosion type 1. Unlike the cooked BP shells, this registers the
+	// timed explosion plus native ground fire, ped/world/car ignition and damage.
+	constexpr uintptr_t NativeAddExplosionRva = 0x13E96A0;
+	constexpr std::array<uint8_t, 16> NativeAddExplosionPrologue{
+		0x40, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8D,
+		0x6C, 0x24, 0xC0, 0x48, 0x81, 0xEC, 0x40, 0x01
+	};
+	constexpr int NativeMolotovExplosionType = 1;
+	constexpr int NativeGrenadeWeaponType = 16;
+	constexpr int NativeGrenadeExplosionType = 0;
 
 	const char* NativeMeleeEntityTypeLabel(uint8_t entityType) {
 		switch (entityType) {
+		case NativeEntityTypeWorld: return "world";
 		case NativeEntityTypeVehicle: return "vehicle";
 		case NativeEntityTypePed: return "ped";
 		default: return "unknown";
@@ -2442,7 +2477,7 @@ void MemoryManager::GetNativeShotSpreadBypassCounts(uint32_t& pathA, uint32_t& p
 }
 
 bool MemoryManager::QueryNativeLineOfSightEntity(const std::array<float, 3>& start,
-	const std::array<float, 3>& end, NativeMeleeContact& contact)
+	const std::array<float, 3>& end, NativeMeleeContact& contact, bool requireEntity)
 {
 	contact = NativeMeleeContact{};
 	if (InterlockedCompareExchange(&nativeLineTraceContactDisabled, 0, 0) != 0)
@@ -2583,14 +2618,14 @@ bool MemoryManager::QueryNativeLineOfSightEntity(const std::array<float, 3>& sta
 		disableNativeContact("native call or ignore-entity restore fault");
 		return false;
 	}
-	if (!hit || hitEntity == 0 || hitEntity == localPlayerPed)
+	if (!hit || hitEntity == localPlayerPed || (requireEntity && hitEntity == 0))
 		return false;
 
 	std::memcpy(&hitPoint, hitResult.data(), sizeof(hitPoint));
 	if (!std::isfinite(hitPoint.x) || !std::isfinite(hitPoint.y)
 		|| !std::isfinite(hitPoint.z))
 		return false;
-	if (hitEntity > (std::numeric_limits<uintptr_t>::max)()
+	if (hitEntity != 0 && hitEntity > (std::numeric_limits<uintptr_t>::max)()
 		- NativeEntityTypeOffset - sizeof(uint8_t))
 		return false;
 
@@ -2598,18 +2633,32 @@ bool MemoryManager::QueryNativeLineOfSightEntity(const std::array<float, 3>& sta
 	// vector at +0x10 is the collision normal and must not be used as a point.
 
 	uint8_t entityType = 0;
-	__try
+	if (hitEntity != 0)
 	{
-		if (!TryRead(hitEntity + NativeEntityTypeOffset, entityType))
+		__try
+		{
+			if (!TryRead(hitEntity + NativeEntityTypeOffset, entityType))
+				return false;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
 			return false;
-	}
-	__except (EXCEPTION_EXECUTE_HANDLER)
-	{
-		return false;
+		}
 	}
 
 	contact.entity = hitEntity;
 	contact.point = { hitPoint.x, hitPoint.y, hitPoint.z };
+	std::memcpy(contact.nativeCollisionPoint.data(), hitResult.data(),
+		contact.nativeCollisionPoint.size());
+	contact.nativeCollisionPointValid = true;
+	std::memcpy(contact.normal.data(), hitResult.data() + 0x10,
+		sizeof(float) * contact.normal.size());
+	const float normalLength = std::sqrt(
+		contact.normal[0] * contact.normal[0]
+		+ contact.normal[1] * contact.normal[1]
+		+ contact.normal[2] * contact.normal[2]);
+	if (!std::isfinite(normalLength) || normalLength <= 0.001f)
+		contact.normal = { 0.0f, 0.0f, 1.0f };
 	contact.piece = hitResult[NativeMeleeContactPieceOffset];
 	contact.entityType = entityType & NativeEntityTypeMask;
 	return true;
@@ -2792,6 +2841,7 @@ bool MemoryManager::ApplyNativeMeleeContactDamage(NativeMeleeContact& contact,
 		|| !TryRead(contact.entity + NativeVehicleHealthOffset, healthBefore)
 		|| !std::isfinite(healthBefore))
 		return false;
+	contact.targetHealthBefore = healthBefore;
 	contact.damageResult = NativeMeleeDamageResult::Attempted;
 	__try
 	{
@@ -2813,8 +2863,11 @@ bool MemoryManager::ApplyNativeMeleeContactDamage(NativeMeleeContact& contact,
 		return false;
 	}
 
-	if (TryRead(contact.entity + NativeVehicleHealthOffset, healthAfter)
-		&& std::isfinite(healthAfter) && healthAfter < healthBefore - 0.001f)
+	const bool readHealthAfter = TryRead(contact.entity + NativeVehicleHealthOffset, healthAfter)
+		&& std::isfinite(healthAfter);
+	if (readHealthAfter)
+		contact.targetHealthAfter = healthAfter;
+	if (readHealthAfter && healthAfter < healthBefore - 0.001f)
 	{
 		contact.damageResult = NativeMeleeDamageResult::Accepted;
 		appliedDamage = static_cast<int>((std::max)(1.0f, healthBefore - healthAfter));
@@ -2831,6 +2884,484 @@ bool MemoryManager::ApplyNativeMeleeContactDamage(NativeMeleeContact& contact,
 		NativeMeleeDamageResultLabel(contact.damageResult),
 		NativeMeleeEntityTypeLabel(contact.entityType),
 		static_cast<unsigned int>(contact.entityType), healthBefore, healthAfter);
+	return false;
+}
+
+bool MemoryManager::ApplyNativeThrowableImpactEvent(NativeMeleeContact& contact,
+	int weaponType)
+{
+	contact.damageResult = NativeMeleeDamageResult::Rejected;
+	if (nativeThrowableImpactDisabled || baseAddressGameEXE == 0
+		|| weaponType != 18 || contact.entity == 0
+		|| (contact.entityType != NativeEntityTypeWorld
+			&& contact.entityType != NativeEntityTypeVehicle
+			&& contact.entityType != NativeEntityTypePed)
+		|| !contact.nativeCollisionPointValid
+		|| !IsReadableMemory(contact.entity, 0x800))
+		return false;
+
+	UpdateCombatAssistPlayerPointer();
+	const uintptr_t playerPed = cachedPlayerPointer;
+	if (playerPed == 0 || playerPed == contact.entity
+		|| !IsReadableMemory(playerPed, 0x1000))
+		return false;
+
+	// The dispatcher reads more than a weapon type from its CWeapon entry. The
+	// player-fire prologue gives us that exact entry for a real native Molotov
+	// trigger; prefer it over the older array guess. A type-only stub can reach
+	// generic impact code but cannot reproduce native Molotov ownership/effects.
+	constexpr size_t WeaponArrayOffset = 0x5A0;
+	constexpr size_t WeaponStride = 0x1C;
+	constexpr size_t SelectedSlotOffset = 0x718;
+	constexpr uint8_t WeaponSlotCount = 13;
+	uint8_t selectedSlot = 0;
+	if (!TryRead(playerPed + SelectedSlotOffset, selectedSlot)
+		|| selectedSlot >= WeaponSlotCount)
+		return false;
+	uintptr_t weaponEntry = 0;
+	uint8_t resolvedSlot = selectedSlot;
+	const char* entrySource = "none";
+	const LONG captureSequenceBefore = InterlockedCompareExchange(
+		&nativeThrowableLiveWeaponSequence, 0, 0);
+	const uintptr_t capturedWeaponEntry = static_cast<uintptr_t>(
+		InterlockedCompareExchange64(&nativeThrowableLiveWeaponEntry, 0, 0));
+	uint32_t capturedWeaponType = 0;
+	const bool capturedWeaponValid = captureSequenceBefore != 0
+		&& capturedWeaponEntry != 0
+		&& IsReadableMemory(capturedWeaponEntry, 0x10)
+		&& TryRead(capturedWeaponEntry, capturedWeaponType)
+		&& capturedWeaponType == static_cast<uint32_t>(weaponType)
+		&& captureSequenceBefore == InterlockedCompareExchange(
+			&nativeThrowableLiveWeaponSequence, 0, 0);
+	if (capturedWeaponValid)
+	{
+		weaponEntry = capturedWeaponEntry;
+		resolvedSlot = 0xFE;
+		entrySource = "native-trigger";
+	}
+	else
+	{
+		for (uint8_t slot = 0; slot < WeaponSlotCount; ++slot)
+		{
+			const uintptr_t candidate = playerPed + WeaponArrayOffset
+				+ (static_cast<size_t>(slot) * WeaponStride);
+			if (!IsReadableMemory(candidate, 0x10))
+				continue;
+			uint32_t candidateType = 0;
+			if (!TryRead(candidate, candidateType)
+				|| candidateType != static_cast<uint32_t>(weaponType))
+				continue;
+			if (weaponEntry == 0 || slot == selectedSlot)
+			{
+				weaponEntry = candidate;
+				resolvedSlot = slot;
+				entrySource = "inventory-scan";
+			}
+			if (slot == selectedSlot)
+				break;
+		}
+	}
+	if (weaponEntry == 0)
+	{
+		uevr::API::get()->log_info(
+			"[MotionThrowableImpact] native dispatcher skipped type=%d selectedSlot=%u reason=no-live-molotov-entry",
+			weaponType, static_cast<unsigned int>(selectedSlot));
+		return false;
+	}
+
+	if (baseAddressGameEXE > (std::numeric_limits<uintptr_t>::max)()
+		- NativeThrowableImpactRva)
+		return false;
+	const uintptr_t target = baseAddressGameEXE + NativeThrowableImpactRva;
+	const std::array<uint8_t, 16> signature{
+		0x4C, 0x89, 0x4C, 0x24, 0x20, 0x55, 0x53, 0x57,
+		0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57 };
+	bool signatureMatches = false;
+	__try
+	{
+		signatureMatches = IsReadableMemory(target, signature.size())
+			&& std::memcmp(reinterpret_cast<const void*>(target), signature.data(),
+				signature.size()) == 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		signatureMatches = false;
+	}
+	if (!signatureMatches)
+	{
+		nativeThrowableImpactDisabled = true;
+		if (!nativeThrowableImpactFailureLogged)
+		{
+			nativeThrowableImpactFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableImpact] native dispatcher signature mismatch at RVA 0x%llX; impact handoff disabled",
+				static_cast<unsigned long long>(NativeThrowableImpactRva));
+		}
+		return false;
+	}
+
+	struct NativeVector { float x, y, z; };
+	NativeVector impact{
+		contact.point[0], contact.point[1], contact.point[2] };
+	NativeVector normal{
+		contact.normal[0], contact.normal[1], contact.normal[2] };
+	const float normalLength = std::sqrt(
+		normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
+	if (!std::isfinite(normalLength) || normalLength <= 0.001f)
+	{
+		normal = { 0.0f, 0.0f, 1.0f };
+	}
+	else
+	{
+		normal.x /= normalLength;
+		normal.y /= normalLength;
+		normal.z /= normalLength;
+	}
+	const NativeVector origin{
+		impact.x - normal.x * 0.05f,
+		impact.y - normal.y * 0.05f,
+		impact.z - normal.z * 0.05f };
+
+	const bool hasHealth = contact.entityType == NativeEntityTypePed
+		|| contact.entityType == NativeEntityTypeVehicle;
+	const size_t healthOffset = contact.entityType == NativeEntityTypePed
+		? NativePedHealthOffset : NativeVehicleHealthOffset;
+	float healthBefore = -1.0f;
+	float healthAfter = -1.0f;
+	const bool healthAddressValid = hasHealth
+		&& contact.entity <= (std::numeric_limits<uintptr_t>::max)()
+		- healthOffset - sizeof(float);
+	const bool healthBeforeValid = healthAddressValid
+		&& TryRead(contact.entity + healthOffset, healthBefore)
+		&& std::isfinite(healthBefore);
+	if (healthBeforeValid)
+		contact.targetHealthBefore = healthBefore;
+
+	using NativeThrowableImpact = void(__fastcall*)(uintptr_t, uintptr_t, uintptr_t,
+		const NativeVector*, const NativeVector*, void*, int32_t);
+	contact.damageResult = NativeMeleeDamageResult::Attempted;
+	bool callFaulted = false;
+	__try
+	{
+		auto nativeImpact = reinterpret_cast<NativeThrowableImpact>(target);
+		nativeImpact(weaponEntry, playerPed, contact.entity, &origin, &impact,
+			contact.nativeCollisionPoint.data(), 1);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		callFaulted = true;
+	}
+	if (callFaulted)
+	{
+		nativeThrowableImpactDisabled = true;
+		if (!nativeThrowableImpactFailureLogged)
+		{
+			nativeThrowableImpactFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableImpact] native dispatcher faulted; impact handoff disabled");
+		}
+		contact.damageResult = NativeMeleeDamageResult::Rejected;
+		return false;
+	}
+
+	const bool healthAfterValid = healthAddressValid
+		&& TryRead(contact.entity + healthOffset, healthAfter)
+		&& std::isfinite(healthAfter);
+	if (healthAfterValid)
+		contact.targetHealthAfter = healthAfter;
+	const bool damageAccepted = healthBeforeValid && healthAfterValid
+		&& healthAfter < healthBefore - 0.001f;
+	if (damageAccepted)
+		contact.damageResult = NativeMeleeDamageResult::Accepted;
+	uevr::API::get()->log_info(
+		"[MotionThrowableImpact] native dispatcher called type=%s(%u) weapon=%d entrySource=%s selectedSlot=%u resolvedSlot=%u weaponEntry=0x%llX target=0x%llX accepted=%s health=%.2f->%.2f colpoint=preserved",
+		NativeMeleeEntityTypeLabel(contact.entityType),
+		static_cast<unsigned int>(contact.entityType), weaponType,
+		entrySource,
+		static_cast<unsigned int>(selectedSlot),
+		static_cast<unsigned int>(resolvedSlot),
+		static_cast<unsigned long long>(weaponEntry),
+		static_cast<unsigned long long>(contact.entity),
+		damageAccepted ? "true" : "false", contact.targetHealthBefore,
+		contact.targetHealthAfter);
+	return true;
+}
+
+bool MemoryManager::ApplyNativeThrowableExplosion(
+	const std::array<float, 3>& impactPoint, int weaponType)
+{
+	const int explosionType = weaponType == NativeGrenadeWeaponType
+		? NativeGrenadeExplosionType
+		: (weaponType == NativeMolotovWeaponType ? NativeMolotovExplosionType : -1);
+	if (explosionType < 0 || nativeThrowableExplosionDisabled || baseAddressGameEXE == 0
+		|| !std::isfinite(impactPoint[0]) || !std::isfinite(impactPoint[1])
+		|| !std::isfinite(impactPoint[2])
+		|| baseAddressGameEXE > (std::numeric_limits<uintptr_t>::max)()
+			- NativeAddExplosionRva)
+		return false;
+
+	UpdateCombatAssistPlayerPointer();
+	const uintptr_t playerPed = cachedPlayerPointer;
+	if (playerPed == 0 || !IsReadableMemory(playerPed, 0x1000))
+		return false;
+
+	const uintptr_t target = baseAddressGameEXE + NativeAddExplosionRva;
+	bool signatureMatches = false;
+	__try
+	{
+		signatureMatches = IsReadableMemory(target, NativeAddExplosionPrologue.size())
+			&& std::memcmp(reinterpret_cast<const void*>(target),
+				NativeAddExplosionPrologue.data(), NativeAddExplosionPrologue.size()) == 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		signatureMatches = false;
+	}
+	if (!signatureMatches)
+	{
+		nativeThrowableExplosionDisabled = true;
+		if (!nativeThrowableExplosionFailureLogged)
+		{
+			nativeThrowableExplosionFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableImpact] native AddExplosion signature mismatch at RVA 0x%llX; throwable handoff disabled",
+				static_cast<unsigned long long>(NativeAddExplosionRva));
+		}
+		return false;
+	}
+
+	struct NativeVector { float x, y, z; };
+	const NativeVector nativeImpact{
+		impactPoint[0], impactPoint[1], impactPoint[2] };
+	using NativeAddExplosion = void(__fastcall*)(
+		uintptr_t victim,
+		uintptr_t creator,
+		int32_t explosionType,
+		const NativeVector* position,
+		uint32_t lifetime,
+		bool useSound,
+		float cameraShake,
+		bool invisible);
+
+	bool callFaulted = false;
+	__try
+	{
+		auto addExplosion = reinterpret_cast<NativeAddExplosion>(target);
+		addExplosion(0, playerPed, explosionType, &nativeImpact,
+			0, true, -1.0f, false);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		callFaulted = true;
+	}
+	if (callFaulted)
+	{
+		nativeThrowableExplosionDisabled = true;
+		if (!nativeThrowableExplosionFailureLogged)
+		{
+			nativeThrowableExplosionFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableImpact] native AddExplosion faulted; throwable handoff disabled");
+		}
+		return false;
+	}
+
+	uevr::API::get()->log_info(
+		"[MotionThrowableImpact] native AddExplosion accepted weapon=%d explosionType=%d creator=0x%llX point=(%.3f %.3f %.3f) lifecycle=de-native",
+		weaponType, explosionType, static_cast<unsigned long long>(playerPed), nativeImpact.x,
+		nativeImpact.y, nativeImpact.z);
+	return true;
+}
+
+bool MemoryManager::ApplyNativeThrowableImpactDamage(NativeMeleeContact& contact,
+	int weaponType, int& appliedDamage, int requestedDamage)
+{
+	appliedDamage = 0;
+	contact.damageResult = NativeMeleeDamageResult::Rejected;
+	if (nativeThrowableDamageDisabled || baseAddressGameEXE == 0
+		|| weaponType != 18 || contact.entity == 0
+		|| (contact.entityType != NativeEntityTypeVehicle
+			&& contact.entityType != NativeEntityTypePed)
+		|| !IsReadableMemory(contact.entity, 0x800))
+		return false;
+	if (contact.entity > (std::numeric_limits<uintptr_t>::max)()
+		- NativeEntityTypeOffset - sizeof(uint8_t))
+		return false;
+	for (const float value : contact.point)
+		if (!std::isfinite(value))
+			return false;
+
+	uint8_t currentEntityType = 0;
+	__try
+	{
+		if (!TryRead(contact.entity + NativeEntityTypeOffset, currentEntityType))
+			return false;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+	currentEntityType &= NativeEntityTypeMask;
+	if (currentEntityType != contact.entityType)
+		return false;
+
+	UpdateCombatAssistPlayerPointer();
+	const uintptr_t playerPed = cachedPlayerPointer;
+	if (playerPed == 0 || playerPed == contact.entity
+		|| !IsReadableMemory(playerPed, 0x1000))
+		return false;
+	if (!ResolveCombatAssistWeaponInfo() || combatAssistWeaponInfoOffset == 0)
+		return false;
+	const uintptr_t weaponInfoDelta = combatAssistWeaponInfoOffset
+		+ (static_cast<uintptr_t>(weaponType) * WeaponInfoSize);
+	if (weaponInfoDelta < combatAssistWeaponInfoOffset
+		|| baseAddressGameEXE > (std::numeric_limits<uintptr_t>::max)()
+			- weaponInfoDelta)
+		return false;
+	const uintptr_t weaponInfo = baseAddressGameEXE + weaponInfoDelta;
+	if (!IsReadableMemory(weaponInfo, WeaponInfoSize))
+		return false;
+	uint16_t weaponInfoDamage = 0;
+	__try
+	{
+		if (!TryRead(weaponInfo + WeaponInfoDamageOffset, weaponInfoDamage))
+			return false;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+	// Molotov CWeaponInfo damage is not guaranteed to be populated on every
+	// DE build because the native projectile path normally supplies the burn
+	// event. Use its value when present and a bounded impact-event fallback when
+	// the field is zero; no plugin health field is written directly.
+	constexpr int ThrowableImpactFallbackDamage = 40;
+	const int nativeDamage = (weaponInfoDamage > 0 && weaponInfoDamage <= 1000)
+		? static_cast<int>(weaponInfoDamage) : ThrowableImpactFallbackDamage;
+	const int damage = requestedDamage > 0
+		? (std::clamp)(requestedDamage, 1, 1000) : nativeDamage;
+
+	const std::array<uint8_t, 11> pedSignature{
+		0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x08, 0x48, 0x89, 0x70, 0x10 };
+	const std::array<uint8_t, 11> vehicleSignature{
+		0xF3, 0x0F, 0x11, 0x5C, 0x24, 0x20, 0x55, 0x53, 0x57, 0x41, 0x57 };
+	const bool targetIsPed = contact.entityType == NativeEntityTypePed;
+	const uintptr_t targetRva = targetIsPed ? NativePedDamageRva : NativeVehicleDamageRva;
+	if (baseAddressGameEXE > (std::numeric_limits<uintptr_t>::max)() - targetRva)
+		return false;
+	const uintptr_t target = baseAddressGameEXE + targetRva;
+	const std::array<uint8_t, 11>& expected = targetIsPed ? pedSignature : vehicleSignature;
+	bool signatureMatches = false;
+	__try
+	{
+		signatureMatches = IsReadableMemory(target, expected.size())
+			&& std::memcmp(reinterpret_cast<const void*>(target), expected.data(), expected.size()) == 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		signatureMatches = false;
+	}
+	if (!signatureMatches)
+	{
+		nativeThrowableDamageDisabled = true;
+		if (!nativeThrowableDamageFailureLogged)
+		{
+			nativeThrowableDamageFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableDamage] native signature mismatch type=%s(%u); impact damage disabled",
+				NativeMeleeEntityTypeLabel(contact.entityType),
+				static_cast<unsigned int>(contact.entityType));
+		}
+		return false;
+	}
+
+	if (targetIsPed)
+	{
+		using GenerateDamageEvent = bool(__fastcall*)(uintptr_t, uintptr_t,
+			int32_t, int32_t, int32_t, uint8_t);
+		const int32_t piece = (contact.piece >= 3 && contact.piece <= 9)
+			? static_cast<int32_t>(contact.piece) : 3;
+		contact.damageResult = NativeMeleeDamageResult::Attempted;
+		bool accepted = false;
+		__try
+		{
+			auto generateDamageEvent = reinterpret_cast<GenerateDamageEvent>(target);
+			accepted = generateDamageEvent(contact.entity, playerPed, weaponType,
+				damage, piece, 0);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			nativeThrowableDamageDisabled = true;
+			if (!nativeThrowableDamageFailureLogged)
+			{
+				nativeThrowableDamageFailureLogged = true;
+				uevr::API::get()->log_error(
+					"[MotionThrowableDamage] ped call faulted; impact damage disabled");
+			}
+			return false;
+		}
+		contact.damageResult = accepted
+			? NativeMeleeDamageResult::Accepted
+			: NativeMeleeDamageResult::Rejected;
+		if (accepted)
+			appliedDamage = damage;
+		uevr::API::get()->log_info(
+			"[MotionThrowableDamage] result=%s type=ped(%u) weapon=%d damage=%d piece=%d infoDamage=%u",
+			NativeMeleeDamageResultLabel(contact.damageResult),
+			static_cast<unsigned int>(contact.entityType), weaponType, appliedDamage,
+			piece, static_cast<unsigned int>(weaponInfoDamage));
+		return accepted;
+	}
+
+	struct NativeVector { float x, y, z; };
+	using InflictVehicleDamage = void(__fastcall*)(uintptr_t, uintptr_t,
+		int32_t, float, const NativeVector*);
+	const NativeVector point{ contact.point[0], contact.point[1], contact.point[2] };
+	float healthBefore = 0.0f;
+	float healthAfter = 0.0f;
+	if (contact.entity > (std::numeric_limits<uintptr_t>::max)()
+		- NativeVehicleHealthOffset - sizeof(float)
+		|| !TryRead(contact.entity + NativeVehicleHealthOffset, healthBefore)
+		|| !std::isfinite(healthBefore))
+		return false;
+	contact.targetHealthBefore = healthBefore;
+	contact.damageResult = NativeMeleeDamageResult::Attempted;
+	__try
+	{
+		auto inflictVehicleDamage = reinterpret_cast<InflictVehicleDamage>(target);
+		inflictVehicleDamage(contact.entity, playerPed, weaponType,
+			static_cast<float>(damage), &point);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		nativeThrowableDamageDisabled = true;
+		if (!nativeThrowableDamageFailureLogged)
+		{
+			nativeThrowableDamageFailureLogged = true;
+			uevr::API::get()->log_error(
+				"[MotionThrowableDamage] vehicle call faulted; impact damage disabled");
+		}
+		return false;
+	}
+	const bool readHealthAfter = TryRead(contact.entity + NativeVehicleHealthOffset, healthAfter)
+		&& std::isfinite(healthAfter);
+	if (readHealthAfter)
+		contact.targetHealthAfter = healthAfter;
+	if (readHealthAfter && healthAfter < healthBefore - 0.001f)
+	{
+		contact.damageResult = NativeMeleeDamageResult::Accepted;
+		appliedDamage = static_cast<int>((std::max)(1.0f, healthBefore - healthAfter));
+		uevr::API::get()->log_info(
+			"[MotionThrowableDamage] result=accepted type=vehicle(%u) weapon=%d damage=%d health=%.2f->%.2f infoDamage=%u",
+			static_cast<unsigned int>(contact.entityType), weaponType, appliedDamage,
+			healthBefore, healthAfter, static_cast<unsigned int>(weaponInfoDamage));
+		return true;
+	}
+	contact.damageResult = NativeMeleeDamageResult::UnverifiedVehicleDispatch;
+	uevr::API::get()->log_info(
+		"[MotionThrowableDamage] result=unverified_vehicle type=vehicle(%u) weapon=%d health=%.2f->%.2f infoDamage=%u",
+		static_cast<unsigned int>(contact.entityType), weaponType,
+		healthBefore, healthAfter, static_cast<unsigned int>(weaponInfoDamage));
 	return false;
 }
 
@@ -2977,6 +3508,34 @@ void MemoryManager::ResetTriggerTimingProbe() {
 }
 
 void MemoryManager::CaptureNativeShotObservation(uintptr_t instructionAddress) {
+	// The player-fire prologue is only an attempt boundary; GTA may still reject
+	// it for cooldown. Consume the one-shot permit here, at the observed native
+	// shot boundary, so a quick physical tap remains pending until accepted.
+	if (gPlayerSemiAutoPullHeld != nullptr && gPlayerSemiAutoShotPermit != nullptr
+		&& InterlockedCompareExchange(gPlayerSemiAutoPullHeld, 0, 0) != 0)
+		InterlockedExchange(gPlayerSemiAutoShotPermit, 0);
+
+	// The hand-specific FireGun entry publishes the active controller hand before
+	// the accepted native shot reaches this hardware breakpoint. Clear only that
+	// hand's retained semi-auto edge; the opposite hand remains independently
+	// pending and retries through the same authoritative native weapon state.
+	if (gCustomAkimboEnabled != nullptr && gCustomAkimboActiveHand != nullptr
+		&& gCustomAkimboPendingMask != nullptr && gCustomAkimboTaskFireMask != nullptr
+		&& gCustomAkimboWeaponType != nullptr && gCustomAkimboAcceptedShotSequence != nullptr
+		&& InterlockedCompareExchange(gCustomAkimboEnabled, 0, 0) != 0) {
+		const LONG hand = InterlockedCompareExchange(gCustomAkimboActiveHand, 0, 0);
+		const LONG weapon = InterlockedCompareExchange(gCustomAkimboWeaponType, 0, 0);
+		const LONG nativeBit = hand == 0 ? 0x02 : (hand == 1 ? 0x01 : 0x00);
+		if (nativeBit != 0) {
+			InterlockedAnd(gCustomAkimboPendingMask, ~nativeBit);
+			if (weapon == 22 || weapon == 26)
+				InterlockedAnd(gCustomAkimboTaskFireMask, ~nativeBit);
+			InterlockedIncrement(gCustomAkimboAcceptedShotSequence);
+			if (gCustomAkimboAcceptedHandMask != nullptr)
+				InterlockedOr(gCustomAkimboAcceptedHandMask, 1L << hand);
+		}
+	}
+
 	if (InterlockedCompareExchange(&triggerTimingActive, 0, 0) == 0)
 		return;
 
@@ -3074,6 +3633,76 @@ bool MemoryManager::SetNativeShotTraceOverride(
 	InterlockedIncrement(&nativeShotTracePublishSequence); // even: stable pair
 	InterlockedExchange(&nativeShotTraceOriginOverrideEnabled, 1);
 	return true;
+}
+
+void MemoryManager::SetCustomAkimboState(bool enabled, int weaponType,
+	uint8_t heldMask, uint8_t edgeMask) {
+	const bool supported = weaponType == 22 || weaponType == 26
+		|| weaponType == 28 || weaponType == 32;
+	if (!customAkimboFirePatchInstalled || !enabled || !supported) {
+		ClearCustomAkimboState();
+		return;
+	}
+
+	const LONG sanitizedHeld = static_cast<LONG>(heldMask & 0x03U);
+	const LONG sanitizedEdges = static_cast<LONG>(edgeMask & 0x03U);
+	InterlockedExchange(&customAkimboWeaponType, static_cast<LONG>(weaponType));
+	InterlockedExchange(&customAkimboHeldMask, sanitizedHeld);
+	if (sanitizedEdges != 0)
+		InterlockedOr(&customAkimboPendingMask, sanitizedEdges);
+
+	// SMGs repeat while held. Pistols and sawn-offs retain each hand's edge until
+	// the native shot observation confirms that exact hand was accepted.
+	const bool automatic = weaponType == 28 || weaponType == 32;
+	const LONG fireMask = automatic
+		? sanitizedHeld
+		: InterlockedCompareExchange(&customAkimboPendingMask, 0, 0);
+	InterlockedExchange(&customAkimboTaskFireMask, fireMask & 0x03);
+	InterlockedExchange(&customAkimboEnabled, 1);
+}
+
+bool MemoryManager::SetCustomAkimboHandTrace(int hand,
+	const std::array<float, 3>& origin, const std::array<float, 3>& target) {
+	if (!customAkimboFirePatchInstalled || hand < 0 || hand > 1)
+		return false;
+	double distanceSquared = 0.0;
+	for (size_t axis = 0; axis < 3; ++axis) {
+		if (!std::isfinite(origin[axis]) || !std::isfinite(target[axis]))
+			return false;
+		const double delta = static_cast<double>(target[axis])
+			- static_cast<double>(origin[axis]);
+		distanceSquared += delta * delta;
+	}
+	if (!std::isfinite(distanceSquared) || distanceSquared < 1.0)
+		return false;
+
+	for (size_t axis = 0; axis < 3; ++axis) {
+		LONG originBits = 0;
+		LONG targetBits = 0;
+		std::memcpy(&originBits, &origin[axis], sizeof(originBits));
+		std::memcpy(&targetBits, &target[axis], sizeof(targetBits));
+		InterlockedExchange(&customAkimboTraceOriginBits[hand][axis], originBits);
+		InterlockedExchange(&customAkimboTraceTargetBits[hand][axis], targetBits);
+	}
+	InterlockedOr(&customAkimboTraceValidMask, 1L << hand);
+	return true;
+}
+
+void MemoryManager::ClearCustomAkimboState() {
+	InterlockedExchange(&customAkimboEnabled, 0);
+	InterlockedExchange(&customAkimboWeaponType, 0);
+	InterlockedExchange(&customAkimboHeldMask, 0);
+	InterlockedExchange(&customAkimboPendingMask, 0);
+	InterlockedExchange(&customAkimboTaskFireMask, 0);
+	InterlockedExchange(&customAkimboActiveHand, -1);
+	InterlockedExchange(&customAkimboTraceValidMask, 0);
+	InterlockedExchange(&customAkimboAcceptedHandMask, 0);
+	InterlockedExchange64(&customAkimboTaskPointer, 0);
+}
+
+uint8_t MemoryManager::ConsumeCustomAkimboAcceptedHandMask() {
+	return static_cast<uint8_t>(InterlockedExchange(
+		&customAkimboAcceptedHandMask, 0) & 0x03);
 }
 
 void MemoryManager::ClearNativeShotTraceOverride() {
@@ -4603,6 +5232,24 @@ void MemoryManager::ApplyPlayerSemiAutoFireGatePatch() {
 			code.insert(code.end(), { 0x4C, 0x39, 0xD2 }); // cmp rdx,r10
 			const size_t notPlayerOffset = AppendNearJcc(code, 0x85); // jne allow
 
+			// A genuine native Molotov trigger is the one safe source of the live
+			// CWeapon entry required by the native impact dispatcher. Capture RCX
+			// only after proving this is the local player and only for type 18;
+			// preserve the original native call unchanged. Custom grip-release
+			// flight later consumes this cached entry at its own collision point.
+			code.insert(code.end(), { 0x44, 0x8B, 0x19 }); // mov r11d,[rcx]
+			code.insert(code.end(), { 0x41, 0x83, 0xFB, 0x12 }); // cmp r11d,18
+			const size_t notMolotovCaptureOffset = AppendNearJcc(code, 0x85); // jne normal gate
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLiveWeaponEntry));
+			code.insert(code.end(), { 0x49, 0x89, 0x0A }); // mov [r10],rcx
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLiveWeaponSequence));
+			code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x02 }); // lock inc dword ptr [r10]
+			const size_t molotovCaptureDoneOffset = code.size();
+			if (!PatchNearJcc(code, notMolotovCaptureOffset, molotovCaptureDoneOffset))
+				return std::vector<uint8_t>{};
+
 			// Physical unarmed/melee combat owns weapon types 0..15. Reject that
 			// local-player native attack at the actual fire-function boundary, even
 			// if a stale Lua weapon event re-injected RT after the XInput clear.
@@ -4613,6 +5260,13 @@ void MemoryManager::ApplyPlayerSemiAutoFireGatePatch() {
 			const size_t semiAutoGateOffset = code.size();
 			if (!PatchNearJcc(code, firearmWeaponOffset, semiAutoGateOffset))
 				return std::vector<uint8_t>{};
+
+			// Custom akimbo owns its own per-hand pending edges at the task boundary.
+			// Do not let the older aggregate semi-auto permit reject the second hand.
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboEnabled));
+			code.insert(code.end(), { 0x41, 0x83, 0x3A, 0x00 });
+			const size_t customAkimboActiveOffset = AppendNearJcc(code, 0x85); // jne allow
 
 			code.push_back(0x49); code.push_back(0xBA);
 			AppendU64(code, reinterpret_cast<uintptr_t>(&playerSemiAutoPullHeld));
@@ -4627,19 +5281,19 @@ void MemoryManager::ApplyPlayerSemiAutoFireGatePatch() {
 
 			code.push_back(0x49); code.push_back(0xBA);
 			AppendU64(code, reinterpret_cast<uintptr_t>(&playerSemiAutoShotPermit));
-			code.insert(code.end(), { 0x45, 0x31, 0xDB }); // xor r11d,r11d
-			code.insert(code.end(), { 0x45, 0x87, 0x1A }); // xchg [r10],r11d
+			code.insert(code.end(), { 0x45, 0x8B, 0x1A }); // mov r11d,[r10]
 			code.insert(code.end(), { 0x45, 0x85, 0xDB }); // test r11d,r11d
-			const size_t permitConsumedOffset = AppendNearJcc(code, 0x85); // jne allow
+			const size_t permitPresentOffset = AppendNearJcc(code, 0x85); // jne allow
 
 			appendBlockedReturn(code);
 
 			const size_t allowOffset = code.size();
 			if (!PatchNearJcc(code, noPlayerOffset, allowOffset) ||
 				!PatchNearJcc(code, notPlayerOffset, allowOffset) ||
+				!PatchNearJcc(code, customAkimboActiveOffset, allowOffset) ||
 				!PatchNearJcc(code, gateInactiveOffset, allowOffset) ||
 				!PatchNearJcc(code, wrongWeaponOffset, allowOffset) ||
-				!PatchNearJcc(code, permitConsumedOffset, allowOffset)) {
+				!PatchNearJcc(code, permitPresentOffset, allowOffset)) {
 				return std::vector<uint8_t>{};
 			}
 
@@ -4657,9 +5311,407 @@ void MemoryManager::ApplyPlayerSemiAutoFireGatePatch() {
 		uevr::API::get()->log_error("%s", "[TriggerGate] player semi-auto fire gate installation failed");
 		return;
 	}
+	gPlayerSemiAutoPullHeld = &playerSemiAutoPullHeld;
+	gPlayerSemiAutoShotPermit = &playerSemiAutoShotPermit;
 
 	uevr::API::get()->log_info("[TriggerGate] player semi-auto fire gate installed at 0x%llX",
 		static_cast<unsigned long long>(target - baseAddressGameEXE));
+}
+
+void MemoryManager::ApplyCustomAkimboFirePatch() {
+	if (customAkimboFirePatchApplyAttempted || settingsManager == nullptr
+		|| !settingsManager->enableCustomAkimbo)
+		return;
+	customAkimboFirePatchApplyAttempted = true;
+	UpdateCombatAssistPlayerPointer();
+
+	const uintptr_t taskDispatch = baseAddressGameEXE + 0x12E5B20;
+	const uintptr_t handFire = baseAddressGameEXE + 0x12E6B60;
+	const bool taskInstalled = InstallHookPatch("Custom akimbo task hand-mask owner",
+		taskDispatch, 5,
+		[this](uintptr_t caveAddress, uintptr_t returnAddress,
+			const std::vector<uint8_t>& originalBytes) {
+			if (originalBytes != std::vector<uint8_t>({ 0x48, 0x89, 0x5C, 0x24, 0x08 }))
+				return std::vector<uint8_t>{};
+			std::vector<uint8_t> code;
+			code.push_back(0x9C); // pushfq
+			code.push_back(0x50); // push rax
+			code.insert(code.end(), { 0x41, 0x52, 0x41, 0x53 }); // push r10/r11
+
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboEnabled));
+			code.insert(code.end(), { 0x41, 0x83, 0x3A, 0x00 });
+			const size_t disabledOffset = AppendNearJcc(code, 0x84); // je original
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&cachedPlayerPointer));
+			code.insert(code.end(), { 0x4D, 0x8B, 0x12, 0x4D, 0x85, 0xD2 });
+			const size_t noPlayerOffset = AppendNearJcc(code, 0x84);
+			code.insert(code.end(), { 0x4C, 0x39, 0xD2 }); // cmp rdx,r10
+			const size_t notPlayerOffset = AppendNearJcc(code, 0x85);
+			// Automatic weapons must use GTA's already accepted task pulse as their
+			// cadence clock. Semi-auto edges may retry until native cooldown accepts.
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboWeaponType));
+			code.insert(code.end(), { 0x41, 0x83, 0x3A, 0x16 }); // cmp [r10],22
+			const size_t semiPistolOffset = AppendNearJcc(code, 0x84);
+			code.insert(code.end(), { 0x41, 0x83, 0x3A, 0x1A }); // cmp [r10],26
+			const size_t semiSawnoffOffset = AppendNearJcc(code, 0x84);
+			code.insert(code.end(), { 0x0F, 0xB6, 0x41, 0x15, 0x85, 0xC0 });
+			const size_t nativeCadenceMissingOffset = AppendNearJcc(code, 0x84);
+			const size_t loadRequestedMaskOffset = code.size();
+			if (!PatchNearJcc(code, semiPistolOffset, loadRequestedMaskOffset)
+				|| !PatchNearJcc(code, semiSawnoffOffset, loadRequestedMaskOffset))
+				return std::vector<uint8_t>{};
+
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboTaskFireMask));
+			code.insert(code.end(), { 0x45, 0x8B, 0x1A, 0x41, 0x83, 0xE3, 0x03 });
+			code.insert(code.end(), { 0x44, 0x88, 0x59, 0x15 }); // mov [rcx+15h],r11b
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboTaskPointer));
+			code.insert(code.end(), { 0x49, 0x89, 0x0A }); // mov [r10],rcx
+			code.insert(code.end(), { 0x45, 0x85, 0xDB });
+			const size_t noRequestOffset = AppendNearJcc(code, 0x84);
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboTaskInjectionSequence));
+			code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x02 });
+
+			const size_t originalOffset = code.size();
+			if (!PatchNearJcc(code, disabledOffset, originalOffset)
+				|| !PatchNearJcc(code, noPlayerOffset, originalOffset)
+				|| !PatchNearJcc(code, notPlayerOffset, originalOffset)
+				|| !PatchNearJcc(code, nativeCadenceMissingOffset, originalOffset)
+				|| !PatchNearJcc(code, noRequestOffset, originalOffset))
+				return std::vector<uint8_t>{};
+			code.insert(code.end(), { 0x41, 0x5B, 0x41, 0x5A, 0x58, 0x9D });
+			code.insert(code.end(), originalBytes.begin(), originalBytes.end());
+			if (!AppendRelJmp(code, caveAddress + code.size(), returnAddress))
+				return std::vector<uint8_t>{};
+			return code;
+		});
+
+	const bool handInstalled = InstallHookPatch("Custom akimbo hand trace selector",
+		handFire, 5,
+		[this](uintptr_t caveAddress, uintptr_t returnAddress,
+			const std::vector<uint8_t>& originalBytes) {
+			if (originalBytes != std::vector<uint8_t>({ 0x48, 0x89, 0x5C, 0x24, 0x20 }))
+				return std::vector<uint8_t>{};
+			std::vector<uint8_t> code;
+			code.push_back(0x9C);
+			code.push_back(0x50);
+			code.insert(code.end(), { 0x41, 0x51, 0x41, 0x52, 0x41, 0x53 }); // r9-r11
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboEnabled));
+			code.insert(code.end(), { 0x41, 0x83, 0x39, 0x00 });
+			const size_t disabledOffset = AppendNearJcc(code, 0x84);
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&cachedPlayerPointer));
+			code.insert(code.end(), { 0x4D, 0x8B, 0x09, 0x4D, 0x85, 0xC9 });
+			const size_t noPlayerOffset = AppendNearJcc(code, 0x84);
+			code.insert(code.end(), { 0x4C, 0x39, 0xCA }); // cmp rdx,r9
+			const size_t notPlayerOffset = AppendNearJcc(code, 0x85);
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboTraceValidMask));
+			code.insert(code.end(), { 0x41, 0x83, 0x39, 0x03 });
+			const size_t tracesMissingOffset = AppendNearJcc(code, 0x85);
+
+			code.insert(code.end(), { 0x45, 0x84, 0xC0 }); // test r8b,r8b
+			const size_t leftHandOffset = AppendNearJcc(code, 0x85);
+			// Native false means right hand, our controller index 1.
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(customAkimboTraceOriginBits[1].data()));
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(customAkimboTraceTargetBits[1].data()));
+			code.push_back(0x48); code.push_back(0xB8);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboActiveHand));
+			code.insert(code.end(), { 0xC7, 0x00, 0x01, 0x00, 0x00, 0x00 });
+			const size_t rightToCopyOffset = code.size();
+			code.push_back(0xE9); AppendU32(code, 0);
+
+			const size_t leftOffset = code.size();
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(customAkimboTraceOriginBits[0].data()));
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(customAkimboTraceTargetBits[0].data()));
+			code.push_back(0x48); code.push_back(0xB8);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&customAkimboActiveHand));
+			code.insert(code.end(), { 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00 });
+
+			const size_t copyOffset = code.size();
+			if (!PatchNearJcc(code, leftHandOffset, leftOffset))
+				return std::vector<uint8_t>{};
+			const int64_t copyDisplacement = static_cast<int64_t>(caveAddress + copyOffset)
+				- static_cast<int64_t>(caveAddress + rightToCopyOffset + 5);
+			if (copyDisplacement < std::numeric_limits<int32_t>::min()
+				|| copyDisplacement > std::numeric_limits<int32_t>::max())
+				return std::vector<uint8_t>{};
+			const int32_t copyRelative = static_cast<int32_t>(copyDisplacement);
+			std::memcpy(code.data() + rightToCopyOffset + 1, &copyRelative, sizeof(copyRelative));
+
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTracePublishSequence));
+			code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x01 }); // odd
+			for (uint8_t axis = 0; axis < 3; ++axis) {
+				const uint8_t displacement = static_cast<uint8_t>(axis * sizeof(LONG));
+				code.insert(code.end(), { 0x41, 0x8B, 0x43, displacement });
+				code.push_back(0x49); code.push_back(0xB9);
+				AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTraceOriginOverrideBits[axis]));
+				code.insert(code.end(), { 0x41, 0x89, 0x01 });
+				code.insert(code.end(), { 0x41, 0x8B, 0x42, displacement });
+				code.push_back(0x49); code.push_back(0xB9);
+				AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTraceTargetOverrideBits[axis]));
+				code.insert(code.end(), { 0x41, 0x89, 0x01 });
+			}
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTracePublishSequence));
+			code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x01 }); // even
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTraceOverrideConsumed));
+			code.insert(code.end(), { 0x41, 0xC7, 0x01, 0, 0, 0, 0 });
+			code.push_back(0x49); code.push_back(0xB9);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeShotTraceOriginOverrideEnabled));
+			code.insert(code.end(), { 0x41, 0xC7, 0x01, 1, 0, 0, 0 });
+
+			const size_t originalOffset = code.size();
+			if (!PatchNearJcc(code, disabledOffset, originalOffset)
+				|| !PatchNearJcc(code, noPlayerOffset, originalOffset)
+				|| !PatchNearJcc(code, notPlayerOffset, originalOffset)
+				|| !PatchNearJcc(code, tracesMissingOffset, originalOffset))
+				return std::vector<uint8_t>{};
+			code.insert(code.end(), { 0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x58, 0x9D });
+			code.insert(code.end(), originalBytes.begin(), originalBytes.end());
+			if (!AppendRelJmp(code, caveAddress + code.size(), returnAddress))
+				return std::vector<uint8_t>{};
+			return code;
+		});
+
+	customAkimboFirePatchInstalled = taskInstalled && handInstalled;
+	if (!customAkimboFirePatchInstalled) {
+		uevr::API::get()->log_error("%s", "[CustomAkimbo] native hand patches failed; feature remains disabled");
+		ClearCustomAkimboState();
+		return;
+	}
+	gCustomAkimboEnabled = &customAkimboEnabled;
+	gCustomAkimboWeaponType = &customAkimboWeaponType;
+	gCustomAkimboPendingMask = &customAkimboPendingMask;
+	gCustomAkimboTaskFireMask = &customAkimboTaskFireMask;
+	gCustomAkimboActiveHand = &customAkimboActiveHand;
+	gCustomAkimboAcceptedShotSequence = &customAkimboAcceptedShotSequence;
+	gCustomAkimboAcceptedHandMask = &customAkimboAcceptedHandMask;
+	uevr::API::get()->log_info(
+		"[CustomAkimbo] native task/fire patches installed task=0x12E5B20 handFire=0x12E6B60");
+}
+
+bool MemoryManager::SetNativeThrowableMotionOverride(const std::array<float, 3>& origin,
+	const std::array<float, 3>& velocity, int weaponType, uint32_t sequence) {
+	if (!nativeThrowableMotionPatchInstalled
+		|| weaponType < 16 || weaponType > 18 || sequence == 0)
+		return false;
+	for (size_t axis = 0; axis < 3; ++axis) {
+		if (!std::isfinite(origin[axis]) || !std::isfinite(velocity[axis]))
+			return false;
+	}
+	// Publication occurs on the engine thread, so refresh the native local-player
+	// identity here even when the optional combat-assist maintenance loop is off.
+	UpdateCombatAssistPlayerPointer();
+	if (cachedPlayerPointer == 0)
+		return false;
+
+	// Publish as one inactive-to-active transaction. The native cave can only
+	// consume a complete origin/velocity pair and clears active after one use.
+	InterlockedExchange(&nativeThrowableMotionOverrideActive, 0);
+	for (size_t axis = 0; axis < 3; ++axis) {
+		LONG originBits = 0;
+		LONG velocityBits = 0;
+		static_assert(sizeof(originBits) == sizeof(origin[axis]));
+		std::memcpy(&originBits, &origin[axis], sizeof(originBits));
+		std::memcpy(&velocityBits, &velocity[axis], sizeof(velocityBits));
+		InterlockedExchange(&nativeThrowableMotionOriginBits[axis], originBits);
+		InterlockedExchange(&nativeThrowableMotionVelocityBits[axis], velocityBits);
+	}
+	InterlockedExchange(&nativeThrowableMotionWeapon, static_cast<LONG>(weaponType));
+	InterlockedExchange(&nativeThrowableMotionPublishSequence, static_cast<LONG>(sequence));
+	InterlockedExchange(&nativeThrowableMotionOverrideActive, 1);
+	return true;
+}
+
+void MemoryManager::ClearNativeThrowableMotionOverride() {
+	InterlockedExchange(&nativeThrowableMotionOverrideActive, 0);
+}
+
+bool MemoryManager::ConsumeNativeThrowableMotionApplied(uint32_t& sequence) {
+	const LONG consumed = InterlockedCompareExchange(
+		&nativeThrowableMotionConsumedSequence, 0, 0);
+	if (consumed == 0 || consumed == lastReadNativeThrowableMotionConsumedSequence)
+		return false;
+	lastReadNativeThrowableMotionConsumedSequence = consumed;
+	sequence = static_cast<uint32_t>(consumed);
+	return true;
+}
+
+bool MemoryManager::ReadLatestNativeThrowableLaunchProbe(
+	NativeThrowableLaunchProbe& probe) {
+	const LONG sequenceBefore = InterlockedCompareExchange(
+		&nativeThrowableLaunchProbeSequence, 0, 0);
+	if (sequenceBefore == 0
+		|| sequenceBefore == lastReadNativeThrowableLaunchProbeSequence)
+		return false;
+
+	const auto readFloatArray = [](const std::array<volatile LONG, 3>& source,
+		std::array<float, 3>& destination) {
+		for (size_t i = 0; i < source.size(); ++i) {
+			const LONG bits = InterlockedCompareExchange(
+				const_cast<volatile LONG*>(&source[i]), 0, 0);
+			std::memcpy(&destination[i], &bits, sizeof(bits));
+		}
+	};
+
+	NativeThrowableLaunchProbe captured{};
+	readFloatArray(nativeThrowableLaunchProbeOriginBits, captured.rawOrigin);
+	readFloatArray(nativeThrowableLaunchProbeVelocityBits, captured.rawVelocity);
+	readFloatArray(nativeThrowableLaunchProbeDirectionBits, captured.rawDirection);
+	const LONG forceBits = InterlockedCompareExchange(
+		&nativeThrowableLaunchProbeForceBits, 0, 0);
+	std::memcpy(&captured.force, &forceBits, sizeof(forceBits));
+	const LONG64 directionPointer = InterlockedCompareExchange64(
+		&nativeThrowableLaunchProbeDirectionPointer, 0, 0);
+	captured.directionSupplied = directionPointer != 0;
+	captured.target = static_cast<uintptr_t>(InterlockedCompareExchange64(
+		&nativeThrowableLaunchProbeTarget, 0, 0));
+	captured.weaponType = static_cast<int>(InterlockedCompareExchange(
+		&nativeThrowableLaunchProbeWeapon, 0, 0));
+	captured.overridden = InterlockedCompareExchange(
+		&nativeThrowableLaunchProbeOverridden, 0, 0) != 0;
+
+	const LONG sequenceAfter = InterlockedCompareExchange(
+		&nativeThrowableLaunchProbeSequence, 0, 0);
+	if (sequenceBefore != sequenceAfter)
+		return false;
+
+	captured.sequence = static_cast<uint32_t>(sequenceAfter);
+	lastReadNativeThrowableLaunchProbeSequence = sequenceAfter;
+	probe = captured;
+	return true;
+}
+
+void MemoryManager::ApplyNativeThrowableMotionPatch() {
+	if (nativeThrowableMotionPatchApplyAttempted || settingsManager == nullptr
+		|| (!settingsManager->enableMotionThrowables
+			&& !settingsManager->enableThrowableMotionProbe))
+		return;
+	nativeThrowableMotionPatchApplyAttempted = true;
+	// Keep the old motion override deliberately disabled. The custom Molotov
+	// flight owns grip-release, and an earlier cave inside the downstream
+	// projectile state machine crashed on the native trigger route. This probe is
+	// intentionally earlier and passive: it copies the already assembled native
+	// AddProjectile arguments and immediately executes the untouched prologue.
+	nativeThrowableMotionPatchInstalled = false;
+	ClearNativeThrowableMotionOverride();
+	if (baseAddressGameEXE == 0) {
+		uevr::API::get()->log_warn("%s",
+			"[NativeThrowableProbe] AddProjectile probe withheld: game module base is unavailable");
+		return;
+	}
+
+	UpdateCombatAssistPlayerPointer();
+	const uintptr_t target = baseAddressGameEXE + NativeThrowableAddProjectileRva;
+	if (std::memcmp(reinterpret_cast<const void*>(target),
+		NativeThrowableAddProjectilePrologue.data(),
+		NativeThrowableAddProjectilePrologue.size()) != 0) {
+		uevr::API::get()->log_warn(
+			"[NativeThrowableProbe] AddProjectile probe withheld: prologue mismatch at RVA 0x%llX",
+			static_cast<unsigned long long>(NativeThrowableAddProjectileRva));
+		return;
+	}
+
+	const bool installed = InstallHookPatch("Native Molotov AddProjectile probe", target,
+		NativeThrowableAddProjectilePrologue.size(),
+		[this](uintptr_t caveAddress, uintptr_t returnAddress,
+			const std::vector<uint8_t>& originalBytes) {
+			std::vector<uint8_t> code;
+			// Preserve every scratch register/flag used by the probe. No C++ call
+			// occurs in this cave, so the original native stack alignment and all
+			// argument registers remain exactly as CWeapon::Fire supplied them.
+			code.push_back(0x9C); // pushfq
+			code.push_back(0x50); // push rax
+			code.insert(code.end(), { 0x41, 0x52 }); // push r10
+			code.insert(code.end(), { 0x41, 0x53 }); // push r11
+
+			code.insert(code.end(), { 0x83, 0xFA, NativeMolotovWeaponType }); // cmp edx,18
+			const size_t wrongWeaponOffset = AppendNearJcc(code, 0x85); // jne restore
+			code.push_back(0x49); code.push_back(0xBA);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&cachedPlayerPointer));
+			code.insert(code.end(), { 0x4D, 0x8B, 0x12 }); // mov r10,[r10]
+			code.insert(code.end(), { 0x4D, 0x85, 0xD2 }); // test r10,r10
+			const size_t noPlayerOffset = AppendNearJcc(code, 0x84); // je restore
+			code.insert(code.end(), { 0x4C, 0x39, 0xD1 }); // cmp rcx,r10
+			const size_t notPlayerOffset = AppendNearJcc(code, 0x85); // jne restore
+
+			// RCX=creator, EDX=weapon, R8=origin, XMM3=force. At function entry
+			// arg5 (direction) and arg6 (target) are [rsp+28h]/[rsp+30h]; the
+			// four saves above shift them to 48h/50h in this cave.
+			code.insert(code.end(), { 0x49, 0x8B, 0x00 }); // mov rax,[r8]
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(nativeThrowableLaunchProbeOriginBits.data()));
+			code.insert(code.end(), { 0x49, 0x89, 0x03 }); // mov [r11],rax
+			code.insert(code.end(), { 0x41, 0x8B, 0x40, 0x08 }); // mov eax,[r8+8]
+			code.insert(code.end(), { 0x41, 0x89, 0x43, 0x08 }); // mov [r11+8],eax
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeForceBits));
+			code.insert(code.end(), { 0xF3, 0x41, 0x0F, 0x11, 0x1B }); // movss [r11],xmm3
+
+			code.insert(code.end(), { 0x4C, 0x8B, 0x54, 0x24, 0x48 }); // mov r10,[rsp+48h]
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeDirectionPointer));
+			code.insert(code.end(), { 0x4D, 0x89, 0x13 }); // mov [r11],r10
+			code.insert(code.end(), { 0x4D, 0x85, 0xD2 }); // test r10,r10
+			const size_t noDirectionOffset = AppendNearJcc(code, 0x84); // je target/metadata
+			code.insert(code.end(), { 0x49, 0x8B, 0x02 }); // mov rax,[r10]
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(nativeThrowableLaunchProbeDirectionBits.data()));
+			code.insert(code.end(), { 0x49, 0x89, 0x03 }); // mov [r11],rax
+			code.insert(code.end(), { 0x41, 0x8B, 0x42, 0x08 }); // mov eax,[r10+8]
+			code.insert(code.end(), { 0x41, 0x89, 0x43, 0x08 }); // mov [r11+8],eax
+
+			const size_t targetAndMetadataOffset = code.size();
+			code.insert(code.end(), { 0x4C, 0x8B, 0x54, 0x24, 0x50 }); // mov r10,[rsp+50h]
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeTarget));
+			code.insert(code.end(), { 0x4D, 0x89, 0x13 }); // mov [r11],r10
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeWeapon));
+			code.insert(code.end(), { 0x41, 0x89, 0x13 }); // mov [r11],edx
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeOverridden));
+			code.insert(code.end(), { 0x41, 0xC7, 0x03, 0x00, 0x00, 0x00, 0x00 });
+			code.push_back(0x49); code.push_back(0xBB);
+			AppendU64(code, reinterpret_cast<uintptr_t>(&nativeThrowableLaunchProbeSequence));
+			code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x03 }); // lock inc dword ptr [r11]
+
+			const size_t restoreOffset = code.size();
+			code.insert(code.end(), { 0x41, 0x5B }); // pop r11
+			code.insert(code.end(), { 0x41, 0x5A }); // pop r10
+			code.push_back(0x58); // pop rax
+			code.push_back(0x9D); // popfq
+			code.insert(code.end(), originalBytes.begin(), originalBytes.end());
+			if (!AppendRelJmp(code, caveAddress + code.size(), returnAddress)
+				|| !PatchNearJcc(code, wrongWeaponOffset, restoreOffset)
+				|| !PatchNearJcc(code, noPlayerOffset, restoreOffset)
+				|| !PatchNearJcc(code, notPlayerOffset, restoreOffset)
+				|| !PatchNearJcc(code, noDirectionOffset, targetAndMetadataOffset))
+				return std::vector<uint8_t>{};
+			return code;
+		});
+	if (!installed) {
+		uevr::API::get()->log_error("%s",
+			"[NativeThrowableProbe] AddProjectile probe installation failed; native trigger path stays untouched");
+		return;
+	}
+
+	nativeThrowableLaunchProbePatchInstalled = true;
+	uevr::API::get()->log_info(
+		"[NativeThrowableProbe] passive AddProjectile probe installed at RVA 0x%llX",
+		static_cast<unsigned long long>(NativeThrowableAddProjectileRva));
 }
 
 void MemoryManager::ApplyManualReloadCapturePatch() {
@@ -4861,10 +5913,58 @@ void MemoryManager::RestoreCombatAssistPatches() {
 	combatAssistPatches.clear();
 	manualReloadCaptureApplyAttempted = false;
 	playerSemiAutoFireGateApplyAttempted = false;
+	customAkimboFirePatchApplyAttempted = false;
+	customAkimboFirePatchInstalled = false;
+	nativeThrowableMotionPatchApplyAttempted = false;
+	nativeThrowableMotionPatchInstalled = false;
+	nativeThrowableLaunchProbePatchInstalled = false;
+	if (gPlayerSemiAutoPullHeld == &playerSemiAutoPullHeld)
+		gPlayerSemiAutoPullHeld = nullptr;
+	if (gPlayerSemiAutoShotPermit == &playerSemiAutoShotPermit)
+		gPlayerSemiAutoShotPermit = nullptr;
+	if (gCustomAkimboEnabled == &customAkimboEnabled)
+		gCustomAkimboEnabled = nullptr;
+	if (gCustomAkimboWeaponType == &customAkimboWeaponType)
+		gCustomAkimboWeaponType = nullptr;
+	if (gCustomAkimboPendingMask == &customAkimboPendingMask)
+		gCustomAkimboPendingMask = nullptr;
+	if (gCustomAkimboTaskFireMask == &customAkimboTaskFireMask)
+		gCustomAkimboTaskFireMask = nullptr;
+	if (gCustomAkimboActiveHand == &customAkimboActiveHand)
+		gCustomAkimboActiveHand = nullptr;
+	if (gCustomAkimboAcceptedShotSequence == &customAkimboAcceptedShotSequence)
+		gCustomAkimboAcceptedShotSequence = nullptr;
+	if (gCustomAkimboAcceptedHandMask == &customAkimboAcceptedHandMask)
+		gCustomAkimboAcceptedHandMask = nullptr;
 	InterlockedExchange(&playerSemiAutoPullHeld, 0);
 	InterlockedExchange(&playerSemiAutoPullWeaponType, 0);
 	InterlockedExchange(&playerSemiAutoShotPermit, 0);
 	InterlockedExchange(&playerSemiAutoBlockedCount, 0);
+	ClearCustomAkimboState();
+	InterlockedExchange(&customAkimboTaskInjectionSequence, 0);
+	InterlockedExchange(&customAkimboAcceptedShotSequence, 0);
+	InterlockedExchange(&customAkimboAcceptedHandMask, 0);
+	InterlockedExchange(&nativeThrowableMotionOverrideActive, 0);
+	InterlockedExchange(&nativeThrowableMotionWeapon, 0);
+	InterlockedExchange(&nativeThrowableMotionPublishSequence, 0);
+	InterlockedExchange(&nativeThrowableMotionConsumedSequence, 0);
+	InterlockedExchange64(&nativeThrowableLiveWeaponEntry, 0);
+	InterlockedExchange(&nativeThrowableLiveWeaponSequence, 0);
+	InterlockedExchange(&nativeThrowableLaunchProbeSequence, 0);
+	InterlockedExchange(&nativeThrowableLaunchProbeWeapon, 0);
+	InterlockedExchange(&nativeThrowableLaunchProbeOverridden, 0);
+	InterlockedExchange(&nativeThrowableLaunchProbeForceBits, 0);
+	InterlockedExchange64(&nativeThrowableLaunchProbeDirectionPointer, 0);
+	InterlockedExchange64(&nativeThrowableLaunchProbeTarget, 0);
+	for (size_t axis = 0; axis < 3; ++axis) {
+		InterlockedExchange(&nativeThrowableMotionOriginBits[axis], 0);
+		InterlockedExchange(&nativeThrowableMotionVelocityBits[axis], 0);
+		InterlockedExchange(&nativeThrowableLaunchProbeOriginBits[axis], 0);
+		InterlockedExchange(&nativeThrowableLaunchProbeVelocityBits[axis], 0);
+		InterlockedExchange(&nativeThrowableLaunchProbeDirectionBits[axis], 0);
+	}
+	lastReadNativeThrowableMotionConsumedSequence = 0;
+	lastReadNativeThrowableLaunchProbeSequence = 0;
 	cachedPlayerPointer = 0;
 	healthRecoveryPlayerPointer = 0;
 	lastHealthRecoverySampleTime = 0;

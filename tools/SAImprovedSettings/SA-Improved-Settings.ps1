@@ -545,6 +545,14 @@ function Launch-Path([string]$Path, [string]$FriendlyName) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
         throw "$FriendlyName path is missing. Use Browse first."
     }
+    if ([System.IO.Path]::GetFileName($Path) -ieq "SanAndreas.exe") {
+        $guardedLauncher = Join-Path $ProfilePath "SAVR-Launch.ps1"
+        if (Test-Path -LiteralPath $guardedLauncher -PathType Leaf) {
+            $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$guardedLauncher`" -GameExe `"$Path`""
+            Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList $arguments
+            return
+        }
+    }
     Start-Process -FilePath $Path -WorkingDirectory (Split-Path -Parent $Path)
 }
 
