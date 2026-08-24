@@ -836,6 +836,7 @@ public:
 	void SetFreeAimWeaponHandsPresentationActive(bool active);
 	void ProcessFreeAimWeaponHands(bool force = false);
 	void RestoreFreeAimWeaponHands();
+	void DiscardPlayerOwnedRuntimeState(const char* reason);
 	void SetGripState(bool leftGripHeld, bool rightGripHeld);
 	bool PrepareForExplicitWeaponCycle();
 	void InitializeGripCalibration();

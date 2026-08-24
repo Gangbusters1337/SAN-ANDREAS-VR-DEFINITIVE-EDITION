@@ -12,7 +12,8 @@
 class ControlGuideOverlay {
 public:
 	void SetVisible(bool visible);
-	void SetOptionsState(int movementOrientation, bool hudAutoHide, uint32_t selectedOption);
+	void SetOptionsState(int movementOrientation, bool hudAutoHide, uint32_t diagnosticMode,
+		uint32_t selectedOption);
 	bool IsVisible() const;
 	void OnDeviceReset();
 	void RenderDx12(ID3D12GraphicsCommandList* commandList, ID3D12Resource* renderTarget,
@@ -37,6 +38,7 @@ private:
 	uint32_t imageHeight = 0;
 	int movementOrientation = 0;
 	bool hudAutoHide = true;
+	uint32_t diagnosticMode = 0;
 	uint32_t selectedOption = 0;
 	bool imageLoadAttempted = false;
 	bool textureUploaded = false;

@@ -182,7 +182,7 @@ void PlayerManager::FetchPlayerUObjects()
 {
 	if (settingsManager->debugMod) uevr::API::get()->log_info("FetchPlayerUObjects()");
 	playerController = uevr::API::get()->get_player_controller(0);
-	if (playerController == nullptr)
+	if (playerController == nullptr || !uevr::API::UObjectHook::exists(playerController))
 	{
 		playerActor = nullptr;
 		playerCharacter = nullptr;
@@ -206,7 +206,7 @@ void PlayerManager::FetchPlayerUObjects()
 	playerHead = nullptr;
 
 	for (auto child : children) {
-		if (child == nullptr)
+		if (child == nullptr || !uevr::API::UObjectHook::exists(child))
 			continue;
 
 		if (gta_playerActor_c != nullptr && playerActor == nullptr && child->is_a(gta_playerActor_c)) {
@@ -219,6 +219,23 @@ void PlayerManager::FetchPlayerUObjects()
 			playerCharacter = child;
 		}
 	}
+}
+
+void PlayerManager::DiscardPlayerObjectCaches()
+{
+	// A save/checkpoint load destroys the old world before the plugin sees the
+	// replacement character. Never call methods on those stale components here.
+	lastBodyVisibilityCharacter = nullptr;
+	bodyVisibilityRefreshTimer = 0.0f;
+	handScaleCharacter = nullptr;
+	handScaleHands = nullptr;
+	handScaleWatch = nullptr;
+	lowerBodyVisibilityProperty = nullptr;
+	shoeVisibilityProperty = nullptr;
+	shoeVisibilityComponents.clear();
+	trackedHandsShoeHidden = false;
+	handsScaledVisible = true;
+	watchScaledVisible = true;
 }
 
 void PlayerManager::RestoreTrackedShoeComponents()

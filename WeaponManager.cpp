@@ -13058,6 +13058,140 @@ void WeaponManager::RestoreFreeAimWeaponHands()
 	playerManager->SetWatchScaled(true, true);
 }
 
+void WeaponManager::DiscardPlayerOwnedRuntimeState(const char* reason)
+{
+	// Save/checkpoint replacement invalidates every UObject owned by the old
+	// world. This path deliberately performs no UObject calls: the old world no
+	// longer needs visual restoration, and the replacement character will build
+	// fresh presentation state after the settle window.
+	gripStateMask.store(0, std::memory_order_release);
+	gripCalibrationButtonMask.store(0, std::memory_order_release);
+	gripCalibrationProcessedButtonMask = 0;
+	gripCalibrationSessions = {};
+	++runtimeHandGeneration;
+	for (auto& state : runtimeHandStates)
+	{
+		state = RuntimeHandState{};
+		state.generation = runtimeHandGeneration;
+	}
+	runtimeHandStateReset = true;
+
+	firstWeaponMesh = nullptr;
+	secondWeaponMesh = nullptr;
+	firstWeaponContainer = nullptr;
+	secondWeaponContainer = nullptr;
+	torso = nullptr;
+	firstWeaponStaticMesh = nullptr;
+	secondWeaponStaticMesh = nullptr;
+	firstWeaponLastParticleShot = nullptr;
+	secondWeaponLastParticleShot = nullptr;
+	firstWeaponPreviousParticles.clear();
+	secondWeaponPreviousParticles.clear();
+	visibilityAppliedFirstWeaponMesh = nullptr;
+	visibilityAppliedSecondWeaponMesh = nullptr;
+	motionConfiguredFirstWeaponMesh = nullptr;
+	motionConfiguredSecondWeaponMesh = nullptr;
+	motionConfiguredFirstHand = -1;
+	motionConfiguredSecondHand = -1;
+	motionConfiguredFirstCalibrationRole = -1;
+
+	customAkimboVisualMesh = nullptr;
+	customAkimboVisualStaticMesh = nullptr;
+	customAkimboVisualCharacter = nullptr;
+	customAkimboVisualWeapon = -1;
+	customAkimboMuzzleEffectTemplate = nullptr;
+	customAkimboMuzzleEffectTemplates.clear();
+	customAkimboMuzzleEffectScales.clear();
+
+	twoHandSupportActive = false;
+	twoHandOffsetApplied = false;
+	twoHandAppliedWeaponMesh = nullptr;
+	twoHandPrimaryBasisValid = false;
+	twoHandPrimaryBasisWeaponMesh = nullptr;
+	twoHandFilteredSupportDirectionValid = false;
+	twoHandStableTargetValid = false;
+	twoHandWristOverrideActive = false;
+	twoHandWristPrimaryHand = -1;
+	twoHandPrimaryHand.store(-1, std::memory_order_release);
+	twoHandFirstGripHandSnapshot.store(-1, std::memory_order_release);
+	twoHandConfiguredHandSnapshot.store(-1, std::memory_order_release);
+	twoHandLatchEligibleSnapshot.store(false, std::memory_order_release);
+
+	magneticIdleWeaponActive = false;
+	magneticGripHand = -1;
+	magneticGripWeaponId = -1;
+	magneticIdleWeaponId = -1;
+	magneticIdleAnchorHand = -1;
+	magneticIdleAnchorBucket = -1;
+	magneticGripAttached = false;
+	magneticReleaseRequested = false;
+	magneticAnchoredWeaponMesh = nullptr;
+	magneticDetachedWeaponMesh = nullptr;
+	magneticIdleNativeParent = nullptr;
+	magneticBodyAnchorParent = nullptr;
+	magneticLegFrameComponent = nullptr;
+	magneticDetachedPlayerCharacter = nullptr;
+	magneticIdleWeaponDetached = false;
+	magneticIdleWeaponBodyAttached = false;
+	magneticStableBodyRotationValid = false;
+	magneticBodyFrameRebaseAt = 0;
+	magneticTriggerBlockedSnapshot.store(false, std::memory_order_release);
+
+	freeAimFakeHandsCharacter = nullptr;
+	freeAimFakeLeftHand = nullptr;
+	freeAimFakeRightHand = nullptr;
+	freeAimClenchedLeftHand = nullptr;
+	freeAimClenchedRightHand = nullptr;
+	freeAimClenchedLeftMesh = nullptr;
+	freeAimClenchedRightMesh = nullptr;
+	freeAimFakeWatch = nullptr;
+	freeAimSupportAttachedWeapon = nullptr;
+	freeAimPrimaryAttachedWeapon = nullptr;
+	freeAimPrimaryAttachPrimeWeapon = nullptr;
+	vehicleNativeRightArmComponent = nullptr;
+	freeAimHandsBlockedCharacter = nullptr;
+	freeAimFakeHandsReady = false;
+	freeAimFakeHandsInitialized = false;
+	freeAimFakeHandsInitializing = false;
+	freeAimFakeHandsActive = false;
+	freeAimSupportHandAttached = false;
+	freeAimSupportWatchAttached = false;
+	freeAimSupportAttachedHand = -1;
+	freeAimPrimaryHandAttached = false;
+	freeAimPrimaryAttachedHand = -1;
+	freeAimPrimaryAttachPrimeFramesRemaining = 0;
+	freeAimPrimaryAttachPrimeHand = -1;
+	freeAimAppliedSupportContactActive = false;
+	freeAimAppliedPrimaryGripAttachmentActive = false;
+	freeAimClenchedHandsReady = false;
+	freeAimClenchedVisibleMask = 0;
+	freeAimWeaponHandsPresentationActive = false;
+	freeAimWeaponHandsVisibilityInitialized = false;
+	vehicleNativeRightArmHidden = false;
+	cachedControllerPalmAdapterComponents = {};
+	cachedControllerPalmAdapterBones = {};
+	cachedControllerPalmAdapters = {};
+
+	motionMeleeDebugAxisComponent = nullptr;
+	motionMeleeDebugAxisCharacter = nullptr;
+	motionMeleeGeometryMesh = nullptr;
+	motionMeleeGeometryValid = false;
+	throwableMotionHiddenMesh = nullptr;
+	motionThrowableFlight = {};
+	motionThrowableDetachedFlights.clear();
+	motionThrowableImpactVisuals.clear();
+	motionThrowableNativeImpactActors.clear();
+	motionThrowableVehicleBurns.clear();
+	motionThrowableSourceHidden = false;
+
+	currentWeaponEquipped = Unarmed;
+	previousWeaponEquipped = Unarmed;
+	ResetShootingState();
+	uevr::API::get()->log_warn(
+		"[SAVRDiag][LifecycleRecovery] reason=%s action=discard-stale-uobject-state generation=%u",
+		reason != nullptr ? reason : "unknown", runtimeHandGeneration);
+}
+
 void WeaponManager::ProcessWeaponHandling(float delta)
 {
 	if (settingsManager->debugMod) uevr::API::get()->log_info("ProcessWeaponHandling()");

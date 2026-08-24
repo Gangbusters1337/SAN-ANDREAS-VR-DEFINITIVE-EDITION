@@ -11,6 +11,7 @@ $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $releaseFiles = Join-Path $RepoRoot "ReleaseFiles"
 $documentation = Join-Path $RepoRoot "Documentation"
 $installerSource = Join-Path $RepoRoot "Installer"
+$supportSource = Join-Path $RepoRoot "Support"
 $releaseVersionFile = Join-Path $RepoRoot "RELEASE_VERSION.txt"
 $manualRoot = Join-Path $OutputRoot "manual\SAVR-Improved-Manual"
 $installerRoot = Join-Path $OutputRoot "installer\SAVR-Improved-Installer"
@@ -33,7 +34,8 @@ foreach ($required in @(
     (Join-Path $releaseFiles "GameFolder\Gameface\Content\Movies\1080\GTA_SA_RSTAR_STINGER_FINAL_1920x1080.mp4"),
     (Join-Path $releaseFiles "GameSettings\GameUserSettings.ini"),
     (Join-Path $documentation "Quest3-Control-Layout.png"),
-    (Join-Path $installerSource "Install-SAVR.ps1")
+    (Join-Path $installerSource "Install-SAVR.ps1"),
+    (Join-Path $supportSource "_INTERNAL - SAVR Support Tool Script.ps1")
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing release input: $required" }
 }
@@ -53,10 +55,17 @@ function Copy-Docs([string]$Target) {
     Copy-Item -LiteralPath (Join-Path $documentation "Quest3-Control-Layout.png") -Destination (Join-Path $Target "Documentation\Quest3-Control-Layout.png") -Force
 }
 
+function Copy-Support([string]$Target) {
+    foreach ($file in @('OPEN SAVR SUPPORT TOOL.bat','_INTERNAL - SAVR Support Tool Script.ps1','SAVR Emergency Diagnostics Switch.ini')) {
+        Copy-Item -LiteralPath (Join-Path $supportSource $file) -Destination (Join-Path $Target $file) -Force
+    }
+}
+
 Copy-Item -LiteralPath (Join-Path $releaseFiles "UnrealVRMod") -Destination $manualRoot -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $releaseFiles "GameFolder") -Destination $manualRoot -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $releaseFiles "GameSettings") -Destination $manualRoot -Recurse -Force
 Copy-Docs $manualRoot
+Copy-Support $manualRoot
 
 Copy-Item -LiteralPath (Join-Path $installerSource "INSTALL-SAVR.bat") -Destination $installerRoot -Force
 Copy-Item -LiteralPath (Join-Path $installerSource "Install-SAVR.ps1") -Destination $installerRoot -Force
@@ -65,6 +74,7 @@ Copy-Item -LiteralPath (Join-Path $releaseFiles "UnrealVRMod") -Destination (Joi
 Copy-Item -LiteralPath (Join-Path $releaseFiles "GameFolder") -Destination (Join-Path $installerRoot "Payload") -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $releaseFiles "GameSettings") -Destination (Join-Path $installerRoot "Payload") -Recurse -Force
 Copy-Docs $installerRoot
+Copy-Support $installerRoot
 
 function Write-VersionInfo([string]$Root, [string]$PackageKind, [string]$DllRelativePath) {
     $dll = Join-Path $Root $DllRelativePath

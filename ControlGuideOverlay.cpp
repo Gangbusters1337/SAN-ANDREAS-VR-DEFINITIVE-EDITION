@@ -51,15 +51,17 @@ void ControlGuideOverlay::SetVisible(bool value)
 		dx11WarmupFrames.store(0, std::memory_order_release);
 }
 
-void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, uint32_t selected)
+void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, uint32_t diagnostics,
+	uint32_t selected)
 {
 	std::scoped_lock lock(stateMutex);
-	selected = (std::min)(selected, 1U);
+	selected = (std::min)(selected, 2U);
 	if (movementOrientation == orientation && hudAutoHide == autoHide
-		&& selectedOption == selected && !basePixels.empty())
+		&& diagnosticMode == diagnostics && selectedOption == selected && !basePixels.empty())
 		return;
 	movementOrientation = orientation;
 	hudAutoHide = autoHide;
+	diagnosticMode = diagnostics;
 	selectedOption = selected;
 	if (!basePixels.empty() && ComposeOptionsPanel())
 	{
@@ -383,7 +385,7 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 	HFONT titleFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_SWISS, L"Arial");
-	HFONT optionFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+	HFONT optionFont = CreateFontW(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_SWISS, L"Arial");
 	HFONT footerFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -406,15 +408,15 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 	const HGDIOBJ oldFont = SelectObject(dc, titleFont);
 	SetTextColor(dc, RGB(226, 166, 61));
 	RECT titleRect{ panel.left + 12, panel.top + 4, panel.right - 12, panel.top + 28 };
-	DrawTextW(dc, L"VR OPTIONS   -   LEFT STICK: SELECT   -   A: CHANGE", -1, &titleRect,
+	DrawTextW(dc, L"VR OPTIONS   -   LEFT STICK LEFT / RIGHT: SELECT   -   A: CHANGE", -1, &titleRect,
 		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
 	SelectObject(dc, optionFont);
-	for (uint32_t index = 0; index < 2; ++index)
+	for (uint32_t index = 0; index < 3; ++index)
 	{
-		const LONG halfWidth = (panel.right - panel.left - 30) / 2;
-		RECT row{ panel.left + 10 + static_cast<LONG>(index) * (halfWidth + 10), panel.top + 31,
-			panel.left + 10 + static_cast<LONG>(index) * (halfWidth + 10) + halfWidth, panel.bottom - 8 };
+		const LONG columnWidth = (panel.right - panel.left - 40) / 3;
+		RECT row{ panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10), panel.top + 31,
+			panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10) + columnWidth, panel.bottom - 8 };
 		if (index == selectedOption)
 		{
 			HBRUSH selectedBrush = CreateSolidBrush(RGB(35, 58, 12));
@@ -431,12 +433,23 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
 			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 		}
-		else
+		else if (index == 1)
 		{
 			std::wstring label = L"HUD AUTO-HIDE: ";
 			label += hudAutoHide ? L"ON" : L"OFF";
 			SetTextColor(dc, hudAutoHide ? RGB(139, 208, 36) : RGB(210, 85, 65));
 			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
+			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+		}
+		else
+		{
+			const wchar_t* state = diagnosticMode == 1 ? L"VEHICLE"
+				: diagnosticMode == 2 ? L"SAVE / LOAD"
+				: diagnosticMode == 3 ? L"FULL" : L"OFF";
+			std::wstring label = L"DIAGNOSTICS: ";
+			label += state;
+			SetTextColor(dc, diagnosticMode == 0 ? RGB(205, 215, 198) : RGB(226, 166, 61));
+			RECT labelRect{ row.left + 5, row.top, row.right - 5, row.bottom };
 			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 		}
 	}

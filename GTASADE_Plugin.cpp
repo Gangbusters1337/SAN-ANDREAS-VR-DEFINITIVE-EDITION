@@ -13,7 +13,10 @@
 #include <chrono>
 #include <cstdint>
 #include <atomic>
+#include <array>
+#include <fstream>
 #include <windows.h>
+#include <shlobj.h>
 
 using namespace uevr;
 
@@ -539,15 +542,24 @@ public:
 
 	void on_post_render_vr_framework_dx12(ID3D12GraphicsCommandList* commandList,
 		ID3D12Resource* renderTarget, D3D12_CPU_DESCRIPTOR_HANDLE* renderTargetView) override {
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
 		controlGuideOverlay.RenderDx12(commandList, renderTarget, renderTargetView);
 	}
 
 	void on_post_render_vr_framework_dx11(ID3D11DeviceContext* context,
 		ID3D11Texture2D* renderTarget, ID3D11RenderTargetView* renderTargetView) override {
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
 		controlGuideOverlay.RenderDx11(context, renderTarget, renderTargetView);
 	}
 
-	bool on_message(HWND hwnd, UINT, WPARAM, LPARAM) override {
+	bool on_message(HWND hwnd, UINT message, WPARAM, LPARAM) override {
+		if (message == WM_CLOSE || message == WM_DESTROY || message == WM_NCDESTROY)
+		{
+			runtimeShutdownRequested.store(true, std::memory_order_release);
+			return true;
+		}
 		if (hwnd != nullptr && IsWindow(hwnd))
 		{
 			const HWND rootWindow = GetAncestor(hwnd, GA_ROOT);
@@ -569,6 +581,8 @@ public:
 
 	void on_xinput_get_state(uint32_t* retval, uint32_t userIndex, XINPUT_STATE* state) override {
 		(void)retval;
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
 		if (userIndex != 0 || state == nullptr)
 		{
 			if (userIndex == 0) {
@@ -582,6 +596,7 @@ public:
 		}
 
 		const WORD buttons = state->Gamepad.wButtons;
+		ObserveDiagnosticVehicleInput(buttons);
 		const bool aircraftLeftStickPressed = (buttons & XINPUT_GAMEPAD_LEFT_THUMB) != 0;
 		const bool fixedWingAircraft = playerManager.isInVehicle
 			&& playerManager.vehicleType == PlayerManager::Plane
@@ -639,6 +654,9 @@ public:
 	}
 
 	void on_dllmain_detach() override {
+		FinishDiagnosticSession(true);
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
 		if (controlGuideNativeHudSuppressed)
 			API::get()->execute_command(L"gta.hud.setvis 1");
 		if (controlGuideHudForcedVisible && !controlGuideHudWasVisible)
@@ -675,6 +693,7 @@ public:
 	void on_initialize() override {
 		API::get()->log_info("%s", "VR cpp mod initializing - Codex combat assist build");
 		settingsManager.InitSettingsManager();
+		InitializeDiagnostics();
 		pause2dStartupRecoveryPending = !settingsManager.RecoverPluginOwnedPause2dScreenMode();
 		if (pause2dStartupRecoveryPending)
 			API::get()->log_info("%s", "[PauseUI] interrupted-session 2D recovery queued until runtime ready");
@@ -712,6 +731,20 @@ public:
 	}
 
 	void on_custom_event(const char* event_name, const char* event_data) override {
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
+		__try
+		{
+			HandleCustomEvent(event_name, event_data);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			API::get()->log_error("[SAVRDiag][CallbackFault] callback=custom-event event=%s code=0x%08lx",
+				event_name != nullptr ? event_name : "<null>", GetExceptionCode());
+		}
+	}
+
+	void HandleCustomEvent(const char* event_name, const char* event_data) {
 		if (event_name == nullptr || event_data == nullptr)
 			return;
 
@@ -721,10 +754,10 @@ public:
 			if (!controlGuideOverlay.IsVisible())
 				return;
 			const std::string action(event_data);
-			if (action == "up")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 2;
-			else if (action == "down")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 2;
+			if (action == "left" || action == "up")
+				controlGuideSelectedOption = (controlGuideSelectedOption + 2) % 3;
+			else if (action == "right" || action == "down")
+				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 3;
 			else if (action == "toggle")
 				ToggleControlGuideOption(controlGuideSelectedOption);
 			else
@@ -732,6 +765,24 @@ public:
 			RefreshControlGuideOptions();
 			API::get()->log_info("[ControlGuide] navigation action=%s selected=%d",
 				action.c_str(), controlGuideSelectedOption);
+			return;
+		}
+		if (eventName == "SAVR.Diagnostics.VehicleInput")
+		{
+			ObserveDiagnosticVehicleStage(event_data);
+			return;
+		}
+		if (eventName == "SAVR.Diagnostics.Lifecycle")
+		{
+			// A Lua reload resets script-local state. Re-publish the session mode so
+			// diagnostics recover live without requiring a game or UEVR restart.
+			API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
+			if (DiagnosticLifecycleEnabled())
+			{
+				++diagnosticGeneration;
+				API::get()->log_info("[SAVRDiag][Lifecycle] generation=%llu stage=%s",
+					static_cast<unsigned long long>(diagnosticGeneration), event_data);
+			}
 			return;
 		}
 		if (eventName == "DUALGRIP.ControlGuide")
@@ -1192,7 +1243,40 @@ public:
 	}
 
 	void on_pre_engine_tick(API::UGameEngine* engine, float delta) override {
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
+		if (preEngineFaultLatched)
+			return;
+		if (gameWindowHandle != nullptr && !IsWindow(gameWindowHandle))
+		{
+			runtimeShutdownRequested.store(true, std::memory_order_release);
+			API::get()->log_info("%s", "[SAVRDiag][Lifecycle] game window destroyed; runtime callbacks stopped");
+			return;
+		}
+		if (GetTickCount64() < preEngineResumeAt)
+			return;
+		__try
+		{
+			OnPreEngineTick(engine, delta);
+			consecutivePreEngineFaults = 0;
+			lifecycleRecoveryPending = false;
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			++consecutivePreEngineFaults;
+			lifecycleRecoveryPending = true;
+			preEngineResumeAt = GetTickCount64() + 250;
+			if (consecutivePreEngineFaults >= 3)
+				preEngineFaultLatched = true;
+			API::get()->log_error("[SAVRDiag][CallbackFault] callback=pre-engine stage=%s code=0x%08lx consecutive=%u action=%s",
+				preEngineStage != nullptr ? preEngineStage : "unknown", GetExceptionCode(), consecutivePreEngineFaults,
+				preEngineFaultLatched ? "callbacks-disabled-for-session" : "retry-after-250ms");
+		}
+	}
+
+	void OnPreEngineTick(API::UGameEngine* engine, float delta) {
 		PLUGIN_LOG_ONCE("Pre Engine Tick: %f", delta);
+		preEngineStage = "begin";
 		weaponManager.BeginInteractionEngineTick();
 		const bool collectInteractionPerf = settingsManager.debugMod;
 		if (!collectInteractionPerf)
@@ -1201,7 +1285,9 @@ public:
 			? InteractionPerfClock::now()
 			: InteractionPerfClock::time_point{};
 
+		preEngineStage = "raw-memory";
 		FetchRequiredValuesFromMemory();
+		UpdateDiagnostics();
 		ProcessControlGuideNativeHudRequest();
 		UpdateAircraftCameraReveal();
 		RetryStartupHudVisibility();
@@ -1214,7 +1300,29 @@ public:
 		if (settingsManager.enableCombatAssist)
 			memoryManager.MaintainCombatAssistValues();
 		weaponManager.ProcessAimCalibrationSample();
+		preEngineStage = "fetch-player-uobjects";
 		playerManager.FetchPlayerUObjects();
+		preEngineStage = "player-identity-transition";
+		if (HandlePlayerIdentityTransition())
+		{
+			ObserveDiagnosticLifecycle();
+			SendStatesToLua();
+			UpdatePreviousStates();
+			preEngineStage = "player-identity-recovery-complete";
+			return;
+		}
+		if (playerReplacementSettleTicksRemaining > 0)
+		{
+			--playerReplacementSettleTicksRemaining;
+			if (playerReplacementSettleTicksRemaining == 0)
+				API::get()->log_info("%s", "[SAVRDiag][LifecycleRecovery] replacement settle complete; normal processing resumes next tick");
+			ObserveDiagnosticLifecycle();
+			SendStatesToLua();
+			UpdatePreviousStates();
+			preEngineStage = "player-replacement-settle";
+			return;
+		}
+		ObserveDiagnosticLifecycle();
 		weaponManager.ProcessGripCalibration();
 
 		const bool playerObjectsReady = playerManager.playerController != nullptr && playerManager.playerHead != nullptr;
@@ -1241,6 +1349,7 @@ public:
 		if (!cameraController.underwaterViewFixed && playerManager.isInControl)
 			cameraController.FixUnderwaterView(true);
 
+		preEngineStage = "manage-plugin-state";
 		ManagePluginState(true, delta);
 		ProcessThumbRestHudGesture(true);
 		ProcessThumbRestHudContext(true);
@@ -1258,6 +1367,7 @@ public:
 		// Main VR functions :
 		if (pluginStateApplied != VRdisabled)
 		{
+			preEngineStage = "vr-gameplay";
 			const auto poseContactStart = collectInteractionPerf
 				? InteractionPerfClock::now()
 				: InteractionPerfClock::time_point{};
@@ -1327,6 +1437,7 @@ public:
 					handlingPresentationStart, handlingPresentationEnd);
 			}
 		}
+		preEngineStage = "send-state";
 		SendStatesToLua();
 		settingsManager.UpdateSettingsIfModifiedByPlayer();
 		UpdatePreviousStates();
@@ -1341,6 +1452,8 @@ public:
 
 
 	void on_post_engine_tick(API::UGameEngine* engine, float delta) override {
+		if (runtimeShutdownRequested.load(std::memory_order_acquire))
+			return;
 		PLUGIN_LOG_ONCE("Post Engine Tick: %f", delta);
 		const bool collectInteractionPerf = settingsManager.debugMod;
 		const auto start = collectInteractionPerf
@@ -1510,6 +1623,48 @@ public:
 	bool controlGuideNativeHudSuppressed = false;
 	std::atomic<int> controlGuideNativeHudRequest{ 0 };
 	int controlGuideSelectedOption = 0;
+	enum class DiagnosticMode : uint8_t { Off = 0, VehicleInput = 1, SaveLoad = 2, Full = 3 };
+	DiagnosticMode diagnosticMode = DiagnosticMode::Off;
+	struct DiagnosticVehicleTransaction
+	{
+		bool active = false;
+		bool captureSeen = false;
+		bool replaySeen = false;
+		bool deliverySeen = false;
+		uint64_t sequence = 0;
+		ULONGLONG startedAt = 0;
+		ULONGLONG deadline = 0;
+	};
+	static constexpr size_t DiagnosticVehicleTransactionCapacity = 4;
+	std::array<DiagnosticVehicleTransaction, DiagnosticVehicleTransactionCapacity> diagnosticVehicleTransactions{};
+	std::string diagnosticProfileDirectory;
+	std::string diagnosticRecoveryPath;
+	std::string diagnosticProfileRecoveryPath;
+	std::string diagnosticSessionMarkerPath;
+	std::string diagnosticInterruptedMarkerPath;
+	ULONGLONG diagnosticRecoveryCheckAt = 0;
+	uint64_t diagnosticGeneration = 0;
+	bool diagnosticForceOff = false;
+	bool diagnosticPhysicalYHeld = false;
+	uint64_t diagnosticVehicleSequence = 0;
+	bool diagnosticLifecycleInitialized = false;
+	bool diagnosticLastInControl = false;
+	bool diagnosticLastInVehicle = false;
+	int diagnosticLastVehicleType = -1;
+	int diagnosticLastCameraMode = -1;
+	int diagnosticLastWeapon = -1;
+	uintptr_t diagnosticLastPlayerCharacter = 0;
+	uintptr_t diagnosticLastPlayerController = 0;
+	bool playerIdentityInitialized = false;
+	uintptr_t activePlayerCharacterIdentity = 0;
+	uintptr_t activePlayerControllerIdentity = 0;
+	bool lifecycleRecoveryPending = false;
+	bool preEngineFaultLatched = false;
+	std::atomic<bool> runtimeShutdownRequested{ false };
+	const char* preEngineStage = "not-started";
+	uint32_t consecutivePreEngineFaults = 0;
+	ULONGLONG preEngineResumeAt = 0;
+	uint8_t playerReplacementSettleTicksRemaining = 0;
 	ULONGLONG hudPinnedRuntimeCheckAt = 0;
 	int hudPinnedObservedPluginState = -1;
 	int hudPinnedObservedCameraMode = -1;
@@ -1547,6 +1702,326 @@ public:
 	static constexpr ULONGLONG ThumbRestTapMaximumMs = 250;
 	static constexpr ULONGLONG ThumbRestDoubleTapWindowMs = 320;
 	static constexpr ULONGLONG HudPinnedRuntimeCheckIntervalMs = 1000;
+	static constexpr ULONGLONG DiagnosticRecoveryCheckIntervalMs = 2000;
+	static constexpr ULONGLONG DiagnosticVehicleOutcomeWindowMs = 4000;
+
+	bool DiagnosticVehicleEnabled() const
+	{
+		return diagnosticMode == DiagnosticMode::VehicleInput || diagnosticMode == DiagnosticMode::Full;
+	}
+
+	bool DiagnosticLifecycleEnabled() const
+	{
+		return diagnosticMode == DiagnosticMode::SaveLoad || diagnosticMode == DiagnosticMode::Full;
+	}
+
+	const char* DiagnosticModeName(DiagnosticMode mode) const
+	{
+		switch (mode)
+		{
+		case DiagnosticMode::VehicleInput: return "vehicle-input";
+		case DiagnosticMode::SaveLoad: return "save-load";
+		case DiagnosticMode::Full: return "full";
+		default: return "off";
+		}
+	}
+
+	void WriteDiagnosticSessionMarker()
+	{
+		if (diagnosticSessionMarkerPath.empty())
+			return;
+		if (diagnosticMode == DiagnosticMode::Off)
+		{
+			DeleteFileA(diagnosticSessionMarkerPath.c_str());
+			return;
+		}
+		std::ofstream marker(diagnosticSessionMarkerPath, std::ios::binary | std::ios::trunc);
+		if (marker)
+			marker << "mode=" << DiagnosticModeName(diagnosticMode) << "\ngeneration="
+				<< diagnosticGeneration << "\n";
+	}
+
+	void SetDiagnosticMode(DiagnosticMode requested, const char* source)
+	{
+		if (diagnosticForceOff && requested != DiagnosticMode::Off)
+		{
+			API::get()->log_warn("[SAVRDiag] mode request rejected source=%s reason=ForceOff", source);
+			requested = DiagnosticMode::Off;
+		}
+		if (diagnosticMode == requested)
+			return;
+		diagnosticMode = requested;
+		++diagnosticGeneration;
+		for (auto& transaction : diagnosticVehicleTransactions)
+			transaction = {};
+		diagnosticLifecycleInitialized = false;
+		WriteDiagnosticSessionMarker();
+		API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
+		API::get()->log_info("[SAVRDiag] mode=%s generation=%llu source=%s sessionOnly=true",
+			DiagnosticModeName(diagnosticMode), static_cast<unsigned long long>(diagnosticGeneration), source);
+	}
+
+	DiagnosticVehicleTransaction* AllocateDiagnosticVehicleTransaction(ULONGLONG now)
+	{
+		for (auto& transaction : diagnosticVehicleTransactions)
+		{
+			if (!transaction.active)
+				return &transaction;
+		}
+		auto* oldest = &diagnosticVehicleTransactions[0];
+		for (auto& transaction : diagnosticVehicleTransactions)
+		{
+			if (transaction.startedAt < oldest->startedAt)
+				oldest = &transaction;
+		}
+		API::get()->log_warn("[SAVRDiag][VehicleExit] seq=%llu outcome=queue-overflow-replaced",
+			static_cast<unsigned long long>(oldest->sequence));
+		*oldest = {};
+		return oldest;
+	}
+
+	DiagnosticVehicleTransaction* FindNewestDiagnosticVehicleTransaction()
+	{
+		DiagnosticVehicleTransaction* newest = nullptr;
+		for (auto& transaction : diagnosticVehicleTransactions)
+		{
+			if (transaction.active && (newest == nullptr || transaction.startedAt > newest->startedAt))
+				newest = &transaction;
+		}
+		return newest;
+	}
+
+	void ResetPlayerOwnedRuntimeState(const char* reason)
+	{
+		API::get()->log_warn("[SAVRDiag][LifecycleRecovery] reason=%s action=discard-player-owned-state",
+			reason != nullptr ? reason : "unknown");
+		heldVisualGraceEnforcementActive = false;
+		playerManager.DiscardPlayerObjectCaches();
+		weaponManager.DiscardPlayerOwnedRuntimeState(reason);
+		memoryManager.ResetTriggerTimingProbe();
+		memoryManager.ClearNativeShotTraceOverride();
+		memoryManager.ClearCustomAkimboState();
+		cameraController.camResetRequested = true;
+		candidateDrivingVehicleModelId = -1;
+		candidateDrivingVehicleModelSamples = 0;
+		activeDrivingVehicleModelId = -1;
+		appliedDrivingCameraProfilePrefix.clear();
+		lastDrivingVehicleModelIdSentToLua = -1;
+		lastWeaponIdSentToLua = -1;
+		meleeNativeTriggerBlockStateInitialized = false;
+		pluginStateApplied = Uninitialized;
+		diagnosticLifecycleInitialized = false;
+		playerReplacementSettleTicksRemaining = 3;
+	}
+
+	bool HandlePlayerIdentityTransition()
+	{
+		const uintptr_t character = reinterpret_cast<uintptr_t>(playerManager.playerCharacter);
+		const uintptr_t controller = reinterpret_cast<uintptr_t>(playerManager.playerController);
+		if (!playerIdentityInitialized)
+		{
+			if (character != 0 || controller != 0)
+			{
+				playerIdentityInitialized = true;
+				activePlayerCharacterIdentity = character;
+				activePlayerControllerIdentity = controller;
+			}
+			return false;
+		}
+
+		const bool identityLost = activePlayerCharacterIdentity != 0 && character == 0;
+		const bool replacement = character != 0
+			&& (character != activePlayerCharacterIdentity || controller != activePlayerControllerIdentity);
+		if (!identityLost && !replacement)
+			return false;
+
+		API::get()->log_warn("[SAVRDiag][LifecycleRecovery] oldCharacter=%p newCharacter=%p oldController=%p newController=%p pendingFault=%s",
+			reinterpret_cast<void*>(activePlayerCharacterIdentity), playerManager.playerCharacter,
+			reinterpret_cast<void*>(activePlayerControllerIdentity), playerManager.playerController,
+			lifecycleRecoveryPending ? "true" : "false");
+		activePlayerCharacterIdentity = character;
+		activePlayerControllerIdentity = controller;
+		lifecycleRecoveryPending = false;
+		ResetPlayerOwnedRuntimeState(identityLost ? "player-object-unavailable" : "player-object-replacement");
+		return true;
+	}
+
+	void InitializeDiagnostics()
+	{
+		diagnosticProfileDirectory = settingsManager.GetProfileDirectory();
+		if (diagnosticProfileDirectory.empty())
+			return;
+		diagnosticProfileRecoveryPath = diagnosticProfileDirectory + "\\SAVR-Recovery.ini";
+		char documentsPath[MAX_PATH]{};
+		if (SUCCEEDED(SHGetFolderPathA(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documentsPath)))
+			diagnosticRecoveryPath = std::string(documentsPath)
+				+ "\\San Andreas VR\\SAVR Emergency Diagnostics Switch.ini";
+		else
+			diagnosticRecoveryPath = diagnosticProfileRecoveryPath;
+		diagnosticSessionMarkerPath = diagnosticProfileDirectory + "\\SAVR_diagnostics_active.flag";
+		diagnosticInterruptedMarkerPath = diagnosticProfileDirectory + "\\SAVR_diagnostics_previous_interrupted.flag";
+		if (GetFileAttributesA(diagnosticSessionMarkerPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+		{
+			MoveFileExA(diagnosticSessionMarkerPath.c_str(), diagnosticInterruptedMarkerPath.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+			API::get()->log_warn("%s", "[SAVRDiag] previous diagnostic session ended unexpectedly; diagnostics forced Off");
+		}
+		diagnosticForceOff = GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
+			diagnosticRecoveryPath.c_str()) != 0
+			|| GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
+				diagnosticProfileRecoveryPath.c_str()) != 0;
+		diagnosticRecoveryCheckAt = GetTickCount64() + DiagnosticRecoveryCheckIntervalMs;
+		API::get()->dispatch_lua_event("diagnosticMode", "off");
+		API::get()->log_info("[SAVRDiag] initialized mode=off forceOff=%s recovery=%s",
+			diagnosticForceOff ? "true" : "false", diagnosticRecoveryPath.c_str());
+	}
+
+	void FinishDiagnosticSession(bool clean)
+	{
+		if (clean && !diagnosticSessionMarkerPath.empty())
+			DeleteFileA(diagnosticSessionMarkerPath.c_str());
+		diagnosticMode = DiagnosticMode::Off;
+	}
+
+	void UpdateDiagnostics()
+	{
+		const ULONGLONG now = GetTickCount64();
+		if (now >= diagnosticRecoveryCheckAt && !diagnosticRecoveryPath.empty())
+		{
+			diagnosticRecoveryCheckAt = now + DiagnosticRecoveryCheckIntervalMs;
+			const bool forceOff = GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
+				diagnosticRecoveryPath.c_str()) != 0
+				|| GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
+					diagnosticProfileRecoveryPath.c_str()) != 0;
+			if (forceOff != diagnosticForceOff)
+			{
+				diagnosticForceOff = forceOff;
+				API::get()->log_info("[SAVRDiag] recovery ForceOff=%s", forceOff ? "true" : "false");
+			}
+			if (forceOff && diagnosticMode != DiagnosticMode::Off)
+				SetDiagnosticMode(DiagnosticMode::Off, "recovery-file");
+		}
+
+		if (!playerManager.isInVehicle)
+		{
+			DiagnosticVehicleTransaction* confirmed = nullptr;
+			for (auto& transaction : diagnosticVehicleTransactions)
+			{
+				if (!transaction.active)
+					continue;
+				if (confirmed == nullptr
+					|| (transaction.deliverySeen && !confirmed->deliverySeen)
+					|| (transaction.deliverySeen == confirmed->deliverySeen
+						&& transaction.startedAt > confirmed->startedAt))
+					confirmed = &transaction;
+			}
+			if (confirmed != nullptr)
+			{
+				API::get()->log_info("[SAVRDiag][VehicleExit] seq=%llu outcome=exit-confirmed latencyMs=%llu capture=%s replay=%s delivered=%s",
+					static_cast<unsigned long long>(confirmed->sequence),
+					static_cast<unsigned long long>(now - confirmed->startedAt),
+					confirmed->captureSeen ? "true" : "false",
+					confirmed->replaySeen ? "true" : "false",
+					confirmed->deliverySeen ? "true" : "false");
+				for (auto& transaction : diagnosticVehicleTransactions)
+					transaction = {};
+			}
+		}
+		for (auto& transaction : diagnosticVehicleTransactions)
+		{
+			if (!transaction.active || now < transaction.deadline)
+				continue;
+			const char* outcome = !transaction.captureSeen ? "input-never-captured"
+				: !transaction.replaySeen ? "captured-not-replayed"
+				: transaction.deliverySeen ? "delivered-game-rejected" : "state-unknown";
+			API::get()->log_warn("[SAVRDiag][VehicleExit] seq=%llu outcome=%s latencyMs=%llu capture=%s replay=%s delivered=%s",
+				static_cast<unsigned long long>(transaction.sequence), outcome,
+				static_cast<unsigned long long>(now - transaction.startedAt),
+				transaction.captureSeen ? "true" : "false",
+				transaction.replaySeen ? "true" : "false",
+				transaction.deliverySeen ? "true" : "false");
+			transaction = {};
+		}
+	}
+
+	void ObserveDiagnosticVehicleInput(WORD buttons)
+	{
+		const bool yHeld = (buttons & XINPUT_GAMEPAD_Y) != 0;
+		if (DiagnosticVehicleEnabled() && playerManager.isInVehicle && yHeld && !diagnosticPhysicalYHeld)
+		{
+			const ULONGLONG now = GetTickCount64();
+			++diagnosticVehicleSequence;
+			auto* transaction = AllocateDiagnosticVehicleTransaction(now);
+			transaction->active = true;
+			transaction->sequence = diagnosticVehicleSequence;
+			transaction->startedAt = now;
+			transaction->deadline = now + DiagnosticVehicleOutcomeWindowMs;
+			API::get()->log_info("[SAVRDiag][VehicleExit] seq=%llu stage=physical-y mapped=xinput-y inControl=%s vehicleType=%d model=%d camera=%d",
+				static_cast<unsigned long long>(diagnosticVehicleSequence),
+				playerManager.isInControl ? "true" : "false", static_cast<int>(playerManager.vehicleType),
+				activeDrivingVehicleModelId, static_cast<int>(cameraController.currentCameraMode));
+		}
+		diagnosticPhysicalYHeld = yHeld;
+	}
+
+	void ObserveDiagnosticVehicleStage(const char* stage)
+	{
+		if (!DiagnosticVehicleEnabled() || stage == nullptr)
+			return;
+		auto* transaction = FindNewestDiagnosticVehicleTransaction();
+		if (transaction == nullptr)
+		{
+			const ULONGLONG now = GetTickCount64();
+			++diagnosticVehicleSequence;
+			transaction = AllocateDiagnosticVehicleTransaction(now);
+			transaction->active = true;
+			transaction->sequence = diagnosticVehicleSequence;
+			transaction->startedAt = now;
+			transaction->deadline = now + DiagnosticVehicleOutcomeWindowMs;
+		}
+		const std::string value(stage);
+		if (value.find("capture") != std::string::npos) transaction->captureSeen = true;
+		if (value.find("replay") != std::string::npos) transaction->replaySeen = true;
+		if (value.find("delivered") != std::string::npos) transaction->deliverySeen = true;
+		API::get()->log_info("[SAVRDiag][VehicleExit] seq=%llu stage=%s inControl=%s inVehicle=%s model=%d camera=%d",
+			static_cast<unsigned long long>(transaction->sequence), value.c_str(),
+			playerManager.isInControl ? "true" : "false", playerManager.isInVehicle ? "true" : "false",
+			activeDrivingVehicleModelId, static_cast<int>(cameraController.currentCameraMode));
+	}
+
+	void ObserveDiagnosticLifecycle()
+	{
+		if (!DiagnosticLifecycleEnabled())
+			return;
+		const uintptr_t character = reinterpret_cast<uintptr_t>(playerManager.playerCharacter);
+		const uintptr_t controller = reinterpret_cast<uintptr_t>(playerManager.playerController);
+		const int vehicleType = static_cast<int>(playerManager.vehicleType);
+		const int cameraMode = static_cast<int>(cameraController.currentCameraMode);
+		const int weapon = static_cast<int>(weaponManager.currentWeaponEquipped);
+		if (!diagnosticLifecycleInitialized || diagnosticLastInControl != playerManager.isInControl
+			|| diagnosticLastInVehicle != playerManager.isInVehicle || diagnosticLastVehicleType != vehicleType
+			|| diagnosticLastCameraMode != cameraMode || diagnosticLastWeapon != weapon
+			|| diagnosticLastPlayerCharacter != character || diagnosticLastPlayerController != controller)
+		{
+			++diagnosticGeneration;
+			API::get()->log_info("[SAVRDiag][Lifecycle] generation=%llu control=%s vehicle=%s vehicleType=%d model=%d camera=%d onFootCamera=%d vehicleCamera=%d weapon=%d character=%p actor=%p head=%p controller=%p pluginState=%d runtimeReady=%s",
+				static_cast<unsigned long long>(diagnosticGeneration), playerManager.isInControl ? "true" : "false",
+				playerManager.isInVehicle ? "true" : "false", vehicleType, activeDrivingVehicleModelId,
+				cameraMode, static_cast<int>(cameraController.currentOnFootCameraMode),
+				static_cast<int>(cameraController.currentVehicleCameraMode), weapon,
+				playerManager.playerCharacter, playerManager.playerActor, playerManager.playerHead,
+				playerManager.playerController, static_cast<int>(pluginStateApplied),
+				API::VR::is_runtime_ready() ? "true" : "false");
+			diagnosticLifecycleInitialized = true;
+			diagnosticLastInControl = playerManager.isInControl;
+			diagnosticLastInVehicle = playerManager.isInVehicle;
+			diagnosticLastVehicleType = vehicleType;
+			diagnosticLastCameraMode = cameraMode;
+			diagnosticLastWeapon = weapon;
+			diagnosticLastPlayerCharacter = character;
+			diagnosticLastPlayerController = controller;
+		}
+	}
 
 	std::string ReadHudRuntimeValue()
 	{
@@ -1621,6 +2096,7 @@ public:
 	{
 		controlGuideOverlay.SetOptionsState(ReadControlGuideMovementOrientation(),
 			settingsManager.enableHudAutoHide,
+			static_cast<uint32_t>(diagnosticMode),
 			static_cast<uint32_t>(controlGuideSelectedOption));
 	}
 
@@ -1643,7 +2119,7 @@ public:
 
 	void ToggleControlGuideOption(int option)
 	{
-		if (option < 0 || option > 1)
+		if (option < 0 || option > 2)
 			return;
 		if (option == 0)
 		{
@@ -1659,6 +2135,13 @@ public:
 			{
 				API::get()->log_warn("[ControlGuide] quick option toggle failed option=%d", option);
 			}
+			return;
+		}
+
+		if (option == 2)
+		{
+			const uint8_t next = (static_cast<uint8_t>(diagnosticMode) + 1U) % 4U;
+			SetDiagnosticMode(static_cast<DiagnosticMode>(next), "control-guide");
 			return;
 		}
 
@@ -1785,7 +2268,8 @@ public:
 			&& !playerManager.weaponWheelEnabled
 			&& (pluginStateApplied == OnFoot || pluginStateApplied == Driving)
 			&& !hudUiAutoRevealedForPause && !pauseUi2dScreenAutoEnabled
-			&& pauseUiExplicitRequestExpiresAt == 0;
+			&& pauseUiExplicitRequestExpiresAt == 0
+			&& !controlGuideOverlay.IsVisible();
 
 		if (!gestureAllowed)
 		{
@@ -2006,6 +2490,12 @@ public:
 		}
 
 		if (thumbRestHudRevealOwned)
+			return;
+		// The control guide is composited into UEVR's UI render target. Hiding
+		// VR_EnableGUI while it is open therefore hides the guide itself, not just
+		// GTA's HUD. Pause the existing timer until the guide closes; its prior
+		// remaining time (or a newly selected auto-hide mode) then resumes normally.
+		if (controlGuideOverlay.IsVisible())
 			return;
 
 		if (!settingsManager.enableHudAutoHide || hudUiPinned || !hudAutoHideTimerActive || !hudUiVisible)

@@ -51,5 +51,5 @@
 - Manual reload mode (disabled by default).
 - Alternate left-handed input modes.
 - Additional body visibility and clipping controls.
-- Experimental diagnostics and calibration probes (disabled by default).
+- Session-only Vehicle Input, Save/Load, and Full support diagnostics, plus a one-click local support-package/recovery tool. Diagnostics default to Off and do not enable experimental gameplay behavior.
 - Native Molotov throw A/B mode and throwable diagnostics (disabled by default).

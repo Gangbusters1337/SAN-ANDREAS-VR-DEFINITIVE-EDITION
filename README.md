@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.1** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -34,7 +34,7 @@ This is still beta software, so back up your existing UEVR `SanAndreas` profile 
 ## Requirements
 
 - A legally installed copy of GTA San Andreas – The Definitive Edition for Windows.
-- The stable UEVR release. The package does **not** include UEVR or game files.
+- **Recommended UEVR version:** [UEVR Nightly 01127](https://github.com/praydog/UEVR-nightly/releases/tag/nightly-01127-6f66affc01cea22e4b1b5a47986e1ade80ccbd26), full build name `UEVR Nightly 01127 (6f66affc01cea22e4b1b5a47986e1ade80ccbd26)`. This is the exact build used to develop and test the mod. Newer UEVR nightlies are not yet validated and may introduce injection, input, rendering, or UI compatibility changes. The package does **not** include UEVR or game files.
 - OpenXR and Quest Touch-style controls are the primary tested setup.
 - Supported executable used during development: `SanAndreas.exe` SHA-256 `CF677214A8AB317B3BC8811C64BBC60742204D021132C79E7C0583322CF5BA17`.
 
@@ -49,7 +49,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.1 change list.
 
 ## What you get in VR
 
@@ -174,6 +174,12 @@ The same full-resolution layout is included under `Documentation` and in the UEV
 4. Use the separate SA Improved Settings utility for optional and experimental flags.
 
 See [CONTROLS.md](CONTROLS.md) and [FEATURES.md](FEATURES.md).
+
+## Support and recovery
+
+Run **`OPEN SAVR SUPPORT TOOL.bat`** beside this README to disable diagnostics, re-enable the in-game diagnostics selector, create a privacy-scrubbed local support ZIP, or open the UEVR log folder. Nothing is uploaded automatically. Installer users also receive the same clearly named launcher under `Documents\San Andreas VR`; the file beginning with `_INTERNAL` is not meant to be opened directly.
+
+The in-game A+X guide offers session-only `Off`, `Vehicle Input`, `Save/Load`, and `Full` diagnostics. A crash or interrupted session leaves a marker for the support ZIP and the next launch safely starts with diagnostics Off. `SAVR Emergency Diagnostics Switch.ini` provides an emergency `ForceOff=true` override that the running plugin checks without requiring a restart.
 
 ## Questions and bug reports
 

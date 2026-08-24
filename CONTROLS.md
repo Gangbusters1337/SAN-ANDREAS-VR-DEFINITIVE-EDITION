@@ -67,7 +67,8 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Double-tap the left thumb-rest: pin or unpin the HUD.
 - Hold the left thumb-rest: reveal the HUD context while using the touch D-pad.
 - Right B + Left Y: reveal pause UI and send a short Start pulse.
-- The experimental in-game A+X control-guide overlay is disabled in this beta because UEVR does not present its render target reliably. Open `Documentation/Quest3-Control-Layout.png` outside the game instead.
+- Right A + Left X opens/closes the in-game control guide. Use the left stick to select and A to change Body Orientation, HUD Auto-Hide, or the session-only Diagnostics mode.
+- Diagnostics choices are Off, Vehicle Input, Save/Load, and Full. They always start Off after a restart and never enable experimental gameplay behavior.
 - Short press of the left Quest menu action (350 ms or less): cycle the camera.
 - A longer left Quest menu hold does not cycle the camera.
 - HUD auto-hide defaults to 20 seconds; pause UI auto-show defaults on.

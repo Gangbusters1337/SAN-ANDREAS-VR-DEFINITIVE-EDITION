@@ -110,6 +110,14 @@ void SettingsManager::InitSettingsManager()
 	FetchPluginSettings();
 }
 
+std::string SettingsManager::GetProfileDirectory() const
+{
+	if (pluginConfigFilePath.empty())
+		return {};
+	const size_t fileNamePos = pluginConfigFilePath.find_last_of("\\/");
+	return fileNamePos == std::string::npos ? std::string{} : pluginConfigFilePath.substr(0, fileNamePos);
+}
+
 void SettingsManager::FetchUevrSettings(bool writeToPlugin)
 {
 	if (debugMod) uevr::API::get()->log_info("UpdateUevrSettings()");

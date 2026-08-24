@@ -87,6 +87,7 @@ local LEFT_THUMB_REST_ACTION_PATHS = {
 }
 local LEFT_THUMB_REST_LOOKUP_RETRY_SECONDS = 1.0
 local debugInputLayerProbe = false
+local savrDiagnosticMode = "off"
 local currentWeaponId = 0
 local authoritativeMeleeTriggerBlock = false
 local lastManualReloadWeaponId = 0
@@ -250,6 +251,31 @@ local function dispatch_control_guide_navigation(action)
         uevr.params.functions.dispatch_custom_event("DUALGRIP.ControlGuideNav", action)
     end
 end
+
+local function vehicle_diagnostics_enabled()
+    return savrDiagnosticMode == "vehicle-input" or savrDiagnosticMode == "full"
+end
+
+local function dispatch_vehicle_diagnostic(stage)
+    if not vehicle_diagnostics_enabled() then
+        return
+    end
+    if uevr and uevr.api and uevr.api.dispatch_custom_event then
+        uevr.api:dispatch_custom_event("SAVR.Diagnostics.VehicleInput", stage)
+    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
+        uevr.params.functions.dispatch_custom_event("SAVR.Diagnostics.VehicleInput", stage)
+    end
+end
+
+local function dispatch_savr_lifecycle(stage)
+    if uevr and uevr.api and uevr.api.dispatch_custom_event then
+        uevr.api:dispatch_custom_event("SAVR.Diagnostics.Lifecycle", stage)
+    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
+        uevr.params.functions.dispatch_custom_event("SAVR.Diagnostics.Lifecycle", stage)
+    end
+end
+
+dispatch_savr_lifecycle("lua-loaded")
 
 local function dispatch_manual_reload()
     if uevr and uevr.api and uevr.api.dispatch_custom_event then
@@ -898,6 +924,7 @@ local function apply_chord_controls(state, buttons, now)
 
         if chordPauseCaptureUntil ~= nil and not xyHeld then
             if not pauseButtonHeld then
+                dispatch_vehicle_diagnostic("capture-cancelled-release")
                 chordPauseCaptureUntil = nil
                 chordPauseCapturedButton = nil
                 chordPauseCaptureStartedAt = nil
@@ -915,6 +942,7 @@ local function apply_chord_controls(state, buttons, now)
             chordPauseCaptureUntil = nil
             chordPauseIgnoreUntilRelease = true
             buttons = set_button(buttons, chordPauseCapturedButton)
+            dispatch_vehicle_diagnostic("replay-start-delivered")
             log_control_debug(string.format(
                 "vehicle pause chord single-button replay after %.0fms",
                 ((now - (chordPauseCaptureStartedAt or now)) * 1000.0)
@@ -929,6 +957,7 @@ local function apply_chord_controls(state, buttons, now)
                 chordPauseCapturedButton = BUTTON_Y
                 chordPauseCaptureStartedAt = now
                 chordPauseCaptureUntil = now + VEHICLE_PAUSE_CHORD_WINDOW_SECONDS
+                dispatch_vehicle_diagnostic("capture-y-start")
                 buttons = clear_button(buttons, BUTTON_Y)
                 state.Gamepad.wButtons = buttons
                 return true
@@ -963,18 +992,18 @@ local function apply_chord_controls(state, buttons, now)
         -- The guide owns a fixed controller-operated options panel. Require a
         -- neutral frame after opening so the A in A+X cannot also toggle an option.
         local guideToggleHeld = has_button(buttons, BUTTON_A)
-        local guideStickY = state.Gamepad.sThumbLY or 0
-        local guideNeutral = not guideToggleHeld and math.abs(guideStickY) < DPAD_STICK_RELEASE_THRESHOLD
+        local guideStickX = state.Gamepad.sThumbLX or 0
+		local guideNeutral = not guideToggleHeld and math.abs(guideStickX) < DPAD_STICK_RELEASE_THRESHOLD
         if not controlGuideInputArmed then
             if guideNeutral then
                 controlGuideInputArmed = true
                 controlGuideToggleHeld = false
             end
         else
-            if math.abs(guideStickY) < DPAD_STICK_RELEASE_THRESHOLD then
+            if math.abs(guideStickX) < DPAD_STICK_RELEASE_THRESHOLD then
                 controlGuideStickLatched = false
             elseif not controlGuideStickLatched then
-                dispatch_control_guide_navigation(guideStickY > 0 and "up" or "down")
+                dispatch_control_guide_navigation(guideStickX > 0 and "right" or "left")
                 controlGuideStickLatched = true
             end
             if guideToggleHeld and not controlGuideToggleHeld and not abHeld then
@@ -2015,6 +2044,9 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
             debugInputLayerProbe = parse_bool(value)
             lastInputProbeSignature = nil
         end
+	elseif event_name == "diagnosticMode" then
+		savrDiagnosticMode = tostring(event_string or "off")
+		log("diagnostic mode=" .. savrDiagnosticMode)
     end
 end)
 

@@ -115,6 +115,7 @@ public:
 	bool RecoverPluginOwnedPause2dScreenMode();
 	std::string GetGripCalibrationFilePath() const;
 	std::string GetHolsterAnchorsFilePath() const;
+	std::string GetProfileDirectory() const;
 
 private:
 	struct CameraOffsetProfile {

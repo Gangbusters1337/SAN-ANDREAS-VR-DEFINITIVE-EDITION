@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.3.1 — Diagnostics and Stability
+
+This update makes SAVR easier to recover, diagnose, and support without changing the established v0.3 combat and control design.
+
+### Save/load and lifecycle recovery
+
+- Added guarded recovery when GTA replaces CJ's player, actor, head, or controller objects during save loads, retries, deaths, and similar lifecycle transitions.
+- Discards stale player-owned UObject, hand, weapon, camera, and transient interaction state before normal processing resumes on the replacement player.
+- Keeps recovery bounded and fail-closed instead of continuing with pointers owned by the previous gameplay instance.
+
+### User-selectable diagnostics
+
+- Added session-only `Off`, `Vehicle Input`, `Save / Load`, and `Full` diagnostic modes to the in-game A+X quick-options panel.
+- Changed quick-option navigation to left/right so it matches the horizontal menu layout.
+- Added focused vehicle-entry/exit transaction reporting and lifecycle state reporting without enabling experimental gameplay behavior.
+- Diagnostics always return to `Off` after a restart.
+
+### One-click support packages
+
+- Added an obvious `OPEN SAVR SUPPORT TOOL.bat` entry point beside the README, with the implementation script clearly marked internal.
+- Added one-click collection of SAVR/UEVR logs, relevant profile and game settings, active diagnostic state, package metadata, and the UEVR crash dump when one exists.
+- Added an easy top-level emergency diagnostics switch for users who cannot get back into VR to change the setting.
+- Redacts user paths and records hashes/version evidence so reports can be compared without packaging game files or saves.
+
+### HUD and control-guide reliability
+
+- Prevented HUD auto-hide from hiding the A+X control guide, which shares UEVR's UI composition layer.
+- Prevented thumb-rest HUD taps from changing UI visibility while the control guide owns the screen.
+- Restores the user's previous HUD visibility and auto-hide timing when the guide closes.
+
+### Packaging and installer updates
+
+- Packages the support tool and emergency switch in both stable-name Manual and Installer archives.
+- Installs the recovery configuration beside the active SAVR profile and keeps support collection local until the user chooses to share the resulting ZIP.
+- Preserves the stable download names while recording `v0.3.1` and exact hashes inside each archive.
+
 ## v0.3.0-beta — Motion Throwables and Independent Akimbo
 
 This beta adds two of the largest interaction upgrades yet while preserving GTA's native combat ownership wherever it matters.

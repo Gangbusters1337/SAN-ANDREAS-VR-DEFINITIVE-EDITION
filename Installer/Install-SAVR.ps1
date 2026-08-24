@@ -222,6 +222,23 @@ try {
     $installedDll = Join-Path $ProfilePath "plugins\UEVR_GTASADE.dll"
     if (-not (Test-Path -LiteralPath $installedDll -PathType Leaf)) { throw "Plugin verification failed: $installedDll" }
 
+    Write-Step "Installing support and recovery tools"
+    $supportHome = Join-Path $DocumentsPath "San Andreas VR"
+    New-Item -ItemType Directory -Force -Path $supportHome | Out-Null
+    foreach ($supportFile in @("OPEN SAVR SUPPORT TOOL.bat", "_INTERNAL - SAVR Support Tool Script.ps1", "SAVR Emergency Diagnostics Switch.ini", "VERSION.txt")) {
+        $source = Join-Path $PackageRoot $supportFile
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $supportHome $supportFile) -Force
+        }
+    }
+	foreach ($obsoleteSupportFile in @("SAVR Support & Recovery.bat", "SAVR Support & Recovery.ps1", "SAVR-Recovery.ini")) {
+		$obsoletePath = Join-Path $supportHome $obsoleteSupportFile
+		if (Test-Path -LiteralPath $obsoletePath -PathType Leaf) {
+			Remove-Item -LiteralPath $obsoletePath -Force
+		}
+	}
+    Write-Host "Support tool: $supportHome" -ForegroundColor Green
+
     if (-not $SkipShortcuts) {
         $desktop = [Environment]::GetFolderPath("Desktop")
         $shell = New-Object -ComObject WScript.Shell

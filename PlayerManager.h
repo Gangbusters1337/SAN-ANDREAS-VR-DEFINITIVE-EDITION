@@ -54,6 +54,7 @@ public:
 	bool watchScaledVisible = true;
 
 	void FetchPlayerUObjects();
+	void DiscardPlayerObjectCaches();
 	void ProcessBodyVisibility(float delta);
 	void SetHandsScaled(bool visible, bool force = false);
 	void SetWatchScaled(bool visible, bool force = false);
