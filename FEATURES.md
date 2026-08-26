@@ -25,6 +25,7 @@
 - Quest A fires in eligible vehicles while RT remains acceleration.
 - Native left-hand steering presentation is retained where supported.
 - Per-model camera offsets save and restore automatically.
+- Hold the left Quest menu button in a road vehicle to cycle GTA's original native vehicle cameras while preserving the same SAVR driving and free-aim controls.
 - Native aircraft controls are preserved, including Hydra touch-D-pad support and short exterior-camera feedback for supported landing-gear changes.
 - Bicycle-specific pedal/fire separation for BMX, Bike, and Mountain Bike.
 
@@ -34,6 +35,7 @@
 - Quest X quick weapon cycling on foot.
 - Y+B pause chord and short camera-switch action.
 - Phone-answer grip tap.
+- Quick right-grip tap or R3 for GTA's native on-foot context action, including same-slot ground-weapon replacement when a pickup is available.
 - HUD auto-hide and mission/pause visibility recovery behavior.
 - Settings utility and Lua feature-flag interface.
 

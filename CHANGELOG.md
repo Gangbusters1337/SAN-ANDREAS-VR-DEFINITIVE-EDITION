@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.2 — Native Vehicle Cameras and Ground-Weapon Swaps
+
+This update restores GTA's original vehicle camera choices without sacrificing SAVR's driving and free-aim controls, and makes same-slot weapon pickups practical with motion controllers.
+
+### Original vehicle camera modes
+
+- Hold the left Quest menu button for about one second in a car, boat, or motorbike to send GTA's native Back/View action and cycle its original vehicle cameras.
+- A short left Quest menu press still opens Pause; the camera hold is blocked on foot and in aircraft.
+- Vehicle camera selection is no longer immediately forced back to first person.
+- Lua now follows the authoritative in-vehicle state even when an exterior camera temporarily reports an on-foot native camera type, preserving steering, acceleration, grips, and vehicle firing.
+- Leaving the vehicle restores the established on-foot first-person behavior.
+
+### Ground-weapon pickup and context control
+
+- A quick right-grip tap on foot now sends GTA's native RB context action for a ringing phone or a same-slot ground-weapon pickup prompt.
+- R3 provides the same on-foot context action as a secondary fallback while L3+R3 remains reserved for the UEVR menu.
+- Holding the right grip continues to own the weapon or clenched hand normally; only a short release becomes the context action.
+- The action works independently of HUD visibility, so an auto-hidden pickup prompt does not make the pickup unavailable.
+
+### Compatibility and packaging
+
+- Preserves the v0.3.1 diagnostics, recovery tools, launch race guard, stable profile handling, motion throwables, akimbo, animated hands, physical melee, vehicle free aim, and per-vehicle camera calibration.
+- Continues to target UEVR Nightly 01127 and the supported SanAndreas.exe hash documented in the README and package metadata.
+- Keeps the stable Manual and Installer filenames while recording `v0.3.2` and exact hashes inside each archive.
+
 ## v0.3.1 — Diagnostics and Stability
 
 This update makes SAVR easier to recover, diagnose, and support without changing the established v0.3 combat and control design.

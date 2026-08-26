@@ -795,7 +795,7 @@ void SettingsManager::WriteFeatureFlagStatus(const std::string& reason)
 	writeFlag("EnableChordHudToggle", enableChordHudToggle, enableChordHudToggle, "LiveOnConfigReload", "VR controls", "Right A + Left X control-guide overlay");
 	writeFlag("EnablePauseUiAutoShow", enablePauseUiAutoShow, enablePauseUiAutoShow, "LiveOnConfigReload", "VR controls", "Show UI while paused");
 	writeFlag("EnableHudAutoHide", enableHudAutoHide, enableHudAutoHide, "LiveOnConfigReload", "VR controls", "Auto-hide HUD after 20 seconds");
-	writeFlag("EnableShortPressCameraSwitch", enableShortPressCameraSwitch, enableShortPressCameraSwitch, "LiveOnConfigReload", "VR controls", "Short press left Quest menu camera switch");
+	writeFlag("EnableShortPressCameraSwitch", enableShortPressCameraSwitch, enableShortPressCameraSwitch, "LiveOnConfigReload", "VR controls", "Hold left Quest menu for native vehicle camera modes");
 	writeFlag("EnableFirstPersonCameraLock", enableFirstPersonCameraLock, enableFirstPersonCameraLock, "LiveOnConfigReload", "VR comfort and camera", "Lock first-person camera [recommended on]");
 	writeFlag("EnableVehicleFaceButtonFire", enableVehicleFaceButtonFire, enableVehicleFaceButtonFire, "LiveOnConfigReload", "VR controls", "Vehicle live-lap weapon on right controller [ordinary driving prototype]");
 	writeFlag("EnableAircraftNativeControls", enableAircraftNativeControls, enableAircraftNativeControls, "LiveOnConfigReload", "VR controls", "Aircraft native controls [recommended on, experimental]");

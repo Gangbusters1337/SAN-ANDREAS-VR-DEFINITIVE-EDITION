@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.1** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.2** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -25,6 +25,8 @@ The big difference is how physical the game feels:
 - **Great-feeling driving controls:** drive, steer, accelerate, brake, and use vehicle weapons without fighting the VR controls.
 - **Custom refined flight controls:** aircraft handling, Hydra VTOL support, and landing-gear camera feedback are tuned separately from ground vehicles.
 - **Vehicle cameras that remember you:** calibrate a car or other vehicle once and its camera position is saved and recalled automatically every time you get back in. Many cars, bikes, boats, and aircraft already have tuned profiles.
+- **Original GTA vehicle camera modes:** hold the left Quest menu button in a road vehicle to cycle GTA's native close and exterior views without remapping steering, acceleration, or weapon controls.
+- **Quick ground-weapon swaps:** tap the right grip—or use R3—while standing over GTA's pickup prompt to replace a same-slot weapon even when the HUD is hidden.
 - **Natural weapon handling:** drop weapons into magnetic waist holsters, recall them per weapon, and keep two-hand grips stable through regrips.
 - **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
 - **Sharper, clearer visuals:** improved textures, scope and muzzle presentation, cleaner effects, and graphics settings that leave room for extra quality.
@@ -49,7 +51,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.1 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.2 change list.
 
 ## What you get in VR
 
@@ -70,6 +72,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.1 change list.
 - **Free aim in cars:** aim and fire supported vehicle weapons while keeping acceleration and driving controls available.
 - **Great-feeling driving controls:** steering, acceleration, braking, vehicle hands, bicycle pedals, motorbike handling, and vehicle firing are separated so they do not fight each other.
 - **Camera calibration that sticks:** open the UEVR camera controls, position the view once, and the mod saves it per vehicle model and restores it automatically on future entries.
+- **Native vehicle camera cycling:** hold the left Quest menu button in a car, boat, or motorbike to use GTA's original Back/View camera cycle; a short press still opens Pause, and on-foot first person remains locked.
 - **Many pre-calibrated vehicles:** tuned profiles are included for a broad set of cars and other vehicle types; uncalibrated models fall back safely and can be adjusted the same way.
 - **Custom refined flight controls:** aircraft controls stay native where appropriate, with Hydra VTOL support, aircraft-specific input handling, and brief exterior-camera feedback for supported landing-gear changes.
 - **HMD-oriented movement support:** use the UEVR body/movement option that suits your standing or seated setup while retaining stick locomotion.
@@ -79,6 +82,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.1 change list.
 - **Auto-hiding HUD for maximum immersion in sunny San Andreas:** show it with the left touch, pin or unpin it with a double-tap, and use the touch modifier with the right stick for contextual D-pad actions.
 - **In-game control guide:** A+X opens the Quest 3 layout and quick VR options without needing to leave the game.
 - **Useful interaction shortcuts:** phone answering, pause controls, camera switching, weapon cycling, vehicle fire, and aircraft-specific controls are mapped for motion controllers.
+- **Context-aware pickup control:** a quick right-grip tap or R3 sends GTA's native on-foot context action for phone calls and same-slot ground-weapon swaps without changing held-grip behavior.
 - **Sharper high-definition VR:** improved textures, scope and reticle clarity, cleaner effects, better muzzle flashes, and graphics settings with headroom for stronger PCs.
 - **Installer safety:** Auto Detect and Manual Path modes, OneDrive-aware profile handling, backups, guarded single-instance launching, and package hashes help protect existing settings.
 

@@ -33,7 +33,8 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Bare fists support both hands independently.
 - With brass knuckles, the primary magnetic hand uses brass-knuckle damage and the other held hand acts as a bare fist.
 - Triggers are clench state only for unarmed/melee weapons. Native trigger punching is blocked; physical contact owns attacks.
-- A quick right-grip tap of 300 ms or less answers a ringing phone while on foot.
+- A quick right-grip tap of 300 ms or less sends GTA's native RB context action while on foot: it answers a ringing phone or replaces the equipped weapon while standing over a same-slot ground-weapon prompt, even when the HUD is hidden. Holding grip remains normal weapon/fist ownership.
+- R3 sends the same native RB context action on foot as a secondary fallback.
 
 ## Vehicles
 
@@ -69,8 +70,8 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Right B + Left Y: reveal pause UI and send a short Start pulse.
 - Right A + Left X opens/closes the in-game control guide. Use the left stick to select and A to change Body Orientation, HUD Auto-Hide, or the session-only Diagnostics mode.
 - Diagnostics choices are Off, Vehicle Input, Save/Load, and Full. They always start Off after a restart and never enable experimental gameplay behavior.
-- Short press of the left Quest menu action (350 ms or less): cycle the camera.
-- A longer left Quest menu hold does not cycle the camera.
+- In a car, boat, or motorbike, hold the left Quest menu button for about one second to send GTA's native Back/View action and cycle its original vehicle cameras. A short press remains Pause.
+- The camera hold is blocked on foot and in aircraft, so it cannot change those camera/control paths.
 - HUD auto-hide defaults to 20 seconds; pause UI auto-show defaults on.
 - Click L3 + R3 together to open or close the UEVR menu.
 - With the UEVR menu open, hold RT and use the left stick for camera left/right/forward/back and the right stick for camera up/down. Per-vehicle offsets are saved automatically after they settle.
@@ -111,7 +112,7 @@ Left-handed mode is configured in settings: disabled, trigger swap, or full inpu
 
 ## Known control issues to verify
 
-- The left Quest menu camera action depends on the installed UEVR profile routing that action through D-pad Left.
+- The vehicle camera action uses UEVR's original System-button long-hold mapping to native Xbox Back/View; it does not post keyboard `V` or synthesize D-pad input.
 - The optional feature-flags UI still contains stale labels for legacy grip cycling and an older vehicle X/A fire proposal.
 - The older `CONTROL_MAPPING_NOTES.txt` grip + ABXY D-pad and medium-hold camera descriptions are obsolete.
 - Quick Left-X weapon cycling can briefly expose GTA's native weapon wheel because it uses a bounded LB pulse; deliberate hold-to-open weapon-wheel behavior is not implemented.

@@ -2625,30 +2625,24 @@ public:
 
 		if (!settingsManager.enableFirstPersonCameraLock || !playerManager.isInControl)
 			return;
+		// The comfort lock is on-foot only. Vehicle cameras are selected by GTA's
+		// native Back/View action and must remain selected until the player cycles
+		// them again; forcing Close here made the original camera switch appear to
+		// work for only one frame.
+		if (playerManager.isInVehicle)
+			return;
 
 		// Keep scripted camera weapon and drive-by aim states under game control.
 		if (cameraController.currentCameraMode == CameraController::Camera ||
 			cameraController.currentCameraMode == CameraController::AimWeaponFromCar)
 			return;
 
-		if (playerManager.isInVehicle)
-		{
-			if (cameraController.currentVehicleCameraMode == CameraController::VehicleCameraMode::Close)
-				return;
+		if (cameraController.currentOnFootCameraMode == CameraController::OnFootCameraMode::Close)
+			return;
 
-			const auto close = CameraController::VehicleCameraMode::Close;
-			*(reinterpret_cast<CameraController::VehicleCameraMode*>(memoryManager.vehicleCameraModeAddress)) = close;
-			cameraController.currentVehicleCameraMode = close;
-		}
-		else
-		{
-			if (cameraController.currentOnFootCameraMode == CameraController::OnFootCameraMode::Close)
-				return;
-
-			const auto close = CameraController::OnFootCameraMode::Close;
-			*(reinterpret_cast<CameraController::OnFootCameraMode*>(memoryManager.onFootCameraModeAddress)) = close;
-			cameraController.currentOnFootCameraMode = close;
-		}
+		const auto close = CameraController::OnFootCameraMode::Close;
+		*(reinterpret_cast<CameraController::OnFootCameraMode*>(memoryManager.onFootCameraModeAddress)) = close;
+		cameraController.currentOnFootCameraMode = close;
 	}
 
 	void UpdateAircraftCameraReveal()
@@ -3082,8 +3076,22 @@ public:
 		}
 		if (playerManager.isInControl != playerManager.wasInControl)
 			API::get()->dispatch_lua_event("playerControlState", playerManager.isInControl ? "true" : "false");
-		if (playerManager.vehicleType != playerManager.previousVehicleType)
-			API::get()->dispatch_lua_event("playerState", playerManager.VehicleTypeToString(playerManager.vehicleType));
+		if (playerManager.vehicleType != playerManager.previousVehicleType
+			|| playerManager.isInVehicle != playerManager.wasInVehicle)
+		{
+			// Some original exterior camera modes temporarily report the native
+			// vehicle-type field as OnFoot even though the authoritative vehicle flag
+			// remains true. Never let that camera-only field change Lua's controls.
+			std::string playerState = playerManager.isInVehicle
+				? playerManager.VehicleTypeToString(playerManager.vehicleType)
+				: "OnFoot";
+			if (playerManager.isInVehicle && playerState == "OnFoot")
+				playerState = "CarOrBoat";
+			API::get()->dispatch_lua_event("playerState", playerState.c_str());
+			API::get()->log_info("[VehicleCamera] authoritative Lua state=%s inVehicle=%s nativeType=%d",
+				playerState.c_str(), playerManager.isInVehicle ? "true" : "false",
+				static_cast<int>(playerManager.vehicleType));
+		}
 		if (activeDrivingVehicleModelId != lastDrivingVehicleModelIdSentToLua)
 		{
 			lastDrivingVehicleModelIdSentToLua = activeDrivingVehicleModelId;

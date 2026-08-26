@@ -150,12 +150,10 @@ SAVRCustomAkimboInput = SAVRCustomAkimboInput or {
     lastHeldMask = -1,
     lastWeapon = -1
 }
-local LEFT_SYSTEM_SHORT_PRESS_SECONDS = 0.35
 local DPAD_STICK_THRESHOLD = 16000
 local DPAD_STICK_RELEASE_THRESHOLD = 8000
 local leftSystemAction = nil
 local leftSystemSource = nil
-local leftSystemPressedAt = nil
 local leftSystemWasHeld = false
 local vehicleLeftFireLogged = false
 local vehicleRightFireLogged = false
@@ -166,7 +164,12 @@ local phoneAnswerPulseUntil = nil
 local PHONE_ANSWER_TAP_SECONDS = 0.30
 -- Mission script input is sampled less consistently than ordinary gameplay
 -- input. Keep the synthesized RB edge long enough to survive a slow script tick.
-local PHONE_ANSWER_PULSE_SECONDS = 0.25
+local PHONE_ANSWER_PULSE_SECONDS = 0.55
+SAVRContextR3 = SAVRContextR3 or {
+    wasHeld = false,
+    chordSeen = false,
+    rightShoulderPulseUntil = nil
+}
 local rightGripReloadPressedAt = nil
 local previousRightGripReloadHeld = false
 local rightGripReloadFireSeen = false
@@ -534,14 +537,6 @@ local function dispatch_pause_ui_reveal()
     end
 end
 
-local function dispatch_camera_cycle()
-    if uevr and uevr.api and uevr.api.dispatch_custom_event then
-        uevr.api:dispatch_custom_event("DUALGRIP.CycleCameraView", "")
-    elseif uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
-        uevr.params.functions.dispatch_custom_event("DUALGRIP.CycleCameraView", "")
-    end
-end
-
 local function is_left_system_button_active()
     if not (vr and vr.get_action_handle and vr.get_left_joystick_source and vr.is_action_active) then
         return false
@@ -549,7 +544,7 @@ local function is_left_system_button_active()
 
     if leftSystemAction == nil or leftSystemSource == nil then
         local actionOk, action = pcall(function()
-            return vr.get_action_handle("/actions/default/in/DPad_Left")
+            return vr.get_action_handle("/actions/default/in/SystemButton")
         end)
         local sourceOk, source = pcall(function()
             return vr.get_left_joystick_source()
@@ -568,33 +563,67 @@ local function is_left_system_button_active()
 end
 
 local function apply_short_press_camera_switch(state, buttons, now)
-    if not enableShortPressCameraSwitch then
-        leftSystemPressedAt = nil
+    local systemHeld = is_left_system_button_active()
+    if not systemHeld then
         leftSystemWasHeld = false
         return buttons
     end
 
-    local systemHeld = is_left_system_button_active()
-    if systemHeld then
-        -- The left Quest menu is deliberately routed to DPad_Left in this
-        -- profile. Consume it while deciding whether this is a short press.
-        buttons = clear_button(buttons, DPAD_LEFT)
-        if not leftSystemWasHeld then
-            leftSystemPressedAt = now
-        end
-        leftSystemWasHeld = true
-    elseif leftSystemWasHeld then
-        local heldSeconds = now - (leftSystemPressedAt or now)
-        leftSystemPressedAt = nil
-        leftSystemWasHeld = false
-        if heldSeconds <= LEFT_SYSTEM_SHORT_PRESS_SECONDS then
-            dispatch_camera_cycle()
-            log(string.format("left Quest menu short press -> camera cycle (%.3fs)", heldSeconds))
+    -- Preserve UEVR's original system-button behavior: a short press becomes
+    -- Start/Pause, while a hold becomes native Xbox Back/View. Only allow the
+    -- latter to reach GTA while driving a non-aircraft vehicle. This changes no
+    -- steering, firing, grip, or face-button mapping and leaves physical gamepad
+    -- Back untouched when the Quest system action is not active.
+    if has_button(buttons, BUTTON_BACK) then
+        if enableShortPressCameraSwitch and isPlayerDriving and not isPlayerAircraft then
+            if not leftSystemWasHeld then
+                log("left Quest menu hold -> native vehicle camera View")
+            end
+            leftSystemWasHeld = true
+        else
+            buttons = clear_button(buttons, BUTTON_BACK)
         end
     end
 
     state.Gamepad.wButtons = buttons
     return buttons
+end
+
+local function apply_on_foot_r3_context_action(state, buttons, now)
+    if not playerInputEnabled or isPlayerDriving or isPlayerAircraft then
+        SAVRContextR3.wasHeld = false
+        SAVRContextR3.chordSeen = false
+        SAVRContextR3.rightShoulderPulseUntil = nil
+        return buttons, false
+    end
+
+    local r3Held = has_button(buttons, RIGHT_THUMB)
+    local l3Held = has_button(buttons, LEFT_THUMB)
+    if r3Held then
+        SAVRContextR3.chordSeen = SAVRContextR3.chordSeen or l3Held
+        -- Preserve L3+R3 for the UEVR menu; R3 alone is the on-foot context action.
+        if not l3Held then
+            buttons = clear_button(buttons, RIGHT_THUMB)
+        end
+    elseif SAVRContextR3.wasHeld then
+        if not SAVRContextR3.chordSeen then
+            SAVRContextR3.rightShoulderPulseUntil = now + 0.55
+            log("on-foot R3 release -> native right shoulder context action")
+        end
+        SAVRContextR3.chordSeen = false
+    end
+
+    SAVRContextR3.wasHeld = r3Held
+    if SAVRContextR3.rightShoulderPulseUntil ~= nil then
+        if now <= SAVRContextR3.rightShoulderPulseUntil then
+            buttons = set_button(buttons, RIGHT_SHOULDER)
+            state.Gamepad.wButtons = buttons
+            return buttons, true
+        end
+        SAVRContextR3.rightShoulderPulseUntil = nil
+    end
+    state.Gamepad.wButtons = buttons
+    return buttons, false
 end
 
 local function apply_vehicle_face_button_fire(state, buttons, now)
@@ -1324,7 +1353,8 @@ local function reset_phone_answer_state()
 end
 
 local function update_phone_answer_tap(rightGripHeld, now)
-    if not enablePhoneAnswerGripTap or not phoneRinging or isPlayerDriving then
+    if not enablePhoneAnswerGripTap or isPlayerDriving
+        or (enableManualReloadMode and not phoneRinging) then
         reset_phone_answer_state()
         return
     end
@@ -1338,7 +1368,9 @@ local function update_phone_answer_tap(rightGripHeld, now)
         if rightGripPhonePressedAt ~= nil
             and now - rightGripPhonePressedAt <= PHONE_ANSWER_TAP_SECONDS then
             phoneAnswerPulseUntil = now + PHONE_ANSWER_PULSE_SECONDS
-            log("phone answer tap -> right shoulder")
+            log(phoneRinging
+                and "phone answer tap -> right shoulder"
+                or "on-foot quick right-grip tap -> native right shoulder context action")
         end
         rightGripPhonePressedAt = nil
     end
@@ -1555,6 +1587,11 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
     local rawLeftGripHeld = has_button(buttons, LEFT_SHOULDER)
     local rawRightGripHeld = has_button(buttons, RIGHT_SHOULDER)
     local rawFireHeld = triggerTimingFireHeld
+    local contextualR3Consumed
+    buttons, contextualR3Consumed = apply_on_foot_r3_context_action(state, buttons, now)
+    if contextualR3Consumed then
+        return
+    end
     update_manual_reload_tap(rawRightGripHeld, rawLeftGripHeld, rawFireHeld, now)
 
     local questXCycleConsumed
@@ -1998,7 +2035,6 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
         elseif name == "EnableShortPressCameraSwitch" then
             enableShortPressCameraSwitch = parse_bool(value)
             if not enableShortPressCameraSwitch then
-                leftSystemPressedAt = nil
                 leftSystemWasHeld = false
             end
         elseif name == "EnableVehicleFaceButtonFire" then
