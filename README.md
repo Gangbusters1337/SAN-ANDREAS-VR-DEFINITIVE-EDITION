@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.2** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.3** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -22,6 +22,7 @@ The big difference is how physical the game feels:
 - **Refined, accurate melee:** swing bats and melee weapons, punch with either fist, and fight with a melee weapon in one hand while the other hand fights freely.
 - **Punch and melee weapon sound effects:** hits feel physical, with distinct feedback for fists, knuckles, blunt weapons, sharp weapons, and vehicles.
 - **Excellent vehicle free aim:** aim and fire from supported cars and bikes while keeping driving controls available.
+- **Vehicle free-aim fixes:** vehicle firing works again, with infinite vehicle free-aim ammo restored.
 - **Great-feeling driving controls:** drive, steer, accelerate, brake, and use vehicle weapons without fighting the VR controls.
 - **Custom refined flight controls:** aircraft handling, Hydra VTOL support, and landing-gear camera feedback are tuned separately from ground vehicles.
 - **Vehicle cameras that remember you:** calibrate a car or other vehicle once and its camera position is saved and recalled automatically every time you get back in. Many cars, bikes, boats, and aircraft already have tuned profiles.
@@ -29,6 +30,8 @@ The big difference is how physical the game feels:
 - **Quick ground-weapon swaps:** tap the right grip—or use R3—while standing over GTA's pickup prompt to replace a same-slot weapon even when the HUD is hidden.
 - **Natural weapon handling:** drop weapons into magnetic waist holsters, recall them per weapon, and keep two-hand grips stable through regrips.
 - **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
+- **Reliable result screens:** fixed invisible Mission Failed, Wasted, Busted, and similar screens, plus loss of controls on those screens.
+- **Broader diagnostics:** expanded input-loss debugging makes controller problems easier to investigate.
 - **Sharper, clearer visuals:** improved textures, scope and muzzle presentation, cleaner effects, and graphics settings that leave room for extra quality.
 
 This is still beta software, so back up your existing UEVR `SanAndreas` profile before installing. A few missions, unusual vehicles, and weapon combinations may still need refinement.
@@ -51,7 +54,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.2 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.3 change list.
 
 ## What you get in VR
 

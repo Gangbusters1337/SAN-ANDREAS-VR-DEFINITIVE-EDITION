@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.3 — Vehicle Combat and Mission-Screen Reliability
+
+- Fixed vehicle free-aim firing that was broken in v0.3.2.
+- Fixed infinite ammo while driving.
+- Fixed bugs that could make Mission Failed, Wasted, Busted, and similar pop-up screens invisible or leave the controllers unresponsive.
+- Expanded diagnostics for input-loss debugging.
+
 ## v0.3.2 — Native Vehicle Cameras and Ground-Weapon Swaps
 
 This update restores GTA's original vehicle camera choices without sacrificing SAVR's driving and free-aim controls, and makes same-slot weapon pickups practical with motion controllers.

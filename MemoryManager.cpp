@@ -58,6 +58,7 @@ namespace {
 	constexpr size_t PlayerHealthOffset = 0x76C;
 	constexpr size_t PlayerMaxHealthOffset = 0x770;
 	constexpr uint32_t CombatAssistReserveAmmo = 400;
+	constexpr uint32_t VehicleCombatAssistReserveThreshold = 50;
 	constexpr size_t WeaponInfoCount = 80;
 	constexpr size_t WeaponInfoSize = 0x70;
 	constexpr size_t WeaponInfoFireTypeOffset = 0x00;
@@ -1749,6 +1750,31 @@ bool MemoryManager::ReloadCurrentWeaponOneMagazine(int expectedWeaponType, bool 
 		useDualCapacity ? "true" : "false",
 		settingsManager->activeCombatAssistAmmo ? "true" : "false",
 		restoringClearedWeaponEntry ? "true" : "false");
+	return true;
+}
+
+bool MemoryManager::RefillVehicleCombatAssistAmmoIfLow(int expectedWeaponType) {
+	if (settingsManager == nullptr || !settingsManager->activeCombatAssistAmmo
+		|| settingsManager->activeManualReloadMode) {
+		InterlockedExchange(&vehicleCombatAssistAmmoWeaponType, 0);
+		return false;
+	}
+
+	if (expectedWeaponType < static_cast<int>(FirstBulletWeaponType)
+		|| expectedWeaponType > static_cast<int>(LastStandardBulletWeaponType)) {
+		InterlockedExchange(&vehicleCombatAssistAmmoWeaponType, 0);
+		return false;
+	}
+
+	InterlockedExchange(&vehicleCombatAssistAmmoWeaponType, expectedWeaponType);
+	const LONG refillCount = InterlockedCompareExchange(&vehicleCombatAssistAmmoRefillCount, 0, 0);
+	if (refillCount == lastReportedVehicleCombatAssistAmmoRefillCount)
+		return false;
+
+	lastReportedVehicleCombatAssistAmmoRefillCount = refillCount;
+	uevr::API::get()->log_info(
+		"[VehicleFreeAim] combat-assist drive-by ammo refilled weapon=%d total=%u count=%ld",
+		expectedWeaponType, CombatAssistReserveAmmo, refillCount);
 	return true;
 }
 
@@ -5184,6 +5210,42 @@ void MemoryManager::ApplyCombatAssistPatches() {
 				code.insert(code.end(), originalBytes.begin(), originalBytes.end());
 				if (!AppendRelJmp(code, caveAddress + code.size(), returnAddress))
 					return std::vector<uint8_t>{};
+				return code;
+			});
+
+		installHook("Vehicle combat-assist reserve ammo",
+			{ 0x8B, 0x47, 0x0C, 0xFF, 0xC8, 0x3D, 0xA6, 0x61, 0x00, 0x00, 0x77 },
+			5,
+			[this](uintptr_t caveAddress, uintptr_t returnAddress, const std::vector<uint8_t>& originalBytes) {
+				std::vector<uint8_t> code;
+				code.push_back(0x9C); // pushfq
+				code.insert(code.end(), { 0x41, 0x52 }); // push r10
+				code.push_back(0x49); code.push_back(0xBA);
+				AppendU64(code, reinterpret_cast<uintptr_t>(&vehicleCombatAssistAmmoWeaponType));
+				code.insert(code.end(), { 0x45, 0x8B, 0x12 }); // mov r10d,[r10]
+				code.insert(code.end(), { 0x45, 0x85, 0xD2 }); // test r10d,r10d
+				const size_t notArmedOffset = AppendShortJcc(code, 0x74); // je restore
+				code.insert(code.end(), { 0x0F, 0xB7, 0x07 }); // movzx eax,word [rdi]
+				code.insert(code.end(), { 0x44, 0x39, 0xD0 }); // cmp eax,r10d
+				const size_t wrongWeaponOffset = AppendShortJcc(code, 0x75); // jne restore
+				code.insert(code.end(), { 0x83, 0x7F, 0x0C,
+					static_cast<uint8_t>(VehicleCombatAssistReserveThreshold) }); // cmp dword [rdi+0Ch],50
+				const size_t reserveAboveThresholdOffset = AppendShortJcc(code, 0x77); // ja restore
+				code.insert(code.end(), { 0xC7, 0x47, 0x0C }); AppendU32(code, CombatAssistReserveAmmo);
+				code.push_back(0x49); code.push_back(0xBA);
+				AppendU64(code, reinterpret_cast<uintptr_t>(&vehicleCombatAssistAmmoRefillCount));
+				code.insert(code.end(), { 0xF0, 0x41, 0xFF, 0x02 }); // lock inc dword [r10]
+
+				const size_t restoreOffset = code.size();
+				code.insert(code.end(), { 0x41, 0x5A }); // pop r10
+				code.push_back(0x9D); // popfq
+				code.insert(code.end(), originalBytes.begin(), originalBytes.end());
+				if (!AppendRelJmp(code, caveAddress + code.size(), returnAddress)
+					|| !PatchShortJcc(code, notArmedOffset, restoreOffset)
+					|| !PatchShortJcc(code, wrongWeaponOffset, restoreOffset)
+					|| !PatchShortJcc(code, reserveAboveThresholdOffset, restoreOffset)) {
+					return std::vector<uint8_t>{};
+				}
 				return code;
 			});
 	}

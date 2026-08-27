@@ -13200,6 +13200,9 @@ void WeaponManager::ProcessWeaponHandling(float delta)
 	{
 		memoryManager->SetVehicleShotTraceModeActive(vehicleFreeAim
 			&& !playerManager->weaponWheelEnabled && motionWeaponTrackingEnabled);
+		memoryManager->RefillVehicleCombatAssistAmmoIfLow(
+			vehicleFreeAim && vehicleFaceButtonHeld.load(std::memory_order_acquire)
+				? static_cast<int>(currentWeaponEquipped) : 0);
 		if (playerManager->isInVehicle
 			&& (!vehicleFreeAim || playerManager->weaponWheelEnabled || !motionWeaponTrackingEnabled))
 			memoryManager->ClearNativeShotTraceOverride();

@@ -597,6 +597,62 @@ public:
 
 		const WORD buttons = state->Gamepad.wButtons;
 		ObserveDiagnosticVehicleInput(buttons);
+		++diagnosticControlCallbackCount;
+		const ULONGLONG diagnosticNow = GetTickCount64();
+		const bool diagnosticLeftActive = (buttons & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y
+			| XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_LEFT_THUMB)) != 0
+			|| state->Gamepad.bLeftTrigger > 30
+			|| state->Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+		const bool diagnosticRightActive = (buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X
+			| XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_RIGHT_THUMB)) != 0
+			|| state->Gamepad.bRightTrigger > 30
+			|| state->Gamepad.sThumbRX > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbRX < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbRY > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
+			|| state->Gamepad.sThumbRY < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+		if (diagnosticLeftActive)
+			diagnosticControlLastLeftActiveAt = diagnosticNow;
+		if (diagnosticRightActive)
+			diagnosticControlLastRightActiveAt = diagnosticNow;
+		if (!playerManager.isInControl && pauseUi2dScreenAutoEnabled
+			&& (buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B
+				| XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK)) != 0)
+		{
+			pauseUiNativeMenuActionObserved.store(true, std::memory_order_release);
+		}
+		if (diagnosticMode == DiagnosticMode::Full
+			&& diagnosticNow >= diagnosticControlNextHeartbeatAt)
+		{
+			diagnosticControlNextHeartbeatAt = diagnosticNow + 1000;
+			diagnosticControlHeartbeatPendingOutput = true;
+			LogDiagnosticControlSnapshot("cpp-entry", state);
+		}
+		// Wasted, busted, and mission-result cameras can leave GTA's generic
+		// isInControl byte set. Give those screens the untouched native controller
+		// state and release only the transient physical-hand input ownership.
+		if (resultScreenInputPassthrough.load(std::memory_order_acquire))
+		{
+			if ((buttons & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B
+				| XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK)) != 0)
+			{
+				interactive2dResultSelectionObserved.store(true, std::memory_order_release);
+			}
+			thumbRestModifierActive = false;
+			PublishThumbRestTouchState(false);
+			cameraController.SetRightJoystickCameraSuppressed(false);
+			weaponManager.SetGripState(false, false);
+			weaponManager.SetMeleeClenchState(false, false);
+			weaponManager.SetCalibrationButtonState(false, false);
+			if (diagnosticControlHeartbeatPendingOutput)
+			{
+				LogDiagnosticControlSnapshot("cpp-result-passthrough", state);
+				diagnosticControlHeartbeatPendingOutput = false;
+			}
+			return;
+		}
 		const bool aircraftLeftStickPressed = (buttons & XINPUT_GAMEPAD_LEFT_THUMB) != 0;
 		const bool fixedWingAircraft = playerManager.isInVehicle
 			&& playerManager.vehicleType == PlayerManager::Plane
@@ -650,6 +706,11 @@ public:
 		// Apply this after the plugin's other XInput mutations. The Lua remap is
 		// disabled for this feature, leaving this as the single D-pad owner.
 		ApplyThumbRestDpadFallback(state);
+		if (diagnosticControlHeartbeatPendingOutput)
+		{
+			LogDiagnosticControlSnapshot("cpp-output", state);
+			diagnosticControlHeartbeatPendingOutput = false;
+		}
 
 	}
 
@@ -679,6 +740,12 @@ public:
 		resultScreenPresentationActive = false;
 		resultScreenHudAutoRevealed = false;
 		resultScreen2dAutoEnabled = false;
+		resultScreenPresentationReassertAt = 0;
+		resultScreenPresentationReassertsRemaining = 0;
+		interactive2dResultInputActive = false;
+		interactive2dResultSelectionObserved.store(false, std::memory_order_release);
+		pauseUiNativeMenuActionObserved.store(false, std::memory_order_release);
+		resultScreenInputPassthrough.store(false, std::memory_order_release);
 		RestoreThumbRestHudContext("detach");
 		cameraController.SetRightJoystickCameraSuppressed(false);
 		weaponManager.CancelGripCalibration();
@@ -774,9 +841,10 @@ public:
 		}
 		if (eventName == "SAVR.Diagnostics.Lifecycle")
 		{
-			// A Lua reload resets script-local state. Re-publish the session mode so
-			// diagnostics recover live without requiring a game or UEVR restart.
-			API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
+			// Do not dispatch Lua events re-entrantly from inside Lua's event callback:
+			// UEVR can drop those nested replies. Defer the complete state reply to the
+			// next engine tick, after this callback has returned.
+			luaStateRepublishPending.store(true, std::memory_order_release);
 			if (DiagnosticLifecycleEnabled())
 			{
 				++diagnosticGeneration;
@@ -1278,6 +1346,12 @@ public:
 		PLUGIN_LOG_ONCE("Pre Engine Tick: %f", delta);
 		preEngineStage = "begin";
 		weaponManager.BeginInteractionEngineTick();
+		if (luaStateRepublishPending.exchange(false, std::memory_order_acq_rel))
+		{
+			settingsManager.DispatchFeatureFlagsToLua();
+			API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
+			API::get()->log_info("%s", "[FeatureFlags] Deferred Lua state republish completed");
+		}
 		const bool collectInteractionPerf = settingsManager.debugMod;
 		if (!collectInteractionPerf)
 			interactionPerfTotals = {};
@@ -1672,6 +1746,20 @@ public:
 	bool resultScreenPresentationActive = false;
 	bool resultScreenHudAutoRevealed = false;
 	bool resultScreen2dAutoEnabled = false;
+	ULONGLONG resultScreenPresentationReassertAt = 0;
+	uint8_t resultScreenPresentationReassertsRemaining = 0;
+	bool interactive2dResultInputActive = false;
+	std::atomic<bool> interactive2dResultSelectionObserved{ false };
+	std::atomic<bool> pauseUiNativeMenuActionObserved{ false };
+	std::atomic<bool> resultScreenInputPassthrough{ false };
+	bool resultScreenInputStateInitialized = false;
+	bool lastResultScreenInputStateSentToLua = false;
+	ULONGLONG diagnosticControlNextHeartbeatAt = 0;
+	uint64_t diagnosticControlCallbackCount = 0;
+	ULONGLONG diagnosticControlLastLeftActiveAt = 0;
+	ULONGLONG diagnosticControlLastRightActiveAt = 0;
+	bool diagnosticControlHeartbeatPendingOutput = false;
+	std::atomic<bool> luaStateRepublishPending{ false };
 	ULONGLONG pauseUiExplicitRequestExpiresAt = 0;
 	bool heldVisualGraceEnforcementActive = false;
 	ULONGLONG pauseUiNoControlTraceNextAt = 0;
@@ -2645,6 +2733,38 @@ public:
 		cameraController.currentOnFootCameraMode = close;
 	}
 
+	void LogDiagnosticControlSnapshot(const char* stage, const XINPUT_STATE* state)
+	{
+		if (diagnosticMode != DiagnosticMode::Full || state == nullptr)
+			return;
+		const ULONGLONG now = GetTickCount64();
+		const long long leftAgeMs = diagnosticControlLastLeftActiveAt == 0
+			? -1LL : static_cast<long long>(now - diagnosticControlLastLeftActiveAt);
+		const long long rightAgeMs = diagnosticControlLastRightActiveAt == 0
+			? -1LL : static_cast<long long>(now - diagnosticControlLastRightActiveAt);
+		API::get()->log_info(
+			"[SAVRDiag][ControlPipeline] stage=%s callbacks=%llu packet=%lu buttons=0x%04X lt=%u rt=%u lx=%d ly=%d rx=%d ry=%d leftAgeMs=%lld rightAgeMs=%lld control=%s vehicle=%s vehicleType=%d camera=%d weapon=%d pluginState=%d resultPass=%s runtimeReady=%s",
+			stage != nullptr ? stage : "unknown",
+			static_cast<unsigned long long>(diagnosticControlCallbackCount),
+			static_cast<unsigned long>(state->dwPacketNumber),
+			static_cast<unsigned int>(state->Gamepad.wButtons),
+			static_cast<unsigned int>(state->Gamepad.bLeftTrigger),
+			static_cast<unsigned int>(state->Gamepad.bRightTrigger),
+			static_cast<int>(state->Gamepad.sThumbLX),
+			static_cast<int>(state->Gamepad.sThumbLY),
+			static_cast<int>(state->Gamepad.sThumbRX),
+			static_cast<int>(state->Gamepad.sThumbRY),
+			leftAgeMs, rightAgeMs,
+			playerManager.isInControl ? "true" : "false",
+			playerManager.isInVehicle ? "true" : "false",
+			static_cast<int>(playerManager.vehicleType),
+			static_cast<int>(cameraController.currentCameraMode),
+			static_cast<int>(weaponManager.currentWeaponEquipped),
+			static_cast<int>(pluginStateApplied),
+			resultScreenInputPassthrough.load(std::memory_order_acquire) ? "true" : "false",
+			API::VR::is_runtime_ready() ? "true" : "false");
+	}
+
 	void UpdateAircraftCameraReveal()
 	{
 		const uint8_t requestMask = aircraftCameraRevealRequestMask.exchange(0U, std::memory_order_acq_rel);
@@ -2726,6 +2846,27 @@ public:
 			cameraController.currentCameraMode == CameraController::PedDeadBaby ||
 			cameraController.currentCameraMode == CameraController::ArrestCamOne ||
 			cameraController.currentCameraMode == CameraController::ArrestCamTwo;
+		if (enteredNoControlState)
+			pauseUiNativeMenuActionObserved.store(false, std::memory_order_release);
+
+		const bool interactive2dSelectionAccepted = interactive2dResultInputActive
+			&& playerManager.isInControl
+			&& (interactive2dResultSelectionObserved.exchange(false, std::memory_order_acq_rel)
+				|| !playerManager.isInVehicle);
+		if (interactive2dSelectionAccepted)
+		{
+			if (pauseUi2dScreenAutoEnabled)
+				settingsManager.SetPause2dScreenMode(false);
+			pauseUi2dScreenAutoEnabled = false;
+			interactive2dResultInputActive = false;
+			if (hudUiAutoRevealedForPause && !hudUiPinned)
+				SetHudVisibility(false, "restore hidden UI after interactive 2D result selection");
+			hudUiAutoRevealedForPause = false;
+			API::get()->log_info(
+				"[PauseUITrace] interactive 2D result selection completed vehicle=%s camera=%d runtime2d=%s",
+				playerManager.isInVehicle ? "true" : "false",
+				static_cast<int>(cameraController.currentCameraMode), ReadPause2dRuntimeValue().c_str());
+		}
 		if (settingsManager.enablePauseUiAutoShow && resultScreenCamera
 			&& !resultScreenPresentationActive)
 		{
@@ -2740,11 +2881,30 @@ public:
 			resultScreen2dAutoEnabled = settingsManager.GetPause2dScreenMode(screen2dWasEnabled)
 				&& !screen2dWasEnabled
 				&& settingsManager.SetPause2dScreenMode(true);
+			// The first write lands on the same frame as GTA's result-camera switch.
+			// Reassert on two later frames so UEVR's compositor cannot miss the new
+			// 2D/HUD ownership while its render targets are being rebuilt.
+			resultScreenPresentationReassertAt = now + 150ULL;
+			resultScreenPresentationReassertsRemaining = 2;
 			API::get()->log_info(
 				"[PauseUITrace] result presentation entered camera=%d hudOwned=%s 2dOwned=%s runtimeHud=%s runtime2d=%s",
 				static_cast<int>(cameraController.currentCameraMode),
 				resultScreenHudAutoRevealed ? "true" : "false",
 				resultScreen2dAutoEnabled ? "true" : "false",
+				ReadHudRuntimeValue().c_str(), ReadPause2dRuntimeValue().c_str());
+		}
+		if (resultScreenPresentationActive && resultScreenCamera
+			&& resultScreenPresentationReassertsRemaining > 0
+			&& now >= resultScreenPresentationReassertAt)
+		{
+			SetHudVisibility(true, "result-screen delayed compositor reassert");
+			if (resultScreen2dAutoEnabled)
+				settingsManager.SetPause2dScreenMode(true);
+			--resultScreenPresentationReassertsRemaining;
+			resultScreenPresentationReassertAt = now + 500ULL;
+			API::get()->log_info(
+				"[PauseUITrace] result compositor reassert remaining=%u runtimeHud=%s runtime2d=%s",
+				static_cast<unsigned int>(resultScreenPresentationReassertsRemaining),
 				ReadHudRuntimeValue().c_str(), ReadPause2dRuntimeValue().c_str());
 		}
 		else if (resultScreenPresentationActive && !resultScreenCamera
@@ -2768,6 +2928,8 @@ public:
 			resultScreenPresentationActive = false;
 			resultScreenHudAutoRevealed = false;
 			resultScreen2dAutoEnabled = false;
+			resultScreenPresentationReassertAt = 0;
+			resultScreenPresentationReassertsRemaining = 0;
 		}
 		const bool use2dFallback = explicitPauseRequest || resultScreenCamera;
 		if (enteredNoControlState || returnedToGameplay)
@@ -2819,12 +2981,33 @@ public:
 
 		if (returnedToGameplay && pauseUi2dScreenAutoEnabled)
 		{
-			settingsManager.SetPause2dScreenMode(false);
-			API::get()->log_info("[PauseUITrace] 2D fallback restored runtime=%s", ReadPause2dRuntimeValue().c_str());
-			pauseUi2dScreenAutoEnabled = false;
+			const bool nativeMenuActionObserved = pauseUiNativeMenuActionObserved.exchange(
+				false, std::memory_order_acq_rel);
+			// A normal pause closes through a second pause request or a native menu
+			// action.  Some in-vehicle mission-result overlays instead restore GTA's
+			// generic control byte while their 2D choices remain on screen.  Keep only
+			// that already-owned 2D session native until the player selects an option;
+			// do not use a decision timeout and do not scan broad UI state.
+			const bool keepInteractive2dResult = playerManager.isInVehicle
+				&& !explicitPauseRequest && !nativeMenuActionObserved;
+			if (keepInteractive2dResult)
+			{
+				interactive2dResultInputActive = true;
+				interactive2dResultSelectionObserved.store(false, std::memory_order_release);
+				API::get()->log_info(
+					"[PauseUITrace] interactive 2D result input retained camera=%d runtime2d=%s",
+					static_cast<int>(cameraController.currentCameraMode), ReadPause2dRuntimeValue().c_str());
+			}
+			else
+			{
+				settingsManager.SetPause2dScreenMode(false);
+				API::get()->log_info("[PauseUITrace] 2D fallback restored runtime=%s", ReadPause2dRuntimeValue().c_str());
+				pauseUi2dScreenAutoEnabled = false;
+			}
 		}
 
-		if (returnedToGameplay && hudUiAutoRevealedForPause)
+		if (returnedToGameplay && hudUiAutoRevealedForPause
+			&& !interactive2dResultInputActive)
 		{
 			SetHudVisibility(false, "restore hidden UI after pause");
 			hudUiAutoRevealedForPause = false;
@@ -3058,6 +3241,29 @@ public:
 
 	void SendStatesToLua()
 	{
+		const bool flybyWithoutControl = !playerManager.isInControl
+			&& cameraController.currentCameraMode == CameraController::Flyby;
+		const bool resultScreenInputActive = flybyWithoutControl
+			|| cameraController.currentCameraMode == CameraController::PlayerFallenWater
+			|| cameraController.currentCameraMode == CameraController::PedDeadBaby
+			|| cameraController.currentCameraMode == CameraController::ArrestCamOne
+			|| cameraController.currentCameraMode == CameraController::ArrestCamTwo
+			|| interactive2dResultInputActive;
+		resultScreenInputPassthrough.store(resultScreenInputActive, std::memory_order_release);
+		if (!resultScreenInputStateInitialized
+			|| resultScreenInputActive != lastResultScreenInputStateSentToLua)
+		{
+			resultScreenInputStateInitialized = true;
+			lastResultScreenInputStateSentToLua = resultScreenInputActive;
+			API::get()->dispatch_lua_event("resultScreenState",
+				resultScreenInputActive ? "true" : "false");
+			API::get()->log_info("[PauseUITrace] result native-input passthrough=%s camera=%d control=%s interactive2d=%s",
+				resultScreenInputActive ? "true" : "false",
+				static_cast<int>(cameraController.currentCameraMode),
+				playerManager.isInControl ? "true" : "false",
+				interactive2dResultInputActive ? "true" : "false");
+		}
+
 		const int authoritativeWeaponId = static_cast<int>(weaponManager.currentWeaponEquipped);
 		if (authoritativeWeaponId != lastWeaponIdSentToLua)
 		{
@@ -3088,9 +3294,18 @@ public:
 			if (playerManager.isInVehicle && playerState == "OnFoot")
 				playerState = "CarOrBoat";
 			API::get()->dispatch_lua_event("playerState", playerState.c_str());
+			// Lua deliberately clears transition-sensitive vehicle input state when it
+			// receives playerState. UpdateActualWeaponMesh may already have published
+			// vehicleFreeAimState earlier in this same engine tick, so reassert the
+			// authoritative value afterward to keep face-fire eligibility ordered.
+			const bool vehicleFreeAimActive = weaponManager.IsVehicleFreeAimActive();
+			API::get()->dispatch_lua_event("vehicleFreeAimState",
+				vehicleFreeAimActive ? "true" : "false");
 			API::get()->log_info("[VehicleCamera] authoritative Lua state=%s inVehicle=%s nativeType=%d",
 				playerState.c_str(), playerManager.isInVehicle ? "true" : "false",
 				static_cast<int>(playerManager.vehicleType));
+			API::get()->log_info("[VehicleFreeAim] authoritative Lua state=%s after player transition",
+				vehicleFreeAimActive ? "true" : "false");
 		}
 		if (activeDrivingVehicleModelId != lastDrivingVehicleModelIdSentToLua)
 		{

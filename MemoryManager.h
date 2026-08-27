@@ -222,6 +222,9 @@ private:
 	volatile LONG manualReloadCapturedPreShotClip = 0;
 	volatile LONG manualReloadCaptureSequence = 0;
 	LONG lastReportedManualReloadCaptureSequence = 0;
+	volatile LONG vehicleCombatAssistAmmoWeaponType = 0;
+	volatile LONG vehicleCombatAssistAmmoRefillCount = 0;
+	LONG lastReportedVehicleCombatAssistAmmoRefillCount = 0;
 	bool playerSemiAutoFireGateApplyAttempted = false;
 	volatile LONG playerSemiAutoPullHeld = 0;
 	volatile LONG playerSemiAutoPullWeaponType = 0;
@@ -461,6 +464,7 @@ public:
 	bool ReadLatestNativeShotEffectProbe(NativeShotEffectProbe& probe);
 	bool CyclePlayerWeaponSlot(int direction);
 	bool ReloadCurrentWeaponOneMagazine(int expectedWeaponType = -1, bool dualWield = false);
+	bool RefillVehicleCombatAssistAmmoIfLow(int expectedWeaponType);
 	bool ReadPhoneRingingState(bool& ringing);
 	int ResolveCurrentVehicleModelId(int vehicleType);
 	bool vehicleRelatedMemoryInstructionsNoped = true;

@@ -170,6 +170,15 @@ SAVRContextR3 = SAVRContextR3 or {
     chordSeen = false,
     rightShoulderPulseUntil = nil
 }
+SAVRResultScreenInput = SAVRResultScreenInput or { active = false }
+SAVRControlDiagnostics = SAVRControlDiagnostics or {
+	lastHeartbeatAt = 0.0,
+	heartbeatOutputPending = false,
+	lastEntrySignature = "",
+	lastOutputSignature = "",
+	lastOutputStage = ""
+}
+SAVRVehicleFaceFireDiagnosticAHeld = SAVRVehicleFaceFireDiagnosticAHeld or false
 local rightGripReloadPressedAt = nil
 local previousRightGripReloadHeld = false
 local rightGripReloadFireSeen = false
@@ -277,8 +286,6 @@ local function dispatch_savr_lifecycle(stage)
         uevr.params.functions.dispatch_custom_event("SAVR.Diagnostics.Lifecycle", stage)
     end
 end
-
-dispatch_savr_lifecycle("lua-loaded")
 
 local function dispatch_manual_reload()
     if uevr and uevr.api and uevr.api.dispatch_custom_event then
@@ -631,11 +638,22 @@ local function apply_vehicle_face_button_fire(state, buttons, now)
     -- after C++ has confirmed the supported controller-pistol vehicle mode, so
     -- the right trigger remains the native accelerator and ordinary controls
     -- are untouched everywhere else.
+	local physicalFaceHeld = has_button(buttons, BUTTON_A)
 	local eligible = isPlayerDriving
         and vehicleFreeAimActive
         and not isPlayerAircraft
 		and (playerState ~= "Bike" or is_motorized_bike_vehicle() or is_pedal_bike_vehicle())
         and enableVehicleFaceButtonFire
+	if savrDiagnosticMode == "full"
+		and physicalFaceHeld ~= SAVRVehicleFaceFireDiagnosticAHeld then
+		log(string.format(
+			"[SAVRDiag][VehicleFaceFire] A=%s eligible=%s driving=%s freeAim=%s aircraft=%s playerState=%s motorizedBike=%s pedalBike=%s enabled=%s weapon=%d",
+			tostring(physicalFaceHeld), tostring(eligible), tostring(isPlayerDriving),
+			tostring(vehicleFreeAimActive), tostring(isPlayerAircraft), tostring(playerState),
+			tostring(is_motorized_bike_vehicle()), tostring(is_pedal_bike_vehicle()),
+			tostring(enableVehicleFaceButtonFire), tonumber(currentWeaponId) or -1))
+	end
+	SAVRVehicleFaceFireDiagnosticAHeld = physicalFaceHeld
     local physicalLeftShoulderHeld = has_button(buttons, LEFT_SHOULDER)
     if not eligible then
         local hadVehicleFaceFireState = previousVehicleFaceFireHeld
@@ -662,7 +680,7 @@ local function apply_vehicle_face_button_fire(state, buttons, now)
     -- In supported vehicle free aim, physical LB is a grip only. Suppress it
     -- before synthesizing GTA's native vehicle-fire bit from A.
     buttons = clear_button(buttons, LEFT_SHOULDER)
-    local faceHeld = has_button(buttons, BUTTON_A)
+    local faceHeld = physicalFaceHeld
     local wasFaceHeld = previousVehicleFaceFireHeld
     if faceHeld ~= previousVehicleFaceFireHeld then
         dispatch_vehicle_face_fire(faceHeld)
@@ -899,7 +917,7 @@ local function log_chord(message, now)
 end
 
 local function log_input_layer(buttons, state)
-    if not debugInputLayerProbe then
+    if not debugInputLayerProbe and savrDiagnosticMode ~= "full" then
         return
     end
 
@@ -925,6 +943,47 @@ local function log_input_layer(buttons, state)
 
     lastInputProbeSignature = signature
     log("input before mod scripts: " .. (signature == "" and "released" or signature))
+end
+
+SAVRDiagnosticControlSnapshot = function(stage, state, now)
+	if savrDiagnosticMode ~= "full" or state == nil then
+		return
+	end
+	local snapshot = string.format(
+		"buttons=0x%04X lt=%d rt=%d lx=%d ly=%d rx=%d ry=%d input=%s guide=%s result=%s driving=%s aircraft=%s weapon=%d visibility=%s",
+		tonumber(state.Gamepad.wButtons) or 0,
+		tonumber(state.Gamepad.bLeftTrigger) or 0,
+		tonumber(state.Gamepad.bRightTrigger) or 0,
+		tonumber(state.Gamepad.sThumbLX) or 0,
+		tonumber(state.Gamepad.sThumbLY) or 0,
+		tonumber(state.Gamepad.sThumbRX) or 0,
+		tonumber(state.Gamepad.sThumbRY) or 0,
+		tostring(playerInputEnabled), tostring(controlGuideVisible),
+		tostring(SAVRResultScreenInput.active), tostring(isPlayerDriving),
+		tostring(isPlayerAircraft), tonumber(currentWeaponId) or -1,
+		tostring(activeVisibilityState))
+	local heartbeat = stage == "lua-entry"
+		and (now - SAVRControlDiagnostics.lastHeartbeatAt >= 1.0)
+	if stage == "lua-entry" then
+		if heartbeat or snapshot ~= SAVRControlDiagnostics.lastEntrySignature then
+			log(string.format("[SAVRDiag][ControlPipeline] stage=%s heartbeat=%s %s",
+				stage, tostring(heartbeat), snapshot))
+			SAVRControlDiagnostics.lastEntrySignature = snapshot
+		end
+		if heartbeat then
+			SAVRControlDiagnostics.lastHeartbeatAt = now
+			SAVRControlDiagnostics.heartbeatOutputPending = true
+		end
+		return
+	end
+	if SAVRControlDiagnostics.heartbeatOutputPending
+		or stage ~= SAVRControlDiagnostics.lastOutputStage
+		or snapshot ~= SAVRControlDiagnostics.lastOutputSignature then
+		log(string.format("[SAVRDiag][ControlPipeline] stage=%s %s", stage, snapshot))
+		SAVRControlDiagnostics.lastOutputStage = stage
+		SAVRControlDiagnostics.lastOutputSignature = snapshot
+	end
+	SAVRControlDiagnostics.heartbeatOutputPending = false
 end
 
 local function apply_chord_controls(state, buttons, now)
@@ -1482,7 +1541,15 @@ end
 uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
     local buttons = state.Gamepad.wButtons
     log_input_layer(buttons, state)
-    local now = os.clock()
+	local now = os.clock()
+	SAVRDiagnosticControlSnapshot("lua-entry", state, now)
+	-- Result cameras do not reliably clear GTA's generic player-control byte.
+	-- Leave their controller state entirely native so retry/continue prompts
+	-- cannot be consumed by SAVR's gameplay remaps.
+	if SAVRResultScreenInput.active then
+		SAVRDiagnosticControlSnapshot("lua-result-passthrough", state, now)
+		return
+	end
     local triggerTimingLeftTriggerValue = tonumber(state.Gamepad.bLeftTrigger) or 0
     local triggerTimingRightTriggerValue = tonumber(state.Gamepad.bRightTrigger) or 0
     -- This is already a shallow physical threshold (about 12% of XInput's
@@ -1567,6 +1634,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 	if apply_chord_controls(state, buttons, now) then
         previousQuestXCycleHeld = has_button(buttons, BUTTON_B)
         reset_manual_reload_tap_state(true)
+		SAVRDiagnosticControlSnapshot("lua-block-chord", state, now)
 		return
 	end
 
@@ -1579,6 +1647,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 			dispatch_vehicle_face_fire(false)
 			previousVehicleFaceFireHeld = false
 		end
+		SAVRDiagnosticControlSnapshot("lua-native-player-control-disabled", state, now)
 		return
 	end
 
@@ -1590,6 +1659,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
     local contextualR3Consumed
     buttons, contextualR3Consumed = apply_on_foot_r3_context_action(state, buttons, now)
     if contextualR3Consumed then
+		SAVRDiagnosticControlSnapshot("lua-consume-context-r3", state, now)
         return
     end
     update_manual_reload_tap(rawRightGripHeld, rawLeftGripHeld, rawFireHeld, now)
@@ -1600,6 +1670,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 		-- apply_quest_x_weapon_cycle already removed the physical shoulders and
 		-- retained only its bounded synthetic LB pulse. Return before the ordinary
 		-- grip layer can clear that pulse again.
+		SAVRDiagnosticControlSnapshot("lua-consume-weapon-cycle", state, now)
         return
     end
 
@@ -1614,10 +1685,12 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
             set_visibility_state("default")
         end
         -- Accepted A->LB is final for this sample; do not clear it below.
+		SAVRDiagnosticControlSnapshot("lua-consume-vehicle-fire", state, now)
         return
     end
 
     if apply_ab_weapon_cycle_test(state, buttons, now) then
+		SAVRDiagnosticControlSnapshot("lua-consume-cycle-test", state, now)
         return
     end
 
@@ -1631,17 +1704,20 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
         else
             set_visibility_state("default")
         end
+		SAVRDiagnosticControlSnapshot("lua-native-aircraft", state, now)
         return
     end
 
     local phoneRightGripHeld = has_button(buttons, RIGHT_SHOULDER)
     update_phone_answer_tap(phoneRightGripHeld, now)
     if apply_phone_answer_pulse(state, buttons, now) then
+		SAVRDiagnosticControlSnapshot("lua-consume-phone-answer", state, now)
         return
     end
 
     if not enableDualGripAimFire then
         reset_dualgrip_state()
+		SAVRDiagnosticControlSnapshot("lua-native-dualgrip-disabled", state, now)
         return
     end
 
@@ -1655,6 +1731,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
         else
             set_visibility_state("default")
         end
+		SAVRDiagnosticControlSnapshot("lua-native-driving", state, now)
         return
     end
 
@@ -1669,6 +1746,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 		if not enableMotionThrowables
 			or (currentWeaponId ~= 16 and currentWeaponId ~= 18) then
 			set_visibility_state("default")
+			SAVRDiagnosticControlSnapshot("lua-native-throwable", state, now)
 			return
 		end
 
@@ -1705,6 +1783,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
 			-- Grip-only interaction belongs exclusively to the custom flight.
 			motionThrowableState.nativePulseSequence = 0
 			state.Gamepad.bRightTrigger = 0
+			SAVRDiagnosticControlSnapshot("lua-consume-throwable-grip", state, now)
 			return
 		end
 		-- Do not return here. The ordinary input output below maps either physical
@@ -1770,6 +1849,7 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
         else
             set_visibility_state("default")
         end
+		SAVRDiagnosticControlSnapshot("lua-held-visual-grace", state, now)
         return
     end
 
@@ -1856,10 +1936,42 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
     else
         set_visibility_state("default")
     end
+	SAVRDiagnosticControlSnapshot("lua-output", state, now)
 end)
 
 uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
-    if event_name == "playerState" then
+    if event_name == "resultScreenState" then
+		if SAVRResultScreenInput.active ~= (event_string == "true") then
+			SAVRResultScreenInput.active = event_string == "true"
+			if SAVRResultScreenInput.active then
+				if SAVRCustomAkimboInput.lastHeldMask ~= 0 then
+					dispatch_akimbo_input(0, 0, currentWeaponId)
+				end
+				SAVRCustomAkimboInput.leftHeld = false
+				SAVRCustomAkimboInput.rightHeld = false
+				SAVRCustomAkimboInput.lastHeldMask = 0
+				if motionThrowableState.probeActive then
+					dispatch_throwable_probe("cancel", motionThrowableState.probeSequence, 0, 0, 0, os.clock())
+				end
+				reset_throwable_probe_state()
+				previousFireInputHeld = false
+				previousGateFireHeld = false
+				semiAutoBufferUntil = nil
+				previousQuestXCycleHeld = false
+				clear_cycle_pulse()
+				reset_phone_answer_state()
+				reset_manual_reload_tap_state(true)
+				cancel_held_visual_grace()
+				if previousVehicleFaceFireHeld then
+					dispatch_vehicle_face_fire(false)
+					previousVehicleFaceFireHeld = false
+				end
+			end
+			log_control_debug(string.format(
+				"result-screen native input passthrough=%s",
+				tostring(SAVRResultScreenInput.active)))
+		end
+    elseif event_name == "playerState" then
         playerState = event_string
         isPlayerDriving = event_string ~= "OnFoot"
         isPlayerAircraft = event_string == "Helicopter" or event_string == "Plane"
@@ -2085,6 +2197,11 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
 		log("diagnostic mode=" .. savrDiagnosticMode)
     end
 end)
+
+-- Register the inbound Lua event callback before asking C++ to republish live
+-- feature flags. The old startup order sent the reply before this listener
+-- existed, leaving fail-closed defaults such as vehicle A-fire disabled.
+dispatch_savr_lifecycle("lua-loaded")
 
 uevr.sdk.callbacks.on_frame(function()
     if cycleProbe == nil then
