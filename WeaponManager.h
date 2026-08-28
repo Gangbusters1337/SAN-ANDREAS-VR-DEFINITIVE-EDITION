@@ -74,6 +74,12 @@ private:
 	uevr::API::UObject* torso = nullptr;
 	uevr::API::UObject* firstWeaponStaticMesh = nullptr;
 	uevr::API::UObject* secondWeaponStaticMesh = nullptr;
+	// GTA can replace the visible weapon component without changing weapon ID
+	// (for example during weapon-skill/animation refreshes). Hold the replacement
+	// hidden for one complete engine tick before restoring controller ownership.
+	uevr::API::UObject* weaponPresentationRebindMesh = nullptr;
+	uint32_t weaponPresentationRebindReadyTick = 0;
+	int weaponPresentationRebindWeaponId = -1;
 	const std::unordered_map<std::wstring, int> weaponNameToIndex = {
 		{L"SM_unarmed", 0},           // Unarmed
 		{L"SM_brassknuckle", 1},    // BrassKnuckles

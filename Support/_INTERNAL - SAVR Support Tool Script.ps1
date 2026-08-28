@@ -13,7 +13,14 @@ $packageFolder = Join-Path $supportHome 'Support Packages'
 function Ensure-RecoveryFile([bool]$forceOff) {
     New-Item -ItemType Directory -Force -Path $profile | Out-Null
     New-Item -ItemType Directory -Force -Path $supportHome | Out-Null
-    $text = "[Diagnostics]`r`nForceOff=$($forceOff.ToString().ToLowerInvariant())`r`nStartMode=Off`r`n"
+	$startMode = 'Off'
+	foreach ($candidate in @((Join-Path $supportHome $userRecoveryName), $recovery)) {
+		if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+			$stored = (Get-Content -LiteralPath $candidate | Where-Object { $_ -match '^StartMode=' } | Select-Object -First 1)
+			if ($stored) { $startMode = ($stored -split '=', 2)[1].Trim(); break }
+		}
+	}
+	$text = "[Diagnostics]`r`nForceOff=$($forceOff.ToString().ToLowerInvariant())`r`nStartMode=$startMode`r`n"
     [IO.File]::WriteAllText($recovery, $text, [Text.Encoding]::ASCII)
     [IO.File]::WriteAllText((Join-Path $supportHome $userRecoveryName), $text, [Text.Encoding]::ASCII)
 }
@@ -126,7 +133,7 @@ $status = New-Object Windows.Forms.Label
 $status.AutoSize = $false
 $status.Size = New-Object Drawing.Size(390,42)
 $status.Location = New-Object Drawing.Point(20,52)
-$status.Text = 'Diagnostics are session-only and default to Off after restart.'
+$status.Text = 'The selected diagnostic mode persists after restart or force-quit.'
 $form.Controls.Add($status)
 
 function Add-Button([string]$text, [int]$top, [scriptblock]$action) {
@@ -144,7 +151,7 @@ Add-Button 'Disable diagnostics now and on next launch' 98 {
 }
 Add-Button 'Allow in-game diagnostics controls' 140 {
     Ensure-RecoveryFile $false
-    $status.Text = 'ForceOff is cleared. Diagnostics still start Off and can be selected in the VR guide.'
+	$status.Text = 'ForceOff is cleared. The last selected mode will resume on the next launch.'
 }
 Add-Button 'Create support package' 182 {
     try {

@@ -1814,6 +1814,51 @@ public:
 		}
 	}
 
+	bool TryParseDiagnosticMode(const char* value, DiagnosticMode& parsed) const
+	{
+		if (value == nullptr || value[0] == '\0')
+			return false;
+		if (_stricmp(value, "off") == 0)
+			parsed = DiagnosticMode::Off;
+		else if (_stricmp(value, "vehicle-input") == 0 || _stricmp(value, "vehicleinput") == 0)
+			parsed = DiagnosticMode::VehicleInput;
+		else if (_stricmp(value, "save-load") == 0 || _stricmp(value, "saveload") == 0)
+			parsed = DiagnosticMode::SaveLoad;
+		else if (_stricmp(value, "full") == 0)
+			parsed = DiagnosticMode::Full;
+		else
+			return false;
+		return true;
+	}
+
+	bool TryReadDiagnosticStartMode(const std::string& path, DiagnosticMode& mode) const
+	{
+		if (path.empty())
+			return false;
+		char value[32]{};
+		if (GetPrivateProfileStringA("Diagnostics", "StartMode", "", value,
+			static_cast<DWORD>(sizeof(value)), path.c_str()) == 0)
+			return false;
+		return TryParseDiagnosticMode(value, mode);
+	}
+
+	void PersistDiagnosticStartMode(DiagnosticMode mode)
+	{
+		const char* value = DiagnosticModeName(mode);
+		bool wroteAny = false;
+		bool failed = false;
+		for (const auto* path : { &diagnosticProfileRecoveryPath, &diagnosticRecoveryPath })
+		{
+			if (path->empty())
+				continue;
+			wroteAny = true;
+			if (!WritePrivateProfileStringA("Diagnostics", "StartMode", value, path->c_str()))
+				failed = true;
+		}
+		if (!wroteAny || failed)
+			API::get()->log_warn("[SAVRDiag] failed to persist StartMode=%s", value);
+	}
+
 	void WriteDiagnosticSessionMarker()
 	{
 		if (diagnosticSessionMarkerPath.empty())
@@ -1836,6 +1881,10 @@ public:
 			API::get()->log_warn("[SAVRDiag] mode request rejected source=%s reason=ForceOff", source);
 			requested = DiagnosticMode::Off;
 		}
+		// ForceOff is an emergency override, not a request to erase the user's
+		// preferred startup mode. All normal in-game selections persist.
+		if (!diagnosticForceOff && (source == nullptr || strcmp(source, "recovery-file") != 0))
+			PersistDiagnosticStartMode(requested);
 		if (diagnosticMode == requested)
 			return;
 		diagnosticMode = requested;
@@ -1845,7 +1894,7 @@ public:
 		diagnosticLifecycleInitialized = false;
 		WriteDiagnosticSessionMarker();
 		API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
-		API::get()->log_info("[SAVRDiag] mode=%s generation=%llu source=%s sessionOnly=true",
+		API::get()->log_info("[SAVRDiag] mode=%s generation=%llu source=%s persistent=true",
 			DiagnosticModeName(diagnosticMode), static_cast<unsigned long long>(diagnosticGeneration), source);
 	}
 
@@ -1952,16 +2001,28 @@ public:
 		{
 			MoveFileExA(diagnosticSessionMarkerPath.c_str(), diagnosticInterruptedMarkerPath.c_str(),
 				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-			API::get()->log_warn("%s", "[SAVRDiag] previous diagnostic session ended unexpectedly; diagnostics forced Off");
+			API::get()->log_warn("%s", "[SAVRDiag] previous diagnostic session ended unexpectedly; persistent StartMode retained");
 		}
 		diagnosticForceOff = GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
 			diagnosticRecoveryPath.c_str()) != 0
 			|| GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
 				diagnosticProfileRecoveryPath.c_str()) != 0;
+		DiagnosticMode startMode = DiagnosticMode::Off;
+		// The top-level Documents switch is the user-facing authority. Fall back
+		// to the profile copy when it is absent or predates StartMode support.
+		if (!TryReadDiagnosticStartMode(diagnosticRecoveryPath, startMode))
+			TryReadDiagnosticStartMode(diagnosticProfileRecoveryPath, startMode);
+		if (diagnosticForceOff)
+			startMode = DiagnosticMode::Off;
+		diagnosticMode = startMode;
+		if (diagnosticMode != DiagnosticMode::Off)
+			++diagnosticGeneration;
+		WriteDiagnosticSessionMarker();
 		diagnosticRecoveryCheckAt = GetTickCount64() + DiagnosticRecoveryCheckIntervalMs;
-		API::get()->dispatch_lua_event("diagnosticMode", "off");
-		API::get()->log_info("[SAVRDiag] initialized mode=off forceOff=%s recovery=%s",
-			diagnosticForceOff ? "true" : "false", diagnosticRecoveryPath.c_str());
+		API::get()->dispatch_lua_event("diagnosticMode", DiagnosticModeName(diagnosticMode));
+		API::get()->log_info("[SAVRDiag] initialized mode=%s forceOff=%s persistent=true recovery=%s",
+			DiagnosticModeName(diagnosticMode), diagnosticForceOff ? "true" : "false",
+			diagnosticRecoveryPath.c_str());
 	}
 
 	void FinishDiagnosticSession(bool clean)

@@ -5349,6 +5349,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 		// ordinary reload/weapon states and caused repeated false invalidation.
 		uevr::API::UObject* replacementMesh = nullptr;
 		uevr::API::UObject* replacementContainer = nullptr;
+		bool replacementMatchesOwnedWeapon = false;
 		const int ownedWeaponId = magneticGripWeaponId >= 0
 			? magneticGripWeaponId : magneticIdleWeaponId;
 		for (auto child : torsoChildren)
@@ -5364,22 +5365,61 @@ void WeaponManager::UpdateActualWeaponMesh()
 			if (candidateAsset == nullptr || !uevr::API::UObjectHook::exists(candidateAsset))
 				continue;
 			const auto candidateIt = weaponNameToIndex.find(candidateAsset->get_fname()->to_string());
-			if (candidateIt == weaponNameToIndex.end() || candidateIt->second == ownedWeaponId)
+			if (candidateIt == weaponNameToIndex.end())
 				continue;
 			replacementMesh = attached.data[0];
 			replacementContainer = child;
+			replacementMatchesOwnedWeapon = candidateIt->second == ownedWeaponId;
 			break;
 		}
 		if (replacementMesh != nullptr)
 		{
-			RestoreMagneticIdleWeaponAttachment("external-component-replacement");
+			auto* replacedMesh = magneticDetachedWeaponMesh;
+			const int preservedGripHand = replacementMatchesOwnedWeapon
+				? magneticGripHand : -1;
+			if (replacementMatchesOwnedWeapon)
+			{
+				// A same-ID replacement is a native presentation refresh, not a
+				// release or weapon change. Tear down only transient relations to the
+				// stale mesh; calibration and per-weapon holster records remain valid.
+				ResetRuntimeHandState("same-weapon-component-rebind", true, false);
+				if (uevr::API::UObjectHook::exists(replacedMesh))
+				{
+					uevr::API::UObjectHook::remove_motion_controller_state(replacedMesh);
+					SetComponentVisibility(replacedMesh, false);
+				}
+				// The replacement already owns GTA's live attachment. Do not put the
+				// retired component back into that hierarchy, where it could be
+				// rediscovered as another same-ID replacement on the following tick.
+				DetachMagneticIdleWeaponFromBody();
+				magneticIdleWeaponDetached = false;
+				magneticDetachedWeaponMesh = nullptr;
+				magneticIdleNativeParent = nullptr;
+				magneticBodyAnchorParent = nullptr;
+				magneticDetachedPlayerCharacter = nullptr;
+				magneticIdleNativeSocket = {};
+				magneticIdleWeaponBodyAttached = false;
+			}
+			else
+				RestoreMagneticIdleWeaponAttachment("external-component-replacement");
 			magneticIdleWeaponActive = false;
 			magneticIdleWeaponId = -1;
-			magneticGripHand = -1;
-			magneticGripWeaponId = -1;
+			magneticGripHand = replacementMatchesOwnedWeapon ? preservedGripHand : -1;
+			magneticGripWeaponId = replacementMatchesOwnedWeapon ? ownedWeaponId : -1;
 			magneticGripAttached = false;
 			magneticReleaseRequested = false;
 			magneticAnchoredWeaponMesh = nullptr;
+			motionConfiguredFirstWeaponMesh = nullptr;
+			motionConfiguredFirstHand = -1;
+			motionConfiguredFirstCalibrationRole = -1;
+			visibilityAppliedFirstWeaponMesh = nullptr;
+			if (replacementMatchesOwnedWeapon)
+			{
+				weaponPresentationRebindMesh = replacementMesh;
+				weaponPresentationRebindWeaponId = ownedWeaponId;
+				weaponPresentationRebindReadyTick = interactionEngineTickGeneration + 1;
+				SetComponentVisibility(replacementMesh, false);
+			}
 			// Explicit X-cycle replacement is a presentation swap, not a new
 			// holster placement. Keep the transition state until
 			// ProcessMagneticIdleWeapon selects the replacement's own anchor.
@@ -5396,8 +5436,10 @@ void WeaponManager::UpdateActualWeaponMesh()
 			firstWeaponMeshFetch = replacementMesh;
 			firstWeaponContainerFetch = replacementContainer;
 			uevr::API::get()->log_info(
-				"[MagneticWeapon] external component replacement adopted previousWeapon=%d mesh=%p",
-				ownedWeaponId, replacementMesh);
+				"[WeaponRebind] component replacement adopted previousWeapon=%d sameWeapon=%s old=%p new=%p hand=%d readyTick=%u",
+				ownedWeaponId, replacementMatchesOwnedWeapon ? "true" : "false",
+				replacedMesh, replacementMesh, preservedGripHand,
+				weaponPresentationRebindReadyTick);
 		}
 		else
 		{
@@ -5488,6 +5530,39 @@ void WeaponManager::UpdateActualWeaponMesh()
 	auto it = weaponNameToIndex.find(weaponName);
 	if (it != weaponNameToIndex.end())
 		currentWeaponEquipped = static_cast<WeaponType>(it->second);
+	bool weaponPresentationRebindWaiting = false;
+	if (weaponPresentationRebindMesh != nullptr)
+	{
+		const bool targetStillValid = weaponPresentationRebindMesh == firstWeaponMesh
+			&& uevr::API::UObjectHook::exists(firstWeaponMesh)
+			&& static_cast<int>(currentWeaponEquipped) == weaponPresentationRebindWeaponId;
+		if (!targetStillValid)
+		{
+			uevr::API::get()->log_warn(
+				"[WeaponRebind] cancelled reason=target-changed expectedWeapon=%d currentWeapon=%d expectedMesh=%p currentMesh=%p",
+				weaponPresentationRebindWeaponId, static_cast<int>(currentWeaponEquipped),
+				weaponPresentationRebindMesh, firstWeaponMesh);
+			weaponPresentationRebindMesh = nullptr;
+			weaponPresentationRebindWeaponId = -1;
+			weaponPresentationRebindReadyTick = 0;
+		}
+		else if (interactionEngineTickGeneration < weaponPresentationRebindReadyTick)
+		{
+			weaponPresentationRebindWaiting = true;
+			SetComponentVisibility(firstWeaponMesh, false);
+		}
+		else
+		{
+			uevr::API::get()->log_info(
+				"[WeaponRebind] stable-frame complete weapon=%d mesh=%p hand=%d tick=%u",
+				static_cast<int>(currentWeaponEquipped), firstWeaponMesh,
+				magneticGripHand, interactionEngineTickGeneration);
+			weaponPresentationRebindMesh = nullptr;
+			weaponPresentationRebindWeaponId = -1;
+			weaponPresentationRebindReadyTick = 0;
+			visibilityAppliedFirstWeaponMesh = nullptr;
+		}
+	}
 
 	const int discoveredWeapon = static_cast<int>(currentWeaponEquipped);
 	const bool customAkimboSupported = discoveredWeapon == Pistol || discoveredWeapon == Sawnoff
@@ -5629,7 +5704,8 @@ void WeaponManager::UpdateActualWeaponMesh()
 	// A weapon change replaces these components after the Lua visibility state
 	// was already applied. Reapply only to a newly discovered component; writing
 	// visibility every frame can fight GTA's native left-hand weapon state.
-	if (visibilityAppliedFirstWeaponMesh != firstWeaponMesh)
+	if (!weaponPresentationRebindWaiting
+		&& visibilityAppliedFirstWeaponMesh != firstWeaponMesh)
 	{
 		SetComponentVisibility(firstWeaponMesh, weaponScaledVisible);
 		visibilityAppliedFirstWeaponMesh = firstWeaponMesh;
@@ -5649,7 +5725,8 @@ void WeaponManager::UpdateActualWeaponMesh()
 				secondWeaponMesh, secondVisible ? "true" : "false", customVisual ? "true" : "false");
 	}
 
-	if (visualWeaponTrackingEnabled && !magneticIdleWeaponActive && !IsGripCalibrationActive()
+	if (!weaponPresentationRebindWaiting
+		&& visualWeaponTrackingEnabled && !magneticIdleWeaponActive && !IsGripCalibrationActive()
 		&& cameraController->currentCameraMode != CameraController::Camera
 		&& (vehicleFreeAimActive || !playerManager->isInVehicle
 			|| cameraController->currentCameraMode == CameraController::AimWeaponFromCar))
@@ -13083,6 +13160,9 @@ void WeaponManager::DiscardPlayerOwnedRuntimeState(const char* reason)
 	torso = nullptr;
 	firstWeaponStaticMesh = nullptr;
 	secondWeaponStaticMesh = nullptr;
+	weaponPresentationRebindMesh = nullptr;
+	weaponPresentationRebindReadyTick = 0;
+	weaponPresentationRebindWeaponId = -1;
 	firstWeaponLastParticleShot = nullptr;
 	secondWeaponLastParticleShot = nullptr;
 	firstWeaponPreviousParticles.clear();

@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.3** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.4** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -32,6 +32,7 @@ The big difference is how physical the game feels:
 - **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
 - **Reliable result screens:** fixed invisible Mission Failed, Wasted, Busted, and similar screens, plus loss of controls on those screens.
 - **Broader diagnostics:** expanded input-loss debugging makes controller problems easier to investigate.
+- **Weapon-skill compatibility:** motion-tracked weapons now remain correctly held when GTA upgrades their weapon skill.
 - **Sharper, clearer visuals:** improved textures, scope and muzzle presentation, cleaner effects, and graphics settings that leave room for extra quality.
 
 This is still beta software, so back up your existing UEVR `SanAndreas` profile before installing. A few missions, unusual vehicles, and weapon combinations may still need refinement.
@@ -54,7 +55,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.3 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.4 change list.
 
 ## What you get in VR
 

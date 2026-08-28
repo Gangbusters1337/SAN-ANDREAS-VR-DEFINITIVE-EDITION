@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4 — Weapon-Skill Compatibility
+
+- Fixed rifles turning sideways or disconnecting from motion controls when GTA upgrades weapon skill.
+- Weapons now stay correctly attached through Gangster, Hitman, and intermediate skill checkpoints.
+
 ## v0.3.3 — Vehicle Combat and Mission-Screen Reliability
 
 - Fixed vehicle free-aim firing that was broken in v0.3.2.
