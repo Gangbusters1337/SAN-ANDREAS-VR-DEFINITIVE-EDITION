@@ -168,7 +168,14 @@ local PHONE_ANSWER_PULSE_SECONDS = 0.55
 SAVRContextR3 = SAVRContextR3 or {
     wasHeld = false,
     chordSeen = false,
-    rightShoulderPulseUntil = nil
+    rightShoulderPulseUntil = nil,
+    pressedAt = nil,
+    dpadActive = false,
+    dpadUsed = false,
+    dpadNeutralReady = false,
+    dpadLastDirection = nil,
+    dpadPulseDirection = nil,
+    dpadPulseSamplesRemaining = 0
 }
 SAVRResultScreenInput = SAVRResultScreenInput or { active = false }
 SAVRControlDiagnostics = SAVRControlDiagnostics or {
@@ -597,27 +604,145 @@ local function apply_short_press_camera_switch(state, buttons, now)
 end
 
 local function apply_on_foot_r3_context_action(state, buttons, now)
-    if not playerInputEnabled or isPlayerDriving or isPlayerAircraft then
+    if not playerInputEnabled or isPlayerAircraft then
+		if enableR3LeftStickDpad and SAVRContextR3.wasHeld then
+			if uevr and uevr.api and uevr.api.dispatch_custom_event then
+				uevr.api:dispatch_custom_event("DUALGRIP.R3ModifierState", "up")
+			elseif uevr and uevr.params and uevr.params.functions
+				and uevr.params.functions.dispatch_custom_event then
+				uevr.params.functions.dispatch_custom_event("DUALGRIP.R3ModifierState", "up")
+			end
+		end
         SAVRContextR3.wasHeld = false
         SAVRContextR3.chordSeen = false
         SAVRContextR3.rightShoulderPulseUntil = nil
+        SAVRContextR3.pressedAt = nil
+        SAVRContextR3.dpadActive = false
+        SAVRContextR3.dpadUsed = false
+        SAVRContextR3.dpadNeutralReady = false
+        SAVRContextR3.dpadLastDirection = nil
+        SAVRContextR3.dpadPulseDirection = nil
+        SAVRContextR3.dpadPulseSamplesRemaining = 0
         return buttons, false
     end
 
     local r3Held = has_button(buttons, RIGHT_THUMB)
     local l3Held = has_button(buttons, LEFT_THUMB)
+    local x = state.Gamepad.sThumbRX or 0
+    local y = state.Gamepad.sThumbRY or 0
+    local maximumAxis = math.max(math.abs(x), math.abs(y))
+    if r3Held and not SAVRContextR3.wasHeld then
+        SAVRContextR3.pressedAt = now
+        SAVRContextR3.dpadActive = false
+        SAVRContextR3.dpadUsed = false
+        SAVRContextR3.dpadNeutralReady = maximumAxis <= DPAD_STICK_RELEASE_THRESHOLD
+        SAVRContextR3.dpadLastDirection = nil
+        SAVRContextR3.dpadPulseDirection = nil
+        SAVRContextR3.dpadPulseSamplesRemaining = 0
+		if enableR3LeftStickDpad and not l3Held then
+			if uevr and uevr.api and uevr.api.dispatch_custom_event then
+				uevr.api:dispatch_custom_event("DUALGRIP.R3ModifierState", "down")
+			elseif uevr and uevr.params and uevr.params.functions
+				and uevr.params.functions.dispatch_custom_event then
+				uevr.params.functions.dispatch_custom_event("DUALGRIP.R3ModifierState", "down")
+			end
+		end
+    end
     if r3Held then
         SAVRContextR3.chordSeen = SAVRContextR3.chordSeen or l3Held
         -- Preserve L3+R3 for the UEVR menu; R3 alone is the on-foot context action.
         if not l3Held then
             buttons = clear_button(buttons, RIGHT_THUMB)
         end
+		-- Keep the cached x/y above for D-pad classification, but suppress native
+		-- look and the plugin camera immediately while R3 owns the right stick.
+		if enableR3LeftStickDpad and not l3Held then
+			state.Gamepad.sThumbRX = 0
+			state.Gamepad.sThumbRY = 0
+		end
+        if enableR3LeftStickDpad and not l3Held and SAVRContextR3.pressedAt ~= nil
+            and now - SAVRContextR3.pressedAt >= 0.25 then
+            SAVRContextR3.dpadActive = true
+            state.Gamepad.sThumbRX = 0
+            state.Gamepad.sThumbRY = 0
+            buttons = clear_button(buttons, DPAD_UP)
+            buttons = clear_button(buttons, DPAD_DOWN)
+            buttons = clear_button(buttons, DPAD_LEFT)
+            buttons = clear_button(buttons, DPAD_RIGHT)
+
+            if maximumAxis <= DPAD_STICK_RELEASE_THRESHOLD then
+                SAVRContextR3.dpadNeutralReady = true
+                SAVRContextR3.dpadLastDirection = nil
+                SAVRContextR3.dpadPulseDirection = nil
+                SAVRContextR3.dpadPulseSamplesRemaining = 0
+            end
+
+            if SAVRContextR3.dpadPulseSamplesRemaining > 0
+                and SAVRContextR3.dpadPulseDirection ~= nil then
+                buttons = set_button(buttons, SAVRContextR3.dpadPulseDirection)
+                SAVRContextR3.dpadPulseSamplesRemaining = SAVRContextR3.dpadPulseSamplesRemaining - 1
+            end
+
+            local direction = nil
+            local directionButton = nil
+            if SAVRContextR3.dpadNeutralReady
+                and (math.abs(x) >= DPAD_STICK_THRESHOLD or math.abs(y) >= DPAD_STICK_THRESHOLD) then
+                if math.abs(x) >= math.abs(y) then
+                    direction = x < 0 and "left" or "right"
+                    directionButton = x < 0 and DPAD_LEFT or DPAD_RIGHT
+                else
+                    direction = y < 0 and "down" or "up"
+                    directionButton = y < 0 and DPAD_DOWN or DPAD_UP
+                end
+            end
+
+            if direction ~= nil and SAVRContextR3.dpadLastDirection == nil then
+                SAVRContextR3.dpadLastDirection = direction
+                SAVRContextR3.dpadUsed = true
+                if directionButton == DPAD_LEFT then
+                    buttons = set_button(buttons, directionButton)
+                else
+                    SAVRContextR3.dpadPulseDirection = directionButton
+                    SAVRContextR3.dpadPulseSamplesRemaining = 2
+                    buttons = set_button(buttons, directionButton)
+                end
+                if uevr and uevr.api and uevr.api.dispatch_custom_event then
+                    uevr.api:dispatch_custom_event("DUALGRIP.R3DpadPulse", direction)
+                elseif uevr and uevr.params and uevr.params.functions
+                    and uevr.params.functions.dispatch_custom_event then
+                    uevr.params.functions.dispatch_custom_event("DUALGRIP.R3DpadPulse", direction)
+                end
+                log_control_debug("R3/right-stick D-pad -> " .. direction)
+            elseif direction == "left" and SAVRContextR3.dpadLastDirection == "left" then
+                -- GTA's View Stats direction is a hold action rather than a pulse.
+                buttons = set_button(buttons, DPAD_LEFT)
+            end
+
+            SAVRContextR3.wasHeld = true
+            state.Gamepad.wButtons = buttons
+            return buttons, true
+        end
     elseif SAVRContextR3.wasHeld then
-        if not SAVRContextR3.chordSeen then
+		if enableR3LeftStickDpad and not SAVRContextR3.chordSeen then
+			if uevr and uevr.api and uevr.api.dispatch_custom_event then
+				uevr.api:dispatch_custom_event("DUALGRIP.R3ModifierState", "up")
+			elseif uevr and uevr.params and uevr.params.functions
+				and uevr.params.functions.dispatch_custom_event then
+				uevr.params.functions.dispatch_custom_event("DUALGRIP.R3ModifierState", "up")
+			end
+		end
+        if not SAVRContextR3.chordSeen and not SAVRContextR3.dpadUsed and not isPlayerDriving then
             SAVRContextR3.rightShoulderPulseUntil = now + 0.55
             log("on-foot R3 release -> native right shoulder context action")
         end
         SAVRContextR3.chordSeen = false
+        SAVRContextR3.pressedAt = nil
+        SAVRContextR3.dpadActive = false
+        SAVRContextR3.dpadUsed = false
+        SAVRContextR3.dpadNeutralReady = false
+        SAVRContextR3.dpadLastDirection = nil
+        SAVRContextR3.dpadPulseDirection = nil
+        SAVRContextR3.dpadPulseSamplesRemaining = 0
     end
 
     SAVRContextR3.wasHeld = r3Held
@@ -722,32 +847,6 @@ local function apply_vehicle_face_button_fire(state, buttons, now)
     end
 
     return buttons, false
-end
-
-local function apply_r3_left_stick_dpad(state, buttons, dualGripHeld)
-    -- A dual weapon grip must never consume the left stick: it remains the
-    -- native walking/steering axis even if the optional R3 remap is enabled.
-    if dualGripHeld or isPlayerDriving or not enableR3LeftStickDpad
-        or not has_button(buttons, RIGHT_THUMB) then
-        return buttons
-    end
-
-    local x = state.Gamepad.sThumbLX or 0
-    local y = state.Gamepad.sThumbLY or 0
-    buttons = clear_button(buttons, RIGHT_THUMB)
-    state.Gamepad.sThumbLX = 0
-    state.Gamepad.sThumbLY = 0
-
-    if math.abs(x) >= DPAD_STICK_THRESHOLD or math.abs(y) >= DPAD_STICK_THRESHOLD then
-        if math.abs(x) >= math.abs(y) then
-            buttons = set_button(buttons, x < 0 and DPAD_LEFT or DPAD_RIGHT)
-        else
-            buttons = set_button(buttons, y < 0 and DPAD_DOWN or DPAD_UP)
-        end
-    end
-
-    state.Gamepad.wButtons = buttons
-    return buttons
 end
 
 local function is_left_thumb_rest_touch_active()
@@ -1694,8 +1793,6 @@ uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
         return
     end
 
-    buttons = apply_r3_left_stick_dpad(state, buttons, rawLeftGripHeld and rawRightGripHeld)
-
     -- Universal pause/HUD/camera controls and the optional thumb-rest D-pad
     -- pulse run above. Ordinary aircraft inputs remain native from here on.
     if enableAircraftNativeControls and isPlayerAircraft then
@@ -2158,6 +2255,15 @@ uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
             end
 		elseif name == "EnableR3LeftStickDpad" then
 			enableR3LeftStickDpad = parse_bool(value)
+			SAVRContextR3.wasHeld = false
+			SAVRContextR3.chordSeen = false
+			SAVRContextR3.pressedAt = nil
+			SAVRContextR3.dpadActive = false
+			SAVRContextR3.dpadUsed = false
+			SAVRContextR3.dpadNeutralReady = false
+			SAVRContextR3.dpadLastDirection = nil
+			SAVRContextR3.dpadPulseDirection = nil
+			SAVRContextR3.dpadPulseSamplesRemaining = 0
 		elseif name == "EnableMotionThrowables" then
 			enableMotionThrowables = parse_bool(value)
 			if not enableMotionThrowables and not enableThrowableMotionProbe then

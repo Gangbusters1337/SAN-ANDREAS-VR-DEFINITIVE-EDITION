@@ -40,6 +40,8 @@ private:
 	bool thumbRestModifierActive = false;
 	std::atomic<bool> thumbRestTouchActive{ false };
 	std::atomic<bool> thumbRestDpadUsed{ false };
+	std::atomic<bool> r3DpadModifierActive{ false };
+	std::atomic<bool> r3DpadModifierUsed{ false };
 	std::atomic<bool> thumbRestActionRebindRequested{ false };
 	ULONGLONG thumbRestActionRefreshAt = 0;
 	enum class ThumbRestHapticRequest : uint8_t { None = 0, PinOn, AutoHide };
@@ -302,8 +304,24 @@ private:
 			cameraController.SetRightJoystickCameraSuppressed(false);
 			return;
 		}
+		// Haptics are shared by both modifier modes. Dispatch queued pulses before
+		// the thumb-rest-specific path can return early for the R3 alternative.
 		DispatchPendingThumbRestHaptic();
-
+		// The two D-pad modifiers are mutually exclusive. R3 mode is implemented
+		// in Lua beside the existing short-R3 context action, where a long hold can
+		// be distinguished without accidentally dispatching a weapon pickup.
+		if (settingsManager.enableR3LeftStickDpad) {
+			thumbRestModifierActive = false;
+			PublishThumbRestTouchState(false);
+			cameraController.SetRightJoystickCameraSuppressed(
+				r3DpadModifierActive.load(std::memory_order_acquire));
+			thumbRestDpadLastDirection = 0;
+			thumbRestDpadPulseDirection = 0;
+			thumbRestDpadPulseSamplesRemaining = 0;
+			return;
+		}
+		r3DpadModifierActive.store(false, std::memory_order_release);
+		r3DpadModifierUsed.store(false, std::memory_order_release);
 		// The Lua layer cannot currently expose is_action_active_any_joystick,
 		// while get_left_joystick_source() is unavailable on this OpenXR setup.
 		// Use the native UEVR VR API here as a compatibility fallback. This mirrors
@@ -588,6 +606,8 @@ public:
 			if (userIndex == 0) {
 				thumbRestModifierActive = false;
 				PublishThumbRestTouchState(false);
+				r3DpadModifierActive.store(false, std::memory_order_release);
+				r3DpadModifierUsed.store(false, std::memory_order_release);
 				cameraController.SetRightJoystickCameraSuppressed(false);
 				weaponManager.SetGripState(false, false);
 				weaponManager.SetMeleeClenchState(false, false);
@@ -642,6 +662,8 @@ public:
 			}
 			thumbRestModifierActive = false;
 			PublishThumbRestTouchState(false);
+			r3DpadModifierActive.store(false, std::memory_order_release);
+			r3DpadModifierUsed.store(false, std::memory_order_release);
 			cameraController.SetRightJoystickCameraSuppressed(false);
 			weaponManager.SetGripState(false, false);
 			weaponManager.SetMeleeClenchState(false, false);
@@ -731,6 +753,8 @@ public:
 		controlGuideOverlay.OnDeviceReset();
 		thumbRestModifierActive = false;
 		PublishThumbRestTouchState(false, true);
+		r3DpadModifierActive.store(false, std::memory_order_release);
+		r3DpadModifierUsed.store(false, std::memory_order_release);
 		aircraftLeftStickPressHeld = false;
 		aircraftCameraRevealRequestMask.store(0U, std::memory_order_release);
 		aircraftCameraRevealActive = false;
@@ -822,9 +846,9 @@ public:
 				return;
 			const std::string action(event_data);
 			if (action == "left" || action == "up")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 2) % 3;
+				controlGuideSelectedOption = (controlGuideSelectedOption + 3) % 4;
 			else if (action == "right" || action == "down")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 3;
+				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 4;
 			else if (action == "toggle")
 				ToggleControlGuideOption(controlGuideSelectedOption);
 			else
@@ -832,6 +856,31 @@ public:
 			RefreshControlGuideOptions();
 			API::get()->log_info("[ControlGuide] navigation action=%s selected=%d",
 				action.c_str(), controlGuideSelectedOption);
+			return;
+		}
+		if (eventName == "DUALGRIP.R3DpadPulse")
+		{
+			r3DpadModifierUsed.store(true, std::memory_order_release);
+			PulseThumbRestDpadHaptic();
+			if (settingsManager.debugInputLayerProbe)
+				API::get()->log_info("[DUALGRIP] R3/right-stick D-pad pulse direction=%s", event_data);
+			return;
+		}
+		if (eventName == "DUALGRIP.R3ModifierState")
+		{
+			const std::string state(event_data);
+			if (state == "down")
+			{
+				r3DpadModifierUsed.store(false, std::memory_order_release);
+				r3DpadModifierActive.store(true, std::memory_order_release);
+				cameraController.SetRightJoystickCameraSuppressed(true);
+				PulseThumbRestDpadHaptic();
+			}
+			else if (state == "up")
+			{
+				r3DpadModifierActive.store(false, std::memory_order_release);
+				cameraController.SetRightJoystickCameraSuppressed(false);
+			}
 			return;
 		}
 		if (eventName == "SAVR.Diagnostics.VehicleInput")
@@ -2245,6 +2294,7 @@ public:
 	{
 		controlGuideOverlay.SetOptionsState(ReadControlGuideMovementOrientation(),
 			settingsManager.enableHudAutoHide,
+			settingsManager.enableR3LeftStickDpad,
 			static_cast<uint32_t>(diagnosticMode),
 			static_cast<uint32_t>(controlGuideSelectedOption));
 	}
@@ -2268,7 +2318,7 @@ public:
 
 	void ToggleControlGuideOption(int option)
 	{
-		if (option < 0 || option > 2)
+		if (option < 0 || option > 3)
 			return;
 		if (option == 0)
 		{
@@ -2287,10 +2337,22 @@ public:
 			return;
 		}
 
-		if (option == 2)
+		if (option == 3)
 		{
 			const uint8_t next = (static_cast<uint8_t>(diagnosticMode) + 1U) % 4U;
 			SetDiagnosticMode(static_cast<DiagnosticMode>(next), "control-guide");
+			return;
+		}
+		if (option == 2)
+		{
+			const bool enabled = !settingsManager.enableR3LeftStickDpad;
+			bool liveApply = false;
+			if (!settingsManager.SetFeatureFlagFromUi("EnableR3LeftStickDpad", enabled, liveApply))
+				return;
+			r3DpadModifierActive.store(false, std::memory_order_release);
+			r3DpadModifierUsed.store(false, std::memory_order_release);
+			cameraController.SetRightJoystickCameraSuppressed(false);
+			settingsManager.DispatchFeatureFlagsToLua();
 			return;
 		}
 
@@ -2412,7 +2474,10 @@ public:
 	void ProcessThumbRestHudGesture(bool playerObjectsReady)
 	{
 		const ULONGLONG now = GetTickCount64();
-		const bool touchActive = thumbRestTouchActive.load(std::memory_order_acquire);
+		const bool r3Mode = settingsManager.enableR3LeftStickDpad;
+		const bool touchActive = r3Mode
+			? r3DpadModifierActive.load(std::memory_order_acquire)
+			: thumbRestTouchActive.load(std::memory_order_acquire);
 		const bool gestureAllowed = playerObjectsReady && playerManager.isInControl
 			&& !playerManager.weaponWheelEnabled
 			&& (pluginStateApplied == OnFoot || pluginStateApplied == Driving)
@@ -2436,7 +2501,10 @@ public:
 				thumbRestGestureStartedAt = now;
 				thumbRestGestureConsumed = false;
 			}
-			if (dualThumbRestRawActive || thumbRestDpadUsed.load(std::memory_order_acquire))
+			const bool modifierUsed = r3Mode
+				? r3DpadModifierUsed.load(std::memory_order_acquire)
+				: thumbRestDpadUsed.load(std::memory_order_acquire);
+			if ((!r3Mode && dualThumbRestRawActive) || modifierUsed)
 				thumbRestGestureConsumed = true;
 		}
 		else if (thumbRestGestureWasActive)
@@ -2557,7 +2625,10 @@ public:
 				&& cameraController.currentCameraMode == CameraController::AimWeaponFromCar);
 		const bool supportedGameplayState = pluginStateApplied == OnFoot
 			|| (pluginStateApplied == Driving && playerManager.isInVehicle);
-		const bool contextAllowed = playerObjectsReady && thumbRestModifierActive
+		const bool selectedModifierActive = settingsManager.enableR3LeftStickDpad
+			? r3DpadModifierActive.load(std::memory_order_acquire)
+			: thumbRestModifierActive;
+		const bool contextAllowed = playerObjectsReady && selectedModifierActive
 			&& playerManager.isInControl
 			&& !playerManager.weaponWheelEnabled && !resultScreenCamera
 			&& !disallowedCamera && supportedGameplayState

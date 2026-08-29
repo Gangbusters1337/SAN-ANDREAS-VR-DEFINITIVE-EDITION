@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.4** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.5** - Click the control guide above to open the full-resolution image.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -30,6 +30,7 @@ The big difference is how physical the game feels:
 - **Quick ground-weapon swaps:** tap the right grip—or use R3—while standing over GTA's pickup prompt to replace a same-slot weapon even when the HUD is hidden.
 - **Natural weapon handling:** drop weapons into magnetic waist holsters, recall them per weapon, and keep two-hand grips stable through regrips.
 - **A cleaner VR interface:** auto-hiding HUD, A+X control guide, touch/D-pad shortcuts, phone grip tap, and Quest-friendly pause controls.
+- **More controller options:** controllers without thumb-rest input can use R3 + right stick for D-pad and HUD controls.
 - **Reliable result screens:** fixed invisible Mission Failed, Wasted, Busted, and similar screens, plus loss of controls on those screens.
 - **Broader diagnostics:** expanded input-loss debugging makes controller problems easier to investigate.
 - **Weapon-skill compatibility:** motion-tracked weapons now remain correctly held when GTA upgrades their weapon skill.
@@ -55,7 +56,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.4 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.5 change list.
 
 ## What you get in VR
 
@@ -84,6 +85,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.4 change list.
 ### Comfort, controls, and presentation
 
 - **Auto-hiding HUD for maximum immersion in sunny San Andreas:** show it with the left touch, pin or unpin it with a double-tap, and use the touch modifier with the right stick for contextual D-pad actions.
+- **Alternate D-pad mode:** switch to R3 + right stick when your controllers do not provide thumb-rest input; the same control handles HUD tap and pin actions without moving the camera.
 - **In-game control guide:** A+X opens the Quest 3 layout and quick VR options without needing to leave the game.
 - **Useful interaction shortcuts:** phone answering, pause controls, camera switching, weapon cycling, vehicle fire, and aircraft-specific controls are mapped for motion controllers.
 - **Context-aware pickup control:** a quick right-grip tap or R3 sends GTA's native on-foot context action for phone calls and same-slot ground-weapon swaps without changing held-grip behavior.

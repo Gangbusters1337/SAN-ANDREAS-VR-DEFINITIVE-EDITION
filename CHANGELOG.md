@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.5 — More Controller Options
+
+- Added an R3 + right-stick D-pad option for controllers without thumb-rest input.
+- R3 mode also controls the HUD and prevents accidental camera movement while using the D-pad.
+
 ## v0.3.4 — Weapon-Skill Compatibility
 
 - Fixed rifles turning sideways or disconnecting from motion controls when GTA upgrades weapon skill.

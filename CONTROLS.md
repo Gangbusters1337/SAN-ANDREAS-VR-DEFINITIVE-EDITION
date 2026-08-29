@@ -68,7 +68,8 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Double-tap the left thumb-rest: pin or unpin the HUD.
 - Hold the left thumb-rest: reveal the HUD context while using the touch D-pad.
 - Right B + Left Y: reveal pause UI and send a short Start pulse.
-- Right A + Left X opens/closes the in-game control guide. Use the left stick to select and A to change Body Orientation, HUD Auto-Hide, or the session-only Diagnostics mode.
+- Right A + Left X opens/closes the in-game control guide. Use the left stick to select and A to change Body Orientation, HUD Auto-Hide, D-pad Control, or the session-only Diagnostics mode.
+- D-pad Control defaults to **THUMBREST + R-STICK**: hold the left thumbrest and move the right stick. Controllers without a thumbrest can select **R3 + R-STICK** instead. Pressing R3 immediately pauses right-stick camera movement; hold it for about 0.25 seconds, then move the right stick for D-pad input. R3 also inherits the HUD tap, double-tap, and held-context behavior while this mode is selected, while a short on-foot click retains the pickup/context action. R3 D-pad mode is disabled in aircraft, and L3+R3 still opens UEVR.
 - Diagnostics choices are Off, Vehicle Input, Save/Load, and Full. They always start Off after a restart and never enable experimental gameplay behavior.
 - In a car, boat, or motorbike, hold the left Quest menu button for about one second to send GTA's native Back/View action and cycle its original vehicle cameras. A short press remains Pause.
 - The camera hold is blocked on foot and in aircraft, so it cannot change those camera/control paths.

@@ -12,7 +12,7 @@
 class ControlGuideOverlay {
 public:
 	void SetVisible(bool visible);
-	void SetOptionsState(int movementOrientation, bool hudAutoHide, uint32_t diagnosticMode,
+	void SetOptionsState(int movementOrientation, bool hudAutoHide, bool r3DpadMode, uint32_t diagnosticMode,
 		uint32_t selectedOption);
 	bool IsVisible() const;
 	void OnDeviceReset();
@@ -38,6 +38,7 @@ private:
 	uint32_t imageHeight = 0;
 	int movementOrientation = 0;
 	bool hudAutoHide = true;
+	bool r3DpadMode = false;
 	uint32_t diagnosticMode = 0;
 	uint32_t selectedOption = 0;
 	bool imageLoadAttempted = false;

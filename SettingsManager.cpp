@@ -799,7 +799,7 @@ void SettingsManager::WriteFeatureFlagStatus(const std::string& reason)
 	writeFlag("EnableFirstPersonCameraLock", enableFirstPersonCameraLock, enableFirstPersonCameraLock, "LiveOnConfigReload", "VR comfort and camera", "Lock first-person camera [recommended on]");
 	writeFlag("EnableVehicleFaceButtonFire", enableVehicleFaceButtonFire, enableVehicleFaceButtonFire, "LiveOnConfigReload", "VR controls", "Vehicle live-lap weapon on right controller [ordinary driving prototype]");
 	writeFlag("EnableAircraftNativeControls", enableAircraftNativeControls, enableAircraftNativeControls, "LiveOnConfigReload", "VR controls", "Aircraft native controls [recommended on, experimental]");
-	writeFlag("EnableR3LeftStickDpad", enableR3LeftStickDpad, enableR3LeftStickDpad, "LiveOnConfigReload", "VR controls", "R3 + left stick D-pad [experimental]");
+	writeFlag("EnableR3LeftStickDpad", enableR3LeftStickDpad, enableR3LeftStickDpad, "LiveOnConfigReload", "VR controls", "D-pad: R3 + R-Stick (off = Thumbrest + R-Stick)");
 	writeFlag("EnableMotionThrowables", enableMotionThrowables, enableMotionThrowables, "LiveOnConfigReload", "Core combat feel", "Grip-release grenade/Molotov physical flight with DE-native impact lifecycle [experimental]");
 	writeFlag("EnableThrowableMotionProbe", enableThrowableMotionProbe, enableThrowableMotionProbe, "LiveOnConfigReload", "Diagnostics", "Passive Molotov release and momentum probe");
 	writeFlag("EnableNativeMolotovMode", enableNativeMolotovMode, enableNativeMolotovMode, "LiveOnConfigReload", "Core combat feel", "Use GTA's native Molotov throw path instead of custom motion flight [A/B test]");

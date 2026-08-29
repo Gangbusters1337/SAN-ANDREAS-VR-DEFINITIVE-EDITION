@@ -51,16 +51,18 @@ void ControlGuideOverlay::SetVisible(bool value)
 		dx11WarmupFrames.store(0, std::memory_order_release);
 }
 
-void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, uint32_t diagnostics,
+void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, bool useR3Dpad, uint32_t diagnostics,
 	uint32_t selected)
 {
 	std::scoped_lock lock(stateMutex);
-	selected = (std::min)(selected, 2U);
+	selected = (std::min)(selected, 3U);
 	if (movementOrientation == orientation && hudAutoHide == autoHide
-		&& diagnosticMode == diagnostics && selectedOption == selected && !basePixels.empty())
+		&& r3DpadMode == useR3Dpad && diagnosticMode == diagnostics
+		&& selectedOption == selected && !basePixels.empty())
 		return;
 	movementOrientation = orientation;
 	hudAutoHide = autoHide;
+	r3DpadMode = useR3Dpad;
 	diagnosticMode = diagnostics;
 	selectedOption = selected;
 	if (!basePixels.empty() && ComposeOptionsPanel())
@@ -412,9 +414,9 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
 	SelectObject(dc, optionFont);
-	for (uint32_t index = 0; index < 3; ++index)
+	for (uint32_t index = 0; index < 4; ++index)
 	{
-		const LONG columnWidth = (panel.right - panel.left - 40) / 3;
+		const LONG columnWidth = (panel.right - panel.left - 50) / 4;
 		RECT row{ panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10), panel.top + 31,
 			panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10) + columnWidth, panel.bottom - 8 };
 		if (index == selectedOption)
@@ -440,6 +442,14 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 			SetTextColor(dc, hudAutoHide ? RGB(139, 208, 36) : RGB(210, 85, 65));
 			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
 			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+		}
+		else if (index == 2)
+		{
+			std::wstring label = L"D-PAD:\n";
+			label += r3DpadMode ? L"R3 + R-STICK" : L"THUMBREST + R-STICK";
+			SetTextColor(dc, RGB(139, 208, 36));
+			RECT labelRect{ row.left + 3, row.top + 2, row.right - 3, row.bottom };
+			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_WORDBREAK);
 		}
 		else
 		{

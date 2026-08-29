@@ -32,6 +32,7 @@
 ## Controls and interface
 
 - Left thumb-rest HUD tap, double-tap pin/unpin, hold modifier, and touch D-pad.
+- Optional R3 + right-stick D-pad and HUD controls for controllers without thumb-rest input.
 - Quest X quick weapon cycling on foot.
 - Y+B pause chord and short camera-switch action.
 - Phone-answer grip tap.
