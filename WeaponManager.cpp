@@ -2494,6 +2494,20 @@ void WeaponManager::ProcessBulletTracePostTick()
 	// the engine hooks. No component scan or passive post-tick probe is needed.
 }
 
+int WeaponManager::GetConfiguredPrimaryHand() const
+{
+	const int hand = configuredPrimaryHand.load(std::memory_order_acquire);
+	return hand == 0 || hand == 1 ? hand : 1;
+}
+
+void WeaponManager::SetConfiguredPrimaryHand(int hand)
+{
+	if (hand != 0 && hand != 1)
+		return;
+	configuredPrimaryHand.store(static_cast<int8_t>(hand), std::memory_order_release);
+	twoHandConfiguredHandSnapshot.store(static_cast<int8_t>(hand), std::memory_order_release);
+}
+
 void WeaponManager::SetGripState(bool leftGripHeld, bool rightGripHeld)
 {
 	const uint8_t mask = static_cast<uint8_t>((leftGripHeld ? 1 : 0) | (rightGripHeld ? 2 : 0));
@@ -2706,7 +2720,7 @@ void WeaponManager::ProcessCustomAkimboState()
 			&& motionConfiguredSecondHand >= 0 && motionConfiguredSecondHand <= 1)
 			customAkimboPrimaryHand = 1 - motionConfiguredSecondHand;
 		else
-			customAkimboPrimaryHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1;
+			customAkimboPrimaryHand = GetConfiguredPrimaryHand();
 	}
 	if (memoryManager != nullptr)
 		memoryManager->SetCustomAkimboState(active, weapon, heldMask, edgeMask);
@@ -3027,7 +3041,7 @@ void WeaponManager::ProcessTwoHandStabilization(float delta)
 			else if (configuredHand >= 0)
 				primaryHand = configuredHand;
 			else
-				primaryHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1;
+				primaryHand = GetConfiguredPrimaryHand();
 			twoHandPrimaryHand.store(static_cast<int8_t>(primaryHand), std::memory_order_release);
 		}
 			if (settingsManager->enableGripCalibration && primaryHand >= 0)
@@ -3559,9 +3573,10 @@ void WeaponManager::RefreshRuntimeHandRoles(const char* reason)
 
 	if (vehicleFreeAim)
 	{
-		desired[0].role = RuntimeHandRole::VehicleNative;
-		desired[1].role = RuntimeHandRole::VehiclePrimary;
-		desired[1].weaponId = static_cast<int>(currentWeaponEquipped);
+		const int gunHand = settingsManager->GetVehicleWeaponHand();
+		desired[1 - gunHand].role = RuntimeHandRole::VehicleNative;
+		desired[gunHand].role = RuntimeHandRole::VehiclePrimary;
+		desired[gunHand].weaponId = static_cast<int>(currentWeaponEquipped);
 	}
 	else
 	{
@@ -4183,9 +4198,14 @@ bool WeaponManager::ReadControllerCalibrationPose(int controllerHand, glm::fvec3
 {
 	gripPosition = glm::fvec3(0.0f);
 	aimRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
+	if (controllerHand < 0 || controllerHand > 1)
+		return false;
+	// Keep the snapshot's direct hand lookup. In Nightly 01127, get_transform
+	// compares the supplied index with get_left/right_controller_index again,
+	// returning the physical LEFT/RIGHT pose even when native input swap is on.
 	const auto controllerIndex = controllerHand == 0
 		? uevr::API::VR::get_left_controller_index()
-		: controllerHand == 1 ? uevr::API::VR::get_right_controller_index() : -1;
+		: uevr::API::VR::get_right_controller_index();
 	if (controllerIndex < 0)
 		return false;
 	const auto gripPose = uevr::API::VR::get_grip_pose(controllerIndex);
@@ -5619,10 +5639,11 @@ void WeaponManager::UpdateActualWeaponMesh()
 		vehicleFreeAimPresentationActive = vehicleFreeAimActive;
 		uevr::API::get()->dispatch_lua_event("vehicleFreeAimState",
 			vehicleFreeAimActive ? "true" : "false");
-		uevr::API::get()->log_info("[VehicleFreeAim] %s weapon=%d camera=%d hand=right mode=%s",
+		uevr::API::get()->log_info("[VehicleFreeAim] %s weapon=%d camera=%d hand=%s mode=%s",
 			vehicleFreeAimActive ? "active" : "inactive",
 			static_cast<int>(currentWeaponEquipped),
 			static_cast<int>(cameraController->currentCameraMode),
+			settingsManager->GetVehicleWeaponHand() == 0 ? "left" : "right",
 			vehicleFreeAimActive ? "controller-pistol" : "native");
 	}
 	if (vehicleFreeAimActive)
@@ -5662,7 +5683,7 @@ void WeaponManager::UpdateActualWeaponMesh()
 		magneticBodyFrameRebaseAt = 0;
 	}
 
-	const int configuredHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1;
+	const int configuredHand = GetConfiguredPrimaryHand();
 	const bool twoHandEligibleNow = settingsManager->enableTwoHandStabilization
 		&& playerManager->isInControl
 		&& !playerManager->isInVehicle
@@ -5738,14 +5759,14 @@ void WeaponManager::UpdateActualWeaponMesh()
 		const bool customAkimboPresentation = secondWeaponMesh == customAkimboVisualMesh
 			&& (gripStateMask.load(std::memory_order_acquire) & 0x03U) == 0x03U;
 		const int desiredFirstHand = vehicleFreeAimActive
-			? 1
+			? settingsManager->GetVehicleWeaponHand()
 			: customAkimboPresentation && customAkimboPrimaryHand >= 0
 			? customAkimboPrimaryHand
 			: magneticGripHand >= 0
 			? magneticGripHand
 			: lockTwoHandPrimary
 			? latchedTwoHandPrimary
-			: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1);
+			: GetConfiguredPrimaryHand();
 		const int desiredCalibrationRole = settingsManager->enableGripCalibration
 			? desiredFirstHand : -1;
 		if (motionConfiguredFirstWeaponMesh != firstWeaponMesh || motionConfiguredFirstHand != desiredFirstHand
@@ -5786,14 +5807,15 @@ void WeaponManager::UpdateActualWeaponMesh()
 				}
 			}
 			if (settingsManager->debugInputLayerProbe)
-				uevr::API::get()->log_info("[WeaponAttach] first mesh=%p hand=%d gripOffset=(%.2f %.2f %.2f)",
-					firstWeaponMesh, desiredFirstHand, weaponPosition.x, weaponPosition.y, weaponPosition.z);
+				uevr::API::get()->log_info("[WeaponAttach] first mesh=%p physicalHand=%d vehicle=%s gripOffset=(%.2f %.2f %.2f)",
+					firstWeaponMesh, desiredFirstHand, vehicleFreeAimActive ? "true" : "false",
+					weaponPosition.x, weaponPosition.y, weaponPosition.z);
 		}
 		if (secondWeaponMesh != nullptr)
 		{
 			const int desiredSecondHand = secondWeaponMesh == customAkimboVisualMesh
 				? 1 - desiredFirstHand
-				: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 1 : 0);
+				: 1 - GetConfiguredPrimaryHand();
 			if (motionConfiguredSecondWeaponMesh != secondWeaponMesh || motionConfiguredSecondHand != desiredSecondHand)
 			{
 				auto motionState = uevr::API::UObjectHook::get_or_add_motion_controller_state(secondWeaponMesh);
@@ -6448,79 +6470,82 @@ void WeaponManager::SetVehicleFaceButtonState(bool held)
 	}
 }
 
-bool WeaponManager::ApplyVehicleNativeRightArmPresentation(bool hidden)
+bool WeaponManager::ApplyVehicleNativeGunArmPresentation(bool hidden, int gunHand)
 {
 	uevr::API::UObject* nativeHands = playerManager != nullptr ? playerManager->handScaleHands : nullptr;
 	if (!hidden)
 	{
-		if (vehicleNativeRightArmHidden && vehicleNativeRightArmComponent != nullptr
-			&& uevr::API::UObjectHook::exists(vehicleNativeRightArmComponent)
-			&& vehicleNativeRightArmBoneName.comparison_index != 0)
+		if (vehicleNativeGunArmHidden && vehicleNativeGunArmComponent != nullptr
+			&& uevr::API::UObjectHook::exists(vehicleNativeGunArmComponent)
+			&& vehicleNativeGunArmBoneName.comparison_index != 0)
 		{
-			if (!UnhideBone(vehicleNativeRightArmComponent, vehicleNativeRightArmBoneName))
+			if (!UnhideBone(vehicleNativeGunArmComponent, vehicleNativeGunArmBoneName))
 			{
-				uevr::API::get()->log_warn("[VehicleFreeAim] native right branch restore unavailable; UnHideBoneByName missing");
+				uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch restore unavailable; UnHideBoneByName missing");
 				return false;
 			}
 			bool stillHidden = true;
 			if (!TryReadBoneHiddenByName(
-				vehicleNativeRightArmComponent, vehicleNativeRightArmBoneName, stillHidden)
+				vehicleNativeGunArmComponent, vehicleNativeGunArmBoneName, stillHidden)
 				|| stillHidden)
 			{
-				uevr::API::get()->log_warn("[VehicleFreeAim] native right branch restore unverifiable; keeping cleanup state for retry");
+				uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch restore unverifiable; keeping cleanup state for retry");
 				return false;
 			}
-			uevr::API::get()->log_info("[VehicleFreeAim] native right hand branch restored");
+			uevr::API::get()->log_info("[VehicleFreeAim] native hand=%d branch restored", vehicleNativeHiddenHand);
 		}
-		vehicleNativeRightArmHidden = false;
-		vehicleNativeRightArmComponent = nullptr;
-		vehicleNativeRightArmBoneName = uevr::API::FName{};
+		vehicleNativeGunArmHidden = false;
+		vehicleNativeHiddenHand = -1;
+		vehicleNativeGunArmComponent = nullptr;
+		vehicleNativeGunArmBoneName = uevr::API::FName{};
 		return true;
 	}
 
-	if (nativeHands == nullptr || !uevr::API::UObjectHook::exists(nativeHands))
+	if (gunHand < 0 || gunHand > 1 || nativeHands == nullptr || !uevr::API::UObjectHook::exists(nativeHands))
 		return false;
-	if (vehicleNativeRightArmHidden && vehicleNativeRightArmComponent == nativeHands)
+	if (vehicleNativeGunArmHidden && vehicleNativeGunArmComponent == nativeHands
+		&& vehicleNativeHiddenHand == gunHand)
 		return true;
 	// Do not hide the native branch unless the same runtime class exposes the
 	// inverse operation.  Without this guard a failed cleanup could leave CJ's
-	// right hand hidden for the rest of the session.
+	// gun-side hand hidden for the rest of the session.
 	if (nativeHands->get_class() == nullptr
 		|| nativeHands->get_class()->find_function(L"UnHideBoneByName") == nullptr)
 	{
-		uevr::API::get()->log_warn("[VehicleFreeAim] native right branch hide unavailable; UnHideBoneByName missing");
+		uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch hide unavailable; UnHideBoneByName missing");
 		return false;
 	}
 
-	if (vehicleNativeRightArmHidden
-		&& !ApplyVehicleNativeRightArmPresentation(false))
+	if (vehicleNativeGunArmHidden
+		&& !ApplyVehicleNativeGunArmPresentation(false))
 	{
-		uevr::API::get()->log_warn("[VehicleFreeAim] native right branch replacement deferred; previous branch not restored");
+		uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch replacement deferred; previous branch not restored");
 		return false;
 	}
 
-	ResolvedBone rightArm;
-	if (!ResolveBone(nativeHands, L"R_UpperArm", rightArm) || rightArm.index < 0
-		|| !HideBone(nativeHands, rightArm.name))
+	ResolvedBone gunArm;
+	if (!ResolveBone(nativeHands, gunHand == 0 ? L"L_UpperArm" : L"R_UpperArm", gunArm) || gunArm.index < 0
+		|| !HideBone(nativeHands, gunArm.name))
 	{
-		uevr::API::get()->log_warn("[VehicleFreeAim] native right branch hide failed");
+		uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch hide failed hand=%d", gunHand);
 		return false;
 	}
 	bool hiddenByName = false;
-	if (!TryReadBoneHiddenByName(nativeHands, rightArm.name, hiddenByName) || !hiddenByName)
+	if (!TryReadBoneHiddenByName(nativeHands, gunArm.name, hiddenByName) || !hiddenByName)
 	{
 		// Do not leave a native branch hidden unless the already-proven reflected
 		// verification path confirms it; the steering hand is the safe fallback.
-		UnhideBone(nativeHands, rightArm.name);
-		uevr::API::get()->log_warn("[VehicleFreeAim] native right branch hide unverifiable; left native hands retained");
+		UnhideBone(nativeHands, gunArm.name);
+		uevr::API::get()->log_warn("[VehicleFreeAim] native gun branch hide unverifiable; native hands retained");
 		return false;
 	}
 
-	vehicleNativeRightArmComponent = nativeHands;
-	vehicleNativeRightArmBoneName = rightArm.name;
-	vehicleNativeRightArmHidden = true;
-	uevr::API::get()->log_info("[VehicleFreeAim] native right hand branch hidden bone=%ls index=%d; native left hand retained",
-		rightArm.text.c_str(), rightArm.index);
+	vehicleNativeGunArmComponent = nativeHands;
+	vehicleNativeGunArmBoneName = gunArm.name;
+	vehicleNativeGunArmHidden = true;
+	vehicleNativeHiddenHand = gunHand;
+	uevr::API::get()->log_info("[VehicleFreeAim] gunHand=%d hiddenNativeBone=%ls index=%d steeringHand=%d",
+		gunHand, gunArm.text.c_str(), gunArm.index, 1 - gunHand);
 	return true;
 }
 
@@ -6919,8 +6944,7 @@ void WeaponManager::ProcessAiming(bool firstWeapon, bool applyGameAim)
 			int hand = firstWeapon ? motionConfiguredFirstHand : motionConfiguredSecondHand;
 			if (hand < 0 || hand > 1)
 			{
-				const int firstHand = settingsManager->leftHandedMode
-					!= SettingsManager::Disabled ? 0 : 1;
+				const int firstHand = GetConfiguredPrimaryHand();
 				hand = firstWeapon ? firstHand : 1 - firstHand;
 			}
 			constexpr float customAkimboTraceRange = 15000.0f;
@@ -7931,7 +7955,7 @@ void WeaponManager::SetMagneticIdleAnchor(int hand)
 {
 	const int anchorHand = hand == 0 || hand == 1
 		? hand
-		: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1);
+		: GetConfiguredPrimaryHand();
 	const float side = anchorHand == 0 ? -1.0f : 1.0f;
 	const bool longGun = IsTwoHandLongGun();
 	const int verticalAxis = ResolveMagneticHolsterVerticalAxis();
@@ -8944,7 +8968,7 @@ void WeaponManager::ProcessMagneticIdleWeapon()
 			selectedHand = twoHandFirstGripHandSnapshot.load(std::memory_order_acquire);
 
 		if (selectedHand < 0)
-			selectedHand = settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1;
+			selectedHand = GetConfiguredPrimaryHand();
 		BeginMagneticGrip(selectedHand, "late-initialize");
 	}
 	if (magneticGripHand < 0 && !magneticIdleWeaponActive && currentMask == 0)
@@ -8969,7 +8993,7 @@ void WeaponManager::ProcessMagneticIdleWeapon()
 		{
 			const int firstGripHand = twoHandFirstGripHandSnapshot.load(std::memory_order_acquire);
 			selectedHand = firstGripHand >= 0 ? firstGripHand
-				: (settingsManager->leftHandedMode != SettingsManager::Disabled ? 0 : 1);
+				: GetConfiguredPrimaryHand();
 		}
 		BeginMagneticGrip(selectedHand, "press-edge");
 	}
@@ -11733,7 +11757,7 @@ void WeaponManager::ProcessMotionMelee(float delta)
 		// native Y is the reflected UE Y axis.
 		return glm::fvec3(uePoint.x * 0.01f, -uePoint.y * 0.01f, uePoint.z * 0.01f);
 	};
-	const auto pulseMeleeContactHaptic = [](int strikingHand) {
+	const auto pulseMeleeContactHaptic = [this](int strikingHand) {
 		if (strikingHand < 0 || strikingHand > 1)
 			return;
 		const auto* pluginParam = uevr::API::get()->param();
@@ -11746,7 +11770,10 @@ void WeaponManager::ProcessMotionMelee(float delta)
 			|| !vr->is_hmd_active() || vr->trigger_haptic_vibration == nullptr)
 			return;
 		UEVR_InputSourceHandle source = nullptr;
-		if (strikingHand == 0)
+		// Input-source handles (unlike the pose API) really do swap. Undo it only
+		// when choosing the haptic source, never for pose/controller attachments.
+		const int sourceHand = settingsManager->AreControllerInputsSwapped() ? 1 - strikingHand : strikingHand;
+		if (sourceHand == 0)
 		{
 			if (vr->get_left_joystick_source == nullptr)
 				return;
@@ -12475,7 +12502,7 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 {
 	if (!freeAimFakeHandsReady || freeAimFakeLeftHand == nullptr || freeAimFakeRightHand == nullptr)
 		return false;
-	const bool vehicleRightOnly = IsVehicleFreeAimActive();
+	const int vehicleGunHand = IsVehicleFreeAimActive() ? settingsManager->GetVehicleWeaponHand() : -1;
 	if (!freeAimFakeHandsInitialized)
 	{
 		freeAimFakeHandsInitializing = true;
@@ -12580,9 +12607,9 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 			leftOpposite.index, rightOpposite.index, leftHand.index, rightHand.index,
 			leftOppositeHidden, rightOppositeHidden, leftHideVerified, rightHideVerified);
 	}
-	if (vehicleRightOnly)
+	if (vehicleGunHand >= 0)
 	{
-		if (!ApplyVehicleNativeRightArmPresentation(true))
+		if (!ApplyVehicleNativeGunArmPresentation(true, vehicleGunHand))
 		{
 			SetComponentVisibility(freeAimFakeLeftHand, false);
 			SetComponentVisibility(freeAimFakeRightHand, false);
@@ -12592,9 +12619,9 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 			return false;
 		}
 	}
-	else if (vehicleNativeRightArmHidden)
+	else if (vehicleNativeGunArmHidden)
 	{
-		ApplyVehicleNativeRightArmPresentation(false);
+		ApplyVehicleNativeGunArmPresentation(false);
 	}
 	// The left clone's bind pose has the opposite local roll regardless of its
 	// current weapon role. Keep this anatomical correction active for free,
@@ -12687,7 +12714,7 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 	if (freeAimFakeHandsActive && freeAimLeftPalmOffsetApplied == leftAnatomicalCorrection
 		&& freeAimAppliedSupportContactActive == supportContactDesired
 		&& freeAimAppliedCalibrationWeaponId == static_cast<int>(currentWeaponEquipped)
-		&& freeAimAppliedVehicleRightOnly == vehicleRightOnly
+		&& freeAimAppliedVehicleGunHand == vehicleGunHand
 		&& freeAimAppliedTwoHandWristOverrideActive == twoHandWristOverrideActive
 		&& freeAimAppliedPrimaryGripAttachmentActive == primaryHandAttachmentDesired
 		&& freeAimClenchedVisibleMask == desiredClenchedMask
@@ -12831,14 +12858,14 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 			}
 		}
 		SetComponentVisibility(freeAimFakeLeftHand,
-			!vehicleRightOnly && (visibleClenchedMask & 0x01U) == 0, false);
+			vehicleGunHand != 1 && (visibleClenchedMask & 0x01U) == 0, false);
 		SetComponentVisibility(freeAimFakeRightHand,
-			(visibleClenchedMask & 0x02U) == 0, false);
+			vehicleGunHand != 0 && (visibleClenchedMask & 0x02U) == 0, false);
 		SetComponentVisibility(freeAimClenchedLeftHand,
-			!vehicleRightOnly && (visibleClenchedMask & 0x01U) != 0);
+			vehicleGunHand != 1 && (visibleClenchedMask & 0x01U) != 0);
 		SetComponentVisibility(freeAimClenchedRightHand,
-			(visibleClenchedMask & 0x02U) != 0);
-		SetComponentVisibility(freeAimFakeWatch, vehicleRightOnly ? false : freeAimWatchActive);
+			vehicleGunHand != 0 && (visibleClenchedMask & 0x02U) != 0);
+		SetComponentVisibility(freeAimFakeWatch, vehicleGunHand != 1 && freeAimWatchActive);
 		if (freeAimClenchedVisibleMask != visibleClenchedMask)
 			uevr::API::get()->log_info(
 				"[ClenchedHands] static visibility mask=%u weapon=%d grips=%u",
@@ -12851,7 +12878,10 @@ bool WeaponManager::ApplyFreeAimFakeHandPresentation()
 		freeAimAppliedSupportContactActive = supportContactDesired && freeAimSupportHandAttached;
 		freeAimAppliedPrimaryGripAttachmentActive = primaryHandAttachmentDesired
 			&& freeAimPrimaryHandAttached;
-		freeAimAppliedVehicleRightOnly = vehicleRightOnly;
+		if (freeAimAppliedVehicleGunHand != vehicleGunHand)
+			uevr::API::get()->log_info("[FreeAimHands] snapshot hand bindings left=0 right=1 vehicleGunHand=%d",
+				vehicleGunHand);
+		freeAimAppliedVehicleGunHand = vehicleGunHand;
 		freeAimAppliedTwoHandWristOverrideActive = twoHandWristOverrideActive;
 		freeAimAppliedCalibrationWeaponId = static_cast<int>(currentWeaponEquipped);
 		freeAimFakeHandsActive = true;
@@ -12941,7 +12971,7 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 	freeAimAppliedSupportContactActive = false;
 	freeAimAppliedPrimaryGripAttachmentActive = false;
 	freeAimClenchedVisibleMask = 0;
-	ApplyVehicleNativeRightArmPresentation(false);
+	ApplyVehicleNativeGunArmPresentation(false);
 	if (destroyComponents)
 	{
 		cachedControllerPalmAdapterComponents = {};
@@ -12961,7 +12991,7 @@ void WeaponManager::RemoveFreeAimFakeHands(bool destroyComponents)
 		freeAimClenchedRightMesh = nullptr;
 		freeAimClenchedAssetFailureLogged = false;
 		freeAimLeftPalmOffsetApplied = false;
-		freeAimAppliedVehicleRightOnly = false;
+		freeAimAppliedVehicleGunHand = -1;
 		freeAimAppliedTwoHandWristOverrideActive = false;
 		freeAimAppliedCalibrationWeaponId = -1;
 		freeAimPrimaryAttachFailureDiagnosticLogged = false;
@@ -13102,14 +13132,14 @@ void WeaponManager::ProcessFreeAimWeaponHands(bool force)
 		RemoveFreeAimFakeHands(false);
 	}
 
-	const bool vehicleRightOnly = vehicleFreeAimPresentation && showHandsOnFreeAimWeapon;
+	const bool nativeWatchVisible = vehicleFreeAimPresentation && settingsManager->GetVehicleWeaponHand() == 1;
 	const bool desiredVisible = vehicleFreeAimPresentation
 		? true
 		: !settingsManager->enableFreeAimWeaponHands || !showHandsOnFreeAimWeapon;
 	const bool changed = !freeAimWeaponHandsVisibilityInitialized || freeAimWeaponHandsVisible != desiredVisible;
 	playerManager->SetHandsScaled(desiredVisible, force || changed);
 	if (showHandsOnFreeAimWeapon)
-		playerManager->SetWatchScaled(vehicleRightOnly, force || changed);
+		playerManager->SetWatchScaled(nativeWatchVisible, force || changed);
 	else if (vehicleFreeAimPresentation)
 		playerManager->SetWatchScaled(true, force || changed);
 	freeAimWeaponHandsVisible = desiredVisible;
@@ -13130,7 +13160,7 @@ void WeaponManager::RestoreFreeAimWeaponHands()
 	freeAimHandsFailureLogged = false;
 	freeAimWatchFailureLogged = false;
 	freeAimWeaponHandsPresentationActive = false;
-	ApplyVehicleNativeRightArmPresentation(false);
+	ApplyVehicleNativeGunArmPresentation(false);
 	playerManager->SetHandsScaled(true, true);
 	playerManager->SetWatchScaled(true, true);
 }
@@ -13228,7 +13258,7 @@ void WeaponManager::DiscardPlayerOwnedRuntimeState(const char* reason)
 	freeAimSupportAttachedWeapon = nullptr;
 	freeAimPrimaryAttachedWeapon = nullptr;
 	freeAimPrimaryAttachPrimeWeapon = nullptr;
-	vehicleNativeRightArmComponent = nullptr;
+	vehicleNativeGunArmComponent = nullptr;
 	freeAimHandsBlockedCharacter = nullptr;
 	freeAimFakeHandsReady = false;
 	freeAimFakeHandsInitialized = false;
@@ -13247,7 +13277,9 @@ void WeaponManager::DiscardPlayerOwnedRuntimeState(const char* reason)
 	freeAimClenchedVisibleMask = 0;
 	freeAimWeaponHandsPresentationActive = false;
 	freeAimWeaponHandsVisibilityInitialized = false;
-	vehicleNativeRightArmHidden = false;
+	vehicleNativeGunArmHidden = false;
+	vehicleNativeHiddenHand = -1;
+	freeAimAppliedVehicleGunHand = -1;
 	cachedControllerPalmAdapterComponents = {};
 	cachedControllerPalmAdapterBones = {};
 	cachedControllerPalmAdapters = {};

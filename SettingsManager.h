@@ -88,7 +88,7 @@ public:
 		AllInputsSwap = 2
 	};
 	LeftHandedMode leftHandedMode = Disabled;
-	bool leftHandedOnlyWhileOnFoot = true;
+	bool leftHandedOnlyWhileOnFoot = false; // Legacy profile field; unified layout applies in both contexts.
 
 	float xAxisSensitivity = 125.0f;
 	float joystickDeadzone = 0.1f;
@@ -106,12 +106,20 @@ public:
 	void UpdateSettingsIfModifiedByPlayer();
 	void ApplyCameraSettings(CameraModeSettings cameraModeSettings, const std::string& cameraOffsetProfilePrefix = "", bool allowCameraOffsetSave = true);
 	bool SetFeatureFlagFromUi(const std::string& name, bool value, bool& liveApply);
+	bool SetLeftHandedModeFromUi(int mode);
+	bool SetOnFootMovementOrientationFromUi(int orientation);
+	int GetOnFootMovementOrientation() const { return uevr_MovementOrientation; }
+	bool AreControllerInputsSwapped() const;
+	int GetVehicleWeaponHand() const {
+		return leftHandedMode != Disabled && !leftHandedOnlyWhileOnFoot ? 0 : 1;
+	}
 	void DispatchFeatureFlagsToLua() const;
 	void WriteFeatureFlagStatus(const std::string& reason);
 	void ApplyHudVisibilityDefault();
 	bool SetHudUiVisible(bool visible);
 	bool GetPause2dScreenMode(bool& enabled) const;
 	bool SetPause2dScreenMode(bool enabled);
+	bool Reset3dVrFromUi();
 	bool RecoverPluginOwnedPause2dScreenMode();
 	std::string GetGripCalibrationFilePath() const;
 	std::string GetHolsterAnchorsFilePath() const;
@@ -165,6 +173,8 @@ private:
 	void ApplyUevrBoolValue(const std::string& key, bool value);
 	void ApplyUevrIntValue(const std::string& key, int value);
 	void ApplyUevrFloatValue(const std::string& key, float value);
+	bool ShouldSwapControllerInputs(CameraModeSettings modeSettings) const;
+	void ApplyCurrentControllerSwap();
 
 	bool uevr_DecoupledPitch = false;
 	bool uevr_LerpPitch = false;

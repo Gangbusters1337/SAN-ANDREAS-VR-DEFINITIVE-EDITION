@@ -352,9 +352,10 @@ local function apply_quest_x_weapon_cycle(state, buttons, now)
 	end
     local pressed = held and not previousQuestXCycleHeld
     previousQuestXCycleHeld = held
-    if isPlayerAircraft then
-        -- GTA owns this face button while riding a bicycle (pedalling). Never
-        -- replace it with the on-foot weapon-cycle pulse.
+    if isPlayerDriving then
+		-- Weapon cycling is on-foot only. In ordinary vehicles the synthetic LB
+		-- pulse is also GTA's drive-by fire input, so emitting it here makes the
+		-- left Quest X button fire and corrupts the dedicated A-fire state.
         clear_cycle_pulse()
         return buttons, false
     end

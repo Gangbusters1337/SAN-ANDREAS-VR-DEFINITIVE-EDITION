@@ -615,7 +615,7 @@ public:
 			return;
 		}
 
-		const WORD buttons = state->Gamepad.wButtons;
+		WORD buttons = state->Gamepad.wButtons;
 		ObserveDiagnosticVehicleInput(buttons);
 		++diagnosticControlCallbackCount;
 		const ULONGLONG diagnosticNow = GetTickCount64();
@@ -674,6 +674,20 @@ public:
 				diagnosticControlHeartbeatPendingOutput = false;
 			}
 			return;
+		}
+		// UEVR swaps XInput channels before plugin callbacks (its pose lookup is
+		// separate and stays physical). Preserve stick/face-button preferences, but
+		// DUALGRIP and the native
+		// hand snapshots must always receive physical left/right combat inputs.
+		if (playerManager.isInControl && !playerManager.isInVehicle
+			&& settingsManager.AreControllerInputsSwapped())
+		{
+			std::swap(state->Gamepad.bLeftTrigger, state->Gamepad.bRightTrigger);
+			const bool leftGrip = (buttons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+			const bool rightGrip = (buttons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+			buttons &= ~(XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER);
+			if (leftGrip) buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+			if (rightGrip) buttons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
 		}
 		const bool aircraftLeftStickPressed = (buttons & XINPUT_GAMEPAD_LEFT_THUMB) != 0;
 		const bool fixedWingAircraft = playerManager.isInVehicle
@@ -840,15 +854,21 @@ public:
 			return;
 
 		const std::string eventName(event_name);
+		if (eventName == "GTASADE.Reset3dVr")
+		{
+			QueueManual3dReset();
+			return;
+		}
 		if (eventName == "DUALGRIP.ControlGuideNav")
 		{
 			if (!controlGuideOverlay.IsVisible())
 				return;
 			const std::string action(event_data);
+			constexpr int optionCount = ControlGuideOverlay::OptionCount;
 			if (action == "left" || action == "up")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 3) % 4;
+				controlGuideSelectedOption = (controlGuideSelectedOption + optionCount - 1) % optionCount;
 			else if (action == "right" || action == "down")
-				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % 4;
+				controlGuideSelectedOption = (controlGuideSelectedOption + 1) % optionCount;
 			else if (action == "toggle")
 				ToggleControlGuideOption(controlGuideSelectedOption);
 			else
@@ -913,6 +933,8 @@ public:
 			}
 			if (show)
 			{
+				if (!manual3dResetRequested.load(std::memory_order_acquire))
+					SetManual3dResetStatus(ControlGuideOverlay::ResetReady);
 				RefreshControlGuideOptions();
 				// UEVR's UI composition must remain enabled for the custom guide texture,
 				// but GTA's own HUD otherwise renders over it. This title exposes a
@@ -1062,9 +1084,9 @@ public:
 				return;
 
 			if (handSide == "left")
-				settingsManager.leftHandedMode = SettingsManager::TriggerSwap;
+				weaponManager.SetConfiguredPrimaryHand(0);
 			else if (handSide == "right")
-				settingsManager.leftHandedMode = SettingsManager::Disabled;
+				weaponManager.SetConfiguredPrimaryHand(1);
 			else
 				return;
 
@@ -1242,6 +1264,36 @@ public:
 		if (eventName == "GTASADE.ResetGripCalibration")
 		{
 			weaponManager.ResetGripCalibration();
+			return;
+		}
+
+		if (eventName == "GTASADE.SetLeftHandedMode")
+		{
+			const std::string value(event_data);
+			const int mode = value == "0" ? 0 : value == "1" ? 1 : value == "2" ? 2 : -1;
+			if (mode < 0)
+			{
+				API::get()->log_warn("[LeftHanded] rejected mode=%s", value.c_str());
+				return;
+			}
+			settingsManager.SetLeftHandedModeFromUi(mode);
+			if (controlGuideOverlay.IsVisible())
+				RefreshControlGuideOptions();
+			return;
+		}
+
+		if (eventName == "GTASADE.SetMovementOrientation")
+		{
+			const std::string value(event_data);
+			const int orientation = value == "0" ? 0 : value == "1" ? 1 : value == "2" ? 2 : -1;
+			if (orientation < 0)
+			{
+				API::get()->log_warn("[MovementOrientation] rejected value=%s", value.c_str());
+				return;
+			}
+			settingsManager.SetOnFootMovementOrientationFromUi(orientation);
+			if (controlGuideOverlay.IsVisible())
+				RefreshControlGuideOptions();
 			return;
 		}
 
@@ -1478,6 +1530,7 @@ public:
 		ProcessThumbRestHudContext(true);
 		// Apply pause/failure UI after ManagePluginState, because camera profile
 		// reloads occur during the state transition and would otherwise overwrite it.
+		ProcessManual3dReset();
 		UpdatePauseHudVisibility();
 		UpdateHudAutoHide(delta);
 		const auto interactionPerfLifecycleEnd = collectInteractionPerf
@@ -1792,6 +1845,8 @@ public:
 	int hudPinnedObservedPluginState = -1;
 	int hudPinnedObservedCameraMode = -1;
 	bool pauseUi2dScreenAutoEnabled = false;
+	std::atomic<bool> manual3dResetRequested{ false };
+	std::atomic<ControlGuideOverlay::ResetState> manual3dResetStatus{ ControlGuideOverlay::ResetReady };
 	bool resultScreenPresentationActive = false;
 	bool resultScreenHudAutoRevealed = false;
 	bool resultScreen2dAutoEnabled = false;
@@ -2277,17 +2332,7 @@ public:
 
 	int ReadControlGuideMovementOrientation() const
 	{
-		if (API::get()->param()->vr == nullptr || !API::VR::is_runtime_ready())
-			return 0;
-		try
-		{
-			return API::VR::get_mod_value<int>("VR_MovementOrientation");
-		}
-		catch (...)
-		{
-			API::get()->log_warn("%s", "[ControlGuide] movement orientation was unreadable");
-		}
-		return 0;
+		return settingsManager.GetOnFootMovementOrientation();
 	}
 
 	void RefreshControlGuideOptions()
@@ -2296,7 +2341,69 @@ public:
 			settingsManager.enableHudAutoHide,
 			settingsManager.enableR3LeftStickDpad,
 			static_cast<uint32_t>(diagnosticMode),
-			static_cast<uint32_t>(controlGuideSelectedOption));
+			settingsManager.leftHandedMode != SettingsManager::Disabled,
+			static_cast<uint32_t>(controlGuideSelectedOption), manual3dResetStatus.load(std::memory_order_acquire));
+	}
+
+	void SetManual3dResetStatus(ControlGuideOverlay::ResetState status)
+	{
+		manual3dResetStatus.store(status, std::memory_order_release);
+		const char* message = status == ControlGuideOverlay::ResetDone ? "3D restored"
+			: status == ControlGuideOverlay::ResetQueued ? "Resetting..."
+			: status == ControlGuideOverlay::ResetResumeGame ? "Resume gameplay first"
+			: status == ControlGuideOverlay::ResetFailed ? "Reset failed - check log" : "Ready";
+		API::get()->dispatch_lua_event("reset3dVrStatus", message);
+		if (controlGuideOverlay.IsVisible())
+			RefreshControlGuideOptions();
+	}
+
+	void QueueManual3dReset()
+	{
+		SetManual3dResetStatus(ControlGuideOverlay::ResetQueued);
+		manual3dResetRequested.store(true, std::memory_order_release);
+		API::get()->log_info("[Reset3DVR] manual request queued");
+	}
+
+	void ProcessManual3dReset()
+	{
+		if (!manual3dResetRequested.exchange(false, std::memory_order_acq_rel))
+			return;
+		// Recovery is for stuck gameplay. Do not strip a genuine pause/death menu
+		// of its 2D presentation or change any automatic result-screen rules.
+		const auto camera = cameraController.currentCameraMode;
+		if (!playerManager.isInControl || camera == CameraController::PlayerFallenWater
+			|| camera == CameraController::PedDeadBaby || camera == CameraController::ArrestCamOne
+			|| camera == CameraController::ArrestCamTwo)
+		{
+			SetManual3dResetStatus(ControlGuideOverlay::ResetResumeGame);
+			API::get()->log_info("[Reset3DVR] rejected control=%s camera=%d; resume gameplay first",
+				playerManager.isInControl ? "true" : "false", static_cast<int>(camera));
+			return;
+		}
+		if (!settingsManager.Reset3dVrFromUi())
+		{
+			SetManual3dResetStatus(ControlGuideOverlay::ResetFailed);
+			return;
+		}
+		pause2dStartupRecoveryPending = false;
+		pauseUi2dScreenAutoEnabled = false;
+		pauseUiExplicitRequestExpiresAt = 0;
+		hudUiAutoRevealedForPause = false;
+		resultScreenPresentationActive = false;
+		resultScreen2dAutoEnabled = false;
+		resultScreenHudAutoRevealed = false;
+		resultScreenPresentationReassertAt = 0;
+		resultScreenPresentationReassertsRemaining = 0;
+		interactive2dResultInputActive = false;
+		interactive2dResultSelectionObserved.store(false, std::memory_order_release);
+		pauseUiNativeMenuActionObserved.store(false, std::memory_order_release);
+		resultScreenInputPassthrough.store(false, std::memory_order_release);
+		lastResultScreenInputStateSentToLua = false;
+		resultScreenInputStateInitialized = true;
+		API::get()->dispatch_lua_event("resultScreenState", "false");
+		if (settingsManager.enableHudAutoHide && hudUiVisible && !hudUiPinned)
+			ResetHudAutoHideTimer();
+		SetManual3dResetStatus(ControlGuideOverlay::ResetDone);
 	}
 
 	void ProcessControlGuideNativeHudRequest()
@@ -2318,32 +2425,33 @@ public:
 
 	void ToggleControlGuideOption(int option)
 	{
-		if (option < 0 || option > 3)
+		if (option < 0 || option >= ControlGuideOverlay::OptionCount)
 			return;
-		if (option == 0)
+		if (option == ControlGuideOverlay::Reset3dVr)
 		{
-			if (API::get()->param()->vr == nullptr || !API::VR::is_runtime_ready())
-				return;
-			try
-			{
-				const int current = ReadControlGuideMovementOrientation();
-				API::VR::set_mod_value("VR_MovementOrientation", current == 1 ? 0 : 1);
-				API::VR::save_config();
-			}
-			catch (...)
-			{
-				API::get()->log_warn("[ControlGuide] quick option toggle failed option=%d", option);
-			}
+			QueueManual3dReset();
+			return;
+		}
+		if (option == ControlGuideOverlay::MovementDirection)
+		{
+			const int current = ReadControlGuideMovementOrientation();
+			settingsManager.SetOnFootMovementOrientationFromUi(current == 1 ? 0 : 1);
 			return;
 		}
 
-		if (option == 3)
+		if (option == ControlGuideOverlay::ControlLayout)
+		{
+			settingsManager.SetLeftHandedModeFromUi(
+				settingsManager.leftHandedMode == SettingsManager::Disabled ? 2 : 0);
+			return;
+		}
+		if (option == ControlGuideOverlay::Diagnostics)
 		{
 			const uint8_t next = (static_cast<uint8_t>(diagnosticMode) + 1U) % 4U;
 			SetDiagnosticMode(static_cast<DiagnosticMode>(next), "control-guide");
 			return;
 		}
-		if (option == 2)
+		if (option == ControlGuideOverlay::DpadControl)
 		{
 			const bool enabled = !settingsManager.enableR3LeftStickDpad;
 			bool liveApply = false;

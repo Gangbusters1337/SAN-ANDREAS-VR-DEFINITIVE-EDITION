@@ -7,9 +7,10 @@ local leftHandedMode = 0;
 local leftHandedOnlyWhileOnFoot = true;
 
 
--- swap both triggers
+-- Only swap native vehicle triggers. On foot, DUALGRIP is already physical-hand
+-- agnostic and has translated either firing hand to native RT before this script.
 uevr.sdk.callbacks.on_xinput_get_state(function(retval, user_index, state)
-    if (leftHandedMode == 1 and leftHandedOnlyWhileOnFoot and not isPlayerDriving) then
+    if (leftHandedMode == 1 and not leftHandedOnlyWhileOnFoot and isPlayerDriving) then
         local leftTrigger = state.Gamepad.bLeftTrigger
         local rightTrigger = state.Gamepad.bRightTrigger
         state.Gamepad.bRightTrigger = leftTrigger

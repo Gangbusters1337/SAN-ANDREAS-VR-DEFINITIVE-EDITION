@@ -68,7 +68,7 @@ Physical Start, Back, L3, and R3 remain native unless an optional remap is enabl
 - Double-tap the left thumb-rest: pin or unpin the HUD.
 - Hold the left thumb-rest: reveal the HUD context while using the touch D-pad.
 - Right B + Left Y: reveal pause UI and send a short Start pulse.
-- Right A + Left X opens/closes the in-game control guide. Use the left stick to select and A to change Body Orientation, HUD Auto-Hide, D-pad Control, or the session-only Diagnostics mode.
+- Right A + Left X opens/closes the in-game control guide and quick settings. Follow the panel's prompts: left stick/A with Standard layout, right stick/X with Left-handed layout. Move the indicated stick left/right to browse the looping menu; the selected setting stays in the center. The indicated button changes Movement Direction, HUD Auto-Hide, D-pad Control, Control Layout, or the session-only Diagnostics mode. A + X closes without changing an option. Movement Direction chooses whether on-foot stick movement follows the game or your HMD; it does not directly turn CJ's body.
 - D-pad Control defaults to **THUMBREST + R-STICK**: hold the left thumbrest and move the right stick. Controllers without a thumbrest can select **R3 + R-STICK** instead. Pressing R3 immediately pauses right-stick camera movement; hold it for about 0.25 seconds, then move the right stick for D-pad input. R3 also inherits the HUD tap, double-tap, and held-context behavior while this mode is selected, while a short on-foot click retains the pickup/context action. R3 D-pad mode is disabled in aircraft, and L3+R3 still opens UEVR.
 - Diagnostics choices are Off, Vehicle Input, Save/Load, and Full. They always start Off after a restart and never enable experimental gameplay behavior.
 - In a car, boat, or motorbike, hold the left Quest menu button for about one second to send GTA's native Back/View action and cycle its original vehicle cameras. A short press remains Pause.
@@ -109,7 +109,9 @@ For a two-hand firearm, the first grip is primary and the other is support. Face
 - Aim-calibration probe.
 - Free-aim animated-hand option.
 
-Left-handed mode is configured in settings: disabled, trigger swap, or full input swap. The on-foot-only setting remains the default behavior.
+Control Layout is available in the A + X quick settings and SAVR's Improvements Settings: Standard or Left-handed. On-foot weapon handling is always ambidextrous: each physical grip/trigger operates its own hand, with unchanged melee, two-hand aiming, holsters, and calibration. Left-handed swaps the other buttons and sticks; vehicle free aim uses the left gun hand and keeps the right native hand on the wheel. The choice is saved across restarts. Older left-handed profiles migrate to this unified layout. Use this SAVR option instead of UEVR's native Swap Controller Inputs.
+
+If gameplay gets stuck on a flat 2D screen, open A + X, browse to **Reset 3D VR**, and activate it with the indicated button. It shows **3D RESTORED** when successful; close the guide with A + X to check the view. The same action is in UEVR's Improvements Settings. Resume gameplay first if you are in a pause, cutscene, or result screen. This clears only 2D mode and stale SAVR 2D guard state; camera calibration, graphics, handedness, and HUD preferences are not reset. No restart is needed.
 
 ## Known control issues to verify
 

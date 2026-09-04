@@ -108,6 +108,7 @@ void SettingsManager::InitSettingsManager()
 	uevr::API::get()->log_info("%s", pluginConfigFilePath.c_str());
 	FetchUevrSettings(false);
 	FetchPluginSettings();
+	ApplyCurrentControllerSwap();
 }
 
 std::string SettingsManager::GetProfileDirectory() const
@@ -128,8 +129,12 @@ void SettingsManager::FetchUevrSettings(bool writeToPlugin)
 	uevr_LerpPitch = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraPitch", true);
 	uevr_LerpRoll = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraRoll", true);
 	uevr_LerpYaw = SettingsManager::GetBoolValueFromFile(uevrConfigFilePath, "VR_LerpCameraYaw", false);
-	uevr_MovementOrientation = std::clamp(
-		SettingsManager::GetIntValueFromFile(uevrConfigFilePath, "VR_MovementOrientation", 0), 0, 2);
+	// A UEVR menu save in a vehicle serializes its temporary game-relative value.
+	// Only adopt native edits on foot (or the initial migration before plugin load).
+	if (!writeToPlugin || cameraModeSettings == OnFoot)
+		uevr_MovementOrientation = (std::clamp)(
+			GetIntValueFromFile(uevrConfigFilePath, "VR_MovementOrientation", 0), 0, 2);
+	uevr::API::get()->dispatch_lua_event("movementOrientation", std::to_string(uevr_MovementOrientation));
 
 	if (writeToPlugin)
 		WriteChangedSettingsToPluginConfigFile();
@@ -205,10 +210,29 @@ void SettingsManager::FetchPluginSettings()
 		featureFlagStatusInitialized = true;
 	}
 
-	leftHandedMode = (LeftHandedMode)SettingsManager::GetIntValueFromFile(pluginConfigFilePath, "LeftHandedMode", 0);
+	const int savedHandedness = (std::clamp)(GetIntValueFromFile(pluginConfigFilePath, "LeftHandedMode", 0), 0, 2);
+	const bool savedOnFootOnly = GetBoolValueFromFile(pluginConfigFilePath, "LeftHandedOnlyWhileOnFoot", false);
+	// Migrate the old three-way choice and scope checkbox into one layout.
+	// Grips/triggers on foot remain physical-hand inputs in either layout.
+	leftHandedMode = savedHandedness == 0 ? Disabled : AllInputsSwap;
+	leftHandedOnlyWhileOnFoot = false;
+	if (savedHandedness != static_cast<int>(leftHandedMode) || savedOnFootOnly)
+	{
+		SetMultipleValuesToFile(pluginConfigFilePath, {
+			{"LeftHandedMode", std::to_string(leftHandedMode)},
+			{"LeftHandedOnlyWhileOnFoot", "false"}
+		});
+		uevr::API::get()->log_info("[ControlLayout] migrated mode=%d onFootOnly=%s to %s",
+			savedHandedness, savedOnFootOnly ? "true" : "false", leftHandedMode == Disabled ? "standard" : "left-handed");
+	}
 	uevr::API::get()->dispatch_lua_event("playerIsLeftHanded", std::to_string(leftHandedMode));
-	leftHandedOnlyWhileOnFoot = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "LeftHandedOnlyWhileOnFoot", true);
-	uevr::API::get()->dispatch_lua_event("leftHandedOnlyWhileOnFoot", leftHandedOnlyWhileOnFoot ? "true" : "false");
+	uevr::API::get()->dispatch_lua_event("leftHandedOnlyWhileOnFoot", "false");
+	const int savedMovement = GetIntValueFromFile(pluginConfigFilePath, "OnFoot_MovementOrientation", -1);
+	if (savedMovement >= 0 && savedMovement <= 2)
+		uevr_MovementOrientation = savedMovement;
+	else
+		SetIntValueToFile(pluginConfigFilePath, "OnFoot_MovementOrientation", uevr_MovementOrientation);
+	uevr::API::get()->dispatch_lua_event("movementOrientation", std::to_string(uevr_MovementOrientation));
 
 	onFoot_DecoupledPitch = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "OnFoot_DecoupledPitch", false);
 	onFoot_LerpPitch = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "OnFoot_LerpPitch", true);
@@ -356,6 +380,47 @@ void SettingsManager::DispatchFeatureFlagsToLua() const
 	dispatchFlag("EnableFireTaskPrewarm", enableFireTaskPrewarm, true);
 	dispatchFlag("DebugInputLayerProbe", debugInputLayerProbe, true);
 	dispatchFlag("EnableShowUiAtStartup", enableShowUiAtStartup, true);
+	// These settings were historically dispatched only during plugin startup,
+	// before the Lua scripts had registered their listeners. Include them in the
+	// deferred state republish so the saved mode is authoritative every launch.
+	uevr::API::get()->dispatch_lua_event("playerIsLeftHanded", std::to_string(leftHandedMode));
+	uevr::API::get()->dispatch_lua_event("leftHandedOnlyWhileOnFoot",
+		leftHandedOnlyWhileOnFoot ? "true" : "false");
+	uevr::API::get()->dispatch_lua_event("movementOrientation", std::to_string(uevr_MovementOrientation));
+}
+
+bool SettingsManager::SetLeftHandedModeFromUi(int mode)
+{
+	const auto next = mode == 0 ? Disabled : AllInputsSwap;
+	leftHandedMode = next;
+	leftHandedOnlyWhileOnFoot = false;
+	SetMultipleValuesToFile(pluginConfigFilePath, {
+		{"LeftHandedMode", std::to_string(next)},
+		{"LeftHandedOnlyWhileOnFoot", "false"}
+	});
+	uevr::API::get()->dispatch_lua_event("playerIsLeftHanded", std::to_string(next));
+	uevr::API::get()->dispatch_lua_event("leftHandedOnlyWhileOnFoot", "false");
+	ApplyCurrentControllerSwap();
+	uevr::API::get()->log_info("[ControlLayout] selected=%s onFootHands=physical vehicleGunHand=%d",
+		next == Disabled ? "standard" : "left-handed", GetVehicleWeaponHand());
+	return true;
+}
+
+bool SettingsManager::SetOnFootMovementOrientationFromUi(int orientation)
+{
+	const int next = (std::clamp)(orientation, 0, 2);
+	uevr_MovementOrientation = next;
+	SetIntValueToFile(pluginConfigFilePath, "OnFoot_MovementOrientation", next);
+	SetIntValueToFile(uevrConfigFilePath, "VR_MovementOrientation", next);
+	uevrConfigWroteByPlugin = true;
+	uevr::API::get()->dispatch_lua_event("movementOrientation", std::to_string(next));
+	// Vehicles deliberately use game-relative movement, but changing the option
+	// there must still update the saved on-foot preference without enabling it
+	// until the player is back on foot.
+	ApplyUevrIntValue("VR_MovementOrientation", cameraModeSettings == OnFoot ? next : 0);
+	uevr::API::get()->log_info("[MovementOrientation] savedOnFoot=%d runtime=%d mode=%d",
+		next, cameraModeSettings == OnFoot ? next : 0, static_cast<int>(cameraModeSettings));
+	return true;
 }
 
 void SettingsManager::ApplyHudVisibilityDefault()
@@ -406,6 +471,29 @@ bool SettingsManager::SetPause2dScreenMode(bool enabled)
 	if (!enabled)
 		ClearPause2dOwnershipMarker();
 	return true;
+}
+
+bool SettingsManager::Reset3dVrFromUi()
+{
+	bool previousLive = false;
+	if (!GetPause2dScreenMode(previousLive))
+		return false;
+	const bool previousSaved = GetBoolValueFromFile(uevrConfigFilePath, "VR_2DScreenMode", false);
+	// Explicit manual recovery only. Persist this one key, never save all UEVR
+	// options: a blanket save could capture unrelated temporary camera/HUD values.
+	const bool changed = SetMultipleValuesToFile(uevrConfigFilePath, {{"VR_2DScreenMode", "false"}});
+	uevrConfigWroteByPlugin = uevrConfigWroteByPlugin || changed;
+	if (GetBoolValueFromFile(uevrConfigFilePath, "VR_2DScreenMode", true))
+	{
+		uevr::API::get()->log_warn("[Reset3DVR] failed to persist VR_2DScreenMode=false");
+		return false;
+	}
+	bool currentLive = true;
+	const bool restored = SetPause2dScreenMode(false) && GetPause2dScreenMode(currentLive) && !currentLive;
+	uevr::API::get()->log_info("[Reset3DVR] manual liveBefore=%s savedBefore=%s liveAfter=%s success=%s",
+		previousLive ? "true" : "false", previousSaved ? "true" : "false",
+		currentLive ? "true" : "false", restored ? "true" : "false");
+	return restored;
 }
 
 bool SettingsManager::RecoverPluginOwnedPause2dScreenMode()
@@ -817,6 +905,7 @@ void SettingsManager::WriteChangedSettingsToPluginConfigFile()
 	switch (cameraModeSettings)
 	{
 	case OnFoot:
+		pluginSettingsToApply.push_back({"OnFoot_MovementOrientation", std::to_string(uevr_MovementOrientation)});
 		pluginSettingsToApply.push_back({"OnFoot_DecoupledPitch", uevr_DecoupledPitch ? "true" : "false"});
 		pluginSettingsToApply.push_back({"OnFoot_LerpPitch", uevr_LerpPitch ? "true" : "false"});
 		pluginSettingsToApply.push_back({"OnFoot_LerpRoll", uevr_LerpRoll ? "true" : "false"});
@@ -981,6 +1070,34 @@ void SettingsManager::ApplyUevrFloatValue(const std::string& key, float value)
 		uevr::API::VR::set_mod_value(key, value);
 }
 
+bool SettingsManager::ShouldSwapControllerInputs(CameraModeSettings modeSettings) const
+{
+	return leftHandedMode == AllInputsSwap
+		&& (!leftHandedOnlyWhileOnFoot || modeSettings == OnFoot);
+}
+
+bool SettingsManager::AreControllerInputsSwapped() const
+{
+	// Read the live option, not the desired mode: UEVR can change it from its own
+	// menu before our config poll. This is an option lookup, not a file/world scan.
+	if (uevr::API::get()->param()->vr == nullptr || !uevr::API::VR::is_runtime_ready())
+		return false;
+	return uevr::API::VR::get_mod_value<bool>("VR_SwapControllerInputs");
+}
+
+void SettingsManager::ApplyCurrentControllerSwap()
+{
+	const bool enabled = ShouldSwapControllerInputs(cameraModeSettings);
+	ApplyUevrBoolValue("VR_SwapControllerInputs", enabled);
+	SetBoolValueToFile(uevrConfigFilePath, "VR_SwapControllerInputs", enabled);
+	uevrConfigWroteByPlugin = true;
+	if (debugInputLayerProbe)
+		uevr::API::get()->log_info(
+			"[InputPreferences] handedness=%d onlyOnFoot=%s mode=%d nativeSwap=%s",
+			static_cast<int>(leftHandedMode), leftHandedOnlyWhileOnFoot ? "true" : "false",
+			static_cast<int>(cameraModeSettings), enabled ? "true" : "false");
+}
+
 void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings modeSettings,
 	const std::string& cameraOffsetProfilePrefix, bool allowCameraOffsetSave)
 {
@@ -1042,6 +1159,7 @@ void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings mo
 		uevrSettingsToApply.push_back({"VR_CameraUpOffset", std::to_string(uevr_CameraOffset.up)});
 	}
 
+	int runtimeOnlyMovementOrientation = -1;
 	switch (cameraModeSettings)
 	{
 	case Cutscene:
@@ -1049,8 +1167,6 @@ void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings mo
 		queueBool("VR_LerpCameraPitch", false);
 		queueBool("VR_LerpCameraRoll", false);
 		queueBool("VR_LerpCameraYaw", false);
-		if (leftHandedMode == AllInputsSwap)
-			queueBool("VR_SwapControllerInputs", !leftHandedOnlyWhileOnFoot);
 		break;
 	case OnFoot:
 		queueBool("VR_DecoupledPitch", onFoot_DecoupledPitch);
@@ -1058,38 +1174,42 @@ void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings mo
 		queueBool("VR_LerpCameraPitch", onFoot_LerpPitch);
 		queueBool("VR_LerpCameraRoll", onFoot_LerpRoll);
 		queueBool("VR_LerpCameraYaw", onFoot_LerpYaw);
-		if (leftHandedMode == AllInputsSwap)
-			queueBool("VR_SwapControllerInputs", true);
 		break;
 	case DrivingCar:
 		queueBool("VR_DecoupledPitch", drivingCar_DecoupledPitch);
-		queueInt("VR_MovementOrientation", 0);
+		runtimeOnlyMovementOrientation = 0;
+		ApplyUevrIntValue("VR_MovementOrientation", runtimeOnlyMovementOrientation);
 		queueFloat("VR_AimSpeed", xAxisSensitivity / 10.0f);
 		queueBool("VR_LerpCameraPitch", drivingCar_LerpPitch);
 		queueBool("VR_LerpCameraRoll", drivingCar_LerpRoll);
 		queueBool("VR_LerpCameraYaw", drivingCar_LerpYaw);
-		if (leftHandedMode == AllInputsSwap)
-			queueBool("VR_SwapControllerInputs", !leftHandedOnlyWhileOnFoot);
 		break;
 	case DrivingBike:
 		queueBool("VR_DecoupledPitch", drivingBike_DecoupledPitch);
-		queueInt("VR_MovementOrientation", 0);
+		runtimeOnlyMovementOrientation = 0;
+		ApplyUevrIntValue("VR_MovementOrientation", runtimeOnlyMovementOrientation);
 		queueBool("VR_LerpCameraPitch", drivingBike_LerpPitch);
 		queueBool("VR_LerpCameraRoll", drivingBike_LerpRoll);
 		queueBool("VR_LerpCameraYaw", drivingBike_LerpYaw);
-		if (leftHandedMode == AllInputsSwap)
-			queueBool("VR_SwapControllerInputs", !leftHandedOnlyWhileOnFoot);
 		break;
 	case Flying:
 		queueBool("VR_DecoupledPitch", flying_DecoupledPitch);
-		queueInt("VR_MovementOrientation", 0);
+		runtimeOnlyMovementOrientation = 0;
+		ApplyUevrIntValue("VR_MovementOrientation", runtimeOnlyMovementOrientation);
 		queueBool("VR_LerpCameraPitch", flying_LerpPitch);
 		queueBool("VR_LerpCameraRoll", flying_LerpRoll);
 		queueBool("VR_LerpCameraYaw", flying_LerpYaw);
-		if (leftHandedMode == AllInputsSwap)
-			queueBool("VR_SwapControllerInputs", !leftHandedOnlyWhileOnFoot);
 		break;
 	}
+	// SAVR owns the native swap. A manually toggled UEVR swap must not leak into
+	// vehicles when the saved SAVR mode is right-handed or on-foot-only.
+	queueBool("VR_SwapControllerInputs", ShouldSwapControllerInputs(cameraModeSettings));
+	if (debugInputLayerProbe)
+		uevr::API::get()->log_info(
+			"[InputPreferences] cameraMode=%d movementSaved=%d movementRuntime=%d nativeSwap=%s",
+			static_cast<int>(cameraModeSettings), uevr_MovementOrientation,
+			runtimeOnlyMovementOrientation >= 0 ? runtimeOnlyMovementOrientation : uevr_MovementOrientation,
+			ShouldSwapControllerInputs(cameraModeSettings) ? "true" : "false");
 
 	// Cutscene/NoControls values are temporary. Writing them to config makes UEVR
 	// reload while the renderer is already transitioning, then OnFoot reloads again.
@@ -1112,6 +1232,10 @@ void SettingsManager::ApplyCameraSettings(SettingsManager::CameraModeSettings mo
 		// runtime-only HUD choice without writing the profile again.
 		if (hudUiVisibilityInitialized)
 			uevr::API::VR::set_mod_value("VR_EnableGUI", desiredHudUiVisible);
+		// reload_config restores the persistent on-foot preference. Reapply the
+		// temporary game-relative vehicle value without writing it back to disk.
+		if (runtimeOnlyMovementOrientation >= 0)
+			ApplyUevrIntValue("VR_MovementOrientation", runtimeOnlyMovementOrientation);
 		lastApplyTime = GetTickCount64();
 		uevr::API::get()->log_info("[CameraProfiles] activated rendered camera for %s",
 			activeCameraOffsetProfilePrefix.c_str());
@@ -1226,7 +1350,20 @@ void SettingsManager::UpdateSettingsIfModifiedByPlayer()
 		uevrConfigWroteByPlugin = false;
 		return;
 	}
-	CheckSettingsModificationAndUpdate(uevrConfigFilePath, true);
+	if (CheckSettingsModificationAndUpdate(uevrConfigFilePath, true))
+	{
+		const bool expectedSwap = ShouldSwapControllerInputs(cameraModeSettings);
+		const bool capturedSwap = GetBoolValueFromFile(
+			uevrConfigFilePath, "VR_SwapControllerInputs", expectedSwap);
+		if (capturedSwap != expectedSwap)
+		{
+			uevr::API::get()->log_warn(
+				"[LeftHanded] native UEVR swap=%s conflicts with SAVR mode=%d; restoring=%s",
+				capturedSwap ? "true" : "false", static_cast<int>(leftHandedMode),
+				expectedSwap ? "true" : "false");
+			ApplyCurrentControllerSwap();
+		}
+	}
 }
 
 bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& filePath, bool uevr)
@@ -1288,7 +1425,7 @@ bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& file
 			"\n"
 			"[Left Handed Mode :] -- Must be configured here. 0 = disabled, 1 = Triggers Swap, 2 = Full inputs Swap\n"
 			"LeftHandedMode=0\n"
-			"LeftHandedOnlyWhileOnFoot=true\n"
+			"LeftHandedOnlyWhileOnFoot=false\n"
 			"\n"
 			"[Camera Settings :] -- Can be set directly ingame from uevr menu. The plugin will auto save each camera configuration for each vehicle type here\n"
 			"OnFoot_DecoupledPitch=false\n"

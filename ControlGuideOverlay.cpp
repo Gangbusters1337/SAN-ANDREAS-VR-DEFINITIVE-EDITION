@@ -52,18 +52,22 @@ void ControlGuideOverlay::SetVisible(bool value)
 }
 
 void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, bool useR3Dpad, uint32_t diagnostics,
-	uint32_t selected)
+	bool leftHanded, uint32_t selected, ResetState resetState)
 {
 	std::scoped_lock lock(stateMutex);
-	selected = (std::min)(selected, 3U);
+	selected %= OptionCount;
 	if (movementOrientation == orientation && hudAutoHide == autoHide
 		&& r3DpadMode == useR3Dpad && diagnosticMode == diagnostics
+		&& leftHandedLayout == leftHanded
+		&& reset3dState == resetState
 		&& selectedOption == selected && !basePixels.empty())
 		return;
 	movementOrientation = orientation;
 	hudAutoHide = autoHide;
 	r3DpadMode = useR3Dpad;
 	diagnosticMode = diagnostics;
+	leftHandedLayout = leftHanded;
+	reset3dState = resetState;
 	selectedOption = selected;
 	if (!basePixels.empty() && ComposeOptionsPanel())
 	{
@@ -384,10 +388,10 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 	const HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
 	Rectangle(dc, panel.left, panel.top, panel.right, panel.bottom);
 
-	HFONT titleFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+	HFONT titleFont = CreateFontW(17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_SWISS, L"Arial");
-	HFONT optionFont = CreateFontW(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+	HFONT optionFont = CreateFontW(16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
 		DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_SWISS, L"Arial");
 	HFONT footerFont = CreateFontW(19, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -409,66 +413,61 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 
 	const HGDIOBJ oldFont = SelectObject(dc, titleFont);
 	SetTextColor(dc, RGB(226, 166, 61));
-	RECT titleRect{ panel.left + 12, panel.top + 4, panel.right - 12, panel.top + 28 };
-	DrawTextW(dc, L"VR OPTIONS   -   LEFT STICK LEFT / RIGHT: SELECT   -   A: CHANGE", -1, &titleRect,
-		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-
+	RECT titleRect{ panel.left + 12, panel.top + 3, panel.left + 310, panel.top + 25 };
+	const std::wstring title = L"VR OPTIONS     " + std::to_wstring(selectedOption + 1)
+		+ L" / " + std::to_wstring(OptionCount);
+	DrawTextW(dc, title.c_str(), -1, &titleRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 	SelectObject(dc, optionFont);
-	for (uint32_t index = 0; index < 4; ++index)
-	{
-		const LONG columnWidth = (panel.right - panel.left - 50) / 4;
-		RECT row{ panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10), panel.top + 31,
-			panel.left + 10 + static_cast<LONG>(index) * (columnWidth + 10) + columnWidth, panel.bottom - 8 };
-		if (index == selectedOption)
-		{
-			HBRUSH selectedBrush = CreateSolidBrush(RGB(35, 58, 12));
-			FillRect(dc, &row, selectedBrush);
-			DeleteObject(selectedBrush);
-		}
-		SetTextColor(dc, index == selectedOption ? RGB(245, 245, 220) : RGB(205, 215, 198));
-		if (index == 0)
-		{
-			const wchar_t* state = movementOrientation == 1 ? L"HEAD / HMD"
-				: movementOrientation == 0 ? L"STANDARD" : L"CUSTOM";
-			std::wstring label = L"BODY ORIENTATION: ";
-			label += state;
-			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
-			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-		}
-		else if (index == 1)
-		{
-			std::wstring label = L"HUD AUTO-HIDE: ";
-			label += hudAutoHide ? L"ON" : L"OFF";
-			SetTextColor(dc, hudAutoHide ? RGB(139, 208, 36) : RGB(210, 85, 65));
-			RECT labelRect{ row.left + 8, row.top, row.right - 8, row.bottom };
-			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-		}
-		else if (index == 2)
-		{
-			std::wstring label = L"D-PAD:\n";
-			label += r3DpadMode ? L"R3 + R-STICK" : L"THUMBREST + R-STICK";
-			SetTextColor(dc, RGB(139, 208, 36));
-			RECT labelRect{ row.left + 3, row.top + 2, row.right - 3, row.bottom };
-			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_WORDBREAK);
-		}
-		else
-		{
-			const wchar_t* state = diagnosticMode == 1 ? L"VEHICLE"
-				: diagnosticMode == 2 ? L"SAVE / LOAD"
-				: diagnosticMode == 3 ? L"FULL" : L"OFF";
-			std::wstring label = L"DIAGNOSTICS: ";
-			label += state;
-			SetTextColor(dc, diagnosticMode == 0 ? RGB(205, 215, 198) : RGB(226, 166, 61));
-			RECT labelRect{ row.left + 5, row.top, row.right - 5, row.bottom };
-			DrawTextW(dc, label.c_str(), -1, &labelRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-		}
-	}
+	SetTextColor(dc, RGB(190, 201, 180));
+	RECT hintRect{ panel.left + 315, panel.top + 3, panel.right - 12, panel.top + 25 };
+	// The logical menu stick/A button follow the control layout too. A+X remains
+	// the same physical pair in either layout, so the guide's close hint is stable.
+	const std::wstring hint = std::wstring(leftHandedLayout ? L"R-STICK LEFT / RIGHT: BROWSE    X: "
+		: L"L-STICK LEFT / RIGHT: BROWSE    A: ") + (selectedOption == Reset3dVr ? L"RESET" : L"CHANGE");
+	DrawTextW(dc, hint.c_str(), -1, &hintRect,
+		DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
+	// Fixed center focus. Only the labels cycle, so adding options never expands
+	// the strip into the guide image. Keep names and values on separate lines.
+	const wchar_t* names[OptionCount]{ L"MOVEMENT DIRECTION", L"HUD AUTO-HIDE",
+		L"D-PAD CONTROL", L"CONTROL LAYOUT", L"DIAGNOSTICS", L"RESET 3D VR" };
+	const wchar_t* values[OptionCount]{
+		movementOrientation == 1 ? L"HEAD / HMD" : movementOrientation == 0 ? L"STANDARD" : L"CUSTOM",
+		hudAutoHide ? L"ON" : L"OFF",
+		r3DpadMode ? L"R3 + R-STICK" : L"THUMBREST + R-STICK",
+		leftHandedLayout ? L"LEFT-HANDED" : L"STANDARD",
+		diagnosticMode == 1 ? L"VEHICLE" : diagnosticMode == 2 ? L"SAVE / LOAD"
+			: diagnosticMode == 3 ? L"FULL" : L"OFF",
+		reset3dState == ResetDone ? L"3D RESTORED" : reset3dState == ResetQueued ? L"RESETTING..."
+			: reset3dState == ResetResumeGame ? L"RESUME GAME FIRST"
+			: reset3dState == ResetFailed ? L"RESET FAILED" : L"ACTIVATE"
+	};
+	const uint32_t previous = (selectedOption + OptionCount - 1) % OptionCount;
+	const uint32_t next = (selectedOption + 1) % OptionCount;
+	RECT previousRect{ panel.left + 30, panel.top + 29, panel.left + 202, panel.bottom - 6 };
+	RECT nextRect{ panel.right - 202, panel.top + 29, panel.right - 30, panel.bottom - 6 };
+	SetTextColor(dc, RGB(155, 174, 140));
+	DrawTextW(dc, names[previous], -1, &previousRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	DrawTextW(dc, names[next], -1, &nextRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 	SelectObject(dc, footerFont);
-	SetTextColor(dc, RGB(235, 35, 54));
-	RECT footerRect{ 730, 371, 1190, 402 };
-	DrawTextW(dc, L"AND VR OPTIONS", -1, &footerRect,
-		DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	SetTextColor(dc, RGB(139, 208, 36));
+	RECT leftArrow{ panel.left + 8, panel.top + 27, panel.left + 30, panel.bottom - 5 };
+	RECT rightArrow{ panel.right - 30, panel.top + 27, panel.right - 8, panel.bottom - 5 };
+	DrawTextW(dc, L"\x2039", -1, &leftArrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	DrawTextW(dc, L"\x203A", -1, &rightArrow, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	RECT center{ panel.left + 212, panel.top + 27, panel.right - 212, panel.bottom - 5 };
+	HBRUSH selectedBrush = CreateSolidBrush(RGB(35, 58, 12));
+	FillRect(dc, &center, selectedBrush);
+	DeleteObject(selectedBrush);
+	SelectObject(dc, optionFont);
+	SetTextColor(dc, RGB(245, 245, 220));
+	RECT nameRect{ center.left + 6, center.top, center.right - 6, center.top + 20 };
+	DrawTextW(dc, names[selectedOption], -1, &nameRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+	SelectObject(dc, footerFont);
+	SetTextColor(dc, selectedOption == Diagnostics && diagnosticMode != 0
+		? RGB(226, 166, 61) : RGB(169, 222, 65));
+	RECT valueRect{ center.left + 6, center.top + 20, center.right - 6, center.bottom };
+	DrawTextW(dc, values[selectedOption], -1, &valueRect, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
 	pixels.resize(basePixels.size());
 	for (size_t pixel = 0; pixel < static_cast<size_t>(imageWidth) * imageHeight; ++pixel)

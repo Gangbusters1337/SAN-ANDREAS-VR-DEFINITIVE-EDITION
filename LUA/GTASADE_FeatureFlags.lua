@@ -5,6 +5,8 @@ local quick_options_visible = false
 local logged_imgui_missing = false
 local aim_calibration_result = "No accepted shots yet"
 local quick_movement_orientation = 0
+local left_handed_mode = 0
+local reset_3d_status = "Ready"
 
 local sections = {
     {
@@ -40,7 +42,7 @@ local sections = {
             { key = "EnablePhoneAnswerGripTap", label = "Tap right grip to answer ringing phone [Recommended]" },
             { key = "EnableChordPauseMenu", label = "B + Y opens pause menu" },
             { key = "EnableChordHudToggle", label = "A + X control-guide overlay" },
-            { key = "EnableVehicleFaceButtonFire", label = "Vehicle X/A left/right fire" },
+            { key = "EnableVehicleFaceButtonFire", label = "Vehicle A fire" },
             { key = "EnableAircraftNativeControls", label = "Aircraft controls [Recommended]" },
         },
     },
@@ -121,87 +123,32 @@ local function parse_payload(payload)
     end
 end
 
-local function dispatch_flag(name, enabled)
-    local payload = name .. "=" .. tostring(enabled)
-
+local function dispatch_setting(event_name, payload)
     if uevr and uevr.api and uevr.api.dispatch_custom_event then
         local ok = pcall(function()
-            uevr.api:dispatch_custom_event("GTASADE.SetFeatureFlag", payload)
+            uevr.api:dispatch_custom_event(event_name, tostring(payload))
         end)
         if ok then
-            return
+            return true
         end
     end
 
     if uevr and uevr.params and uevr.params.functions and uevr.params.functions.dispatch_custom_event then
         local ok = pcall(function()
-            uevr.params.functions.dispatch_custom_event("GTASADE.SetFeatureFlag", payload)
+            uevr.params.functions.dispatch_custom_event(event_name, tostring(payload))
         end)
         if ok then
-            return
+            return true
         end
     end
 
-    log("Could not dispatch " .. payload)
+    log("Could not dispatch " .. event_name .. "=" .. tostring(payload))
+    return false
 end
 
-local function clean_vr_value(value)
-    if type(value) ~= "string" then
-        return tostring(value or "")
-    end
-    return value:match("^[^%z]+") or value
-end
-
-local function read_vr_int(name, default_value)
-    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.get_mod_value) then
-        return default_value
-    end
-    local ok, value = pcall(function()
-        return uevr.params.vr.get_mod_value(name)
-    end)
-    if not ok then
-        return default_value
-    end
-    return tonumber(clean_vr_value(value)) or default_value
-end
-
-local function read_vr_bool(name, default_value)
-    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.get_mod_value) then
-        return default_value
-    end
-    local ok, value = pcall(function()
-        return uevr.params.vr.get_mod_value(name)
-    end)
-    if not ok then
-        return default_value
-    end
-    local text = string.lower(clean_vr_value(value))
-    if text == "true" or text == "1" then return true end
-    if text == "false" or text == "0" then return false end
-    return default_value
-end
-
-local function write_vr_option(name, value)
-    if not (uevr and uevr.params and uevr.params.vr and uevr.params.vr.set_mod_value) then
-        log("UEVR option unavailable: " .. name)
-        return false
-    end
-    local ok, err = pcall(function()
-        uevr.params.vr.set_mod_value(name, tostring(value))
-        if uevr.params.vr.save_config then
-            uevr.params.vr.save_config()
-        end
-    end)
-    if not ok then
-        log("UEVR option failed " .. name .. ": " .. tostring(err))
-        return false
-    end
-    log(name .. " = " .. tostring(value))
-    return true
-end
-
-local function refresh_quick_options()
-    quick_movement_orientation = read_vr_int("VR_MovementOrientation", quick_movement_orientation)
+local function dispatch_flag(name, enabled)
+    local payload = name .. "=" .. tostring(enabled)
+    dispatch_setting("GTASADE.SetFeatureFlag", payload)
 end
 
 local function dispatch_reset_aim_calibration()
@@ -224,6 +171,24 @@ end
 
 local function draw_panel_body()
     imgui.text("IMPROVEMENTS SETTINGS")
+    imgui.spacing()
+
+    imgui.text("CONTROL LAYOUT")
+    local handedness_label = left_handed_mode == 0 and "Standard" or "Left-handed"
+    if imgui.button("Control layout: " .. handedness_label .. "##SAVRHandedness") then
+        left_handed_mode = left_handed_mode == 0 and 2 or 0
+        dispatch_setting("GTASADE.SetLeftHandedMode", left_handed_mode)
+    end
+    imgui.text("Use this SAVR setting instead of UEVR Swap Controller Inputs.")
+    imgui.text("On-foot grips and triggers always follow their physical hand.")
+    imgui.text("Also available in the A + X quick settings.")
+    imgui.spacing()
+
+    if imgui.button("Reset 3D VR##SAVRReset3D") then
+        reset_3d_status = "Resetting..."
+        dispatch_setting("GTASADE.Reset3dVr", "reset")
+    end
+    imgui.text("Stuck in a flat screen during gameplay? " .. reset_3d_status)
     imgui.spacing()
 
     for _, section in ipairs(sections) do
@@ -250,11 +215,11 @@ local function draw_quick_options()
     imgui.text("Independent preferences are safer than a hidden standing/seated preset.")
     imgui.spacing()
 
-    local changed, enabled = imgui.checkbox("Movement Orientation: Head/HMD (off = Game)",
+    local changed, enabled = imgui.checkbox("Movement Direction: Head/HMD (off = Game)",
         quick_movement_orientation == 1)
     if changed then
         quick_movement_orientation = enabled and 1 or 0
-        write_vr_option("VR_MovementOrientation", quick_movement_orientation)
+        dispatch_setting("GTASADE.SetMovementOrientation", quick_movement_orientation)
     end
 
     imgui.spacing()
@@ -300,13 +265,22 @@ end
 uevr.sdk.callbacks.on_lua_event(function(event_name, event_string)
     if event_name == "featureFlagState" then
         parse_payload(event_string)
+    elseif event_name == "reset3dVrStatus" then
+        reset_3d_status = event_string or "Ready"
+    elseif event_name == "playerIsLeftHanded" then
+        local mode = tonumber(event_string)
+        if mode and mode >= 0 and mode <= 2 and mode == math.floor(mode) then
+            left_handed_mode = mode
+        end
+    elseif event_name == "movementOrientation" then
+        local orientation = tonumber(event_string)
+        if orientation and orientation >= 0 and orientation <= 2 and orientation == math.floor(orientation) then
+            quick_movement_orientation = orientation
+        end
     elseif event_name == "aimCalibrationResult" then
         aim_calibration_result = event_string or "No accepted shots yet"
     elseif event_name == "controlGuideOptionsVisible" then
         quick_options_visible = parse_bool(event_string)
-        if quick_options_visible then
-            refresh_quick_options()
-        end
     end
 end)
 

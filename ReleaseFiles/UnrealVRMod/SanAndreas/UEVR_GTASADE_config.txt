@@ -9,7 +9,8 @@ EnableCombatAssist=true
 EnableCameraProfiles=true
 [Left Handed Mode :] -- Must be configured here. 0 = disabled, 1 = Triggers Swap, 2 = Full inputs Swap
 LeftHandedMode=0
-LeftHandedOnlyWhileOnFoot=true
+LeftHandedOnlyWhileOnFoot=false
+OnFoot_MovementOrientation=0
 debugMod=false
 
 [Camera Settings :] -- Can be set directly ingame from uevr menu. The plugin will auto save each camera configuration for each vehicle type here

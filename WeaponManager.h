@@ -155,6 +155,10 @@ private:
 	std::atomic<bool> twoHandViewRotationValid{ false };
 	std::atomic<int8_t> twoHandFirstGripHandSnapshot{ -1 };
 	std::atomic<int8_t> twoHandPrimaryHand{ -1 };
+	// Runtime grip ownership is not a user handedness preference. Keep it
+	// separate so choosing a weapon with either hand cannot rewrite the saved
+	// left-handed mode or alter UEVR's controller swap on the next state change.
+	std::atomic<int8_t> configuredPrimaryHand{ 1 };
 	// Published by the game-thread attachment update so the raw XInput/DUALGRIP
 	// callbacks never read the non-atomic motionConfiguredFirstHand or other
 	// transient UObject state.
@@ -188,6 +192,7 @@ private:
 	glm::fquat twoHandWristRotationDelta = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
 	glm::fquat twoHandWristPrimaryPoseRotation = glm::fquat::wxyz(1.0f, 0.0f, 0.0f, 0.0f);
 	bool IsTwoHandLongGun() const;
+	int GetConfiguredPrimaryHand() const;
 	void RestoreTwoHandRotationOffset();
 	glm::fquat ComposeTwoHandRotationOffset(const glm::fquat& baseOffset, uevr::API::UObject* weaponMesh) const;
 
@@ -615,10 +620,11 @@ private:
 	bool freeAimLeftPalmOffsetApplied = false;
 	bool freeAimAppliedTwoHandWristOverrideActive = false;
 	int freeAimAppliedCalibrationWeaponId = -1;
-	bool freeAimAppliedVehicleRightOnly = false;
-	bool vehicleNativeRightArmHidden = false;
-	uevr::API::UObject* vehicleNativeRightArmComponent = nullptr;
-	uevr::API::FName vehicleNativeRightArmBoneName{};
+	int freeAimAppliedVehicleGunHand = -1;
+	bool vehicleNativeGunArmHidden = false;
+	int vehicleNativeHiddenHand = -1;
+	uevr::API::UObject* vehicleNativeGunArmComponent = nullptr;
+	uevr::API::FName vehicleNativeGunArmBoneName{};
 	bool freeAimHandsCreationBlocked = false;
 	uevr::API::UObject* freeAimHandsBlockedCharacter = nullptr;
 	bool freeAimHandsOffsetsLogged = false;
@@ -749,12 +755,14 @@ private:
 	void EndGripCalibration(int controllerHand, bool save);
 	void EnforceGripCalibrationFreeze();
 	bool IsVehicleFreeAimSupportedWeapon() const;
-	bool ApplyVehicleNativeRightArmPresentation(bool hidden);
+	bool ApplyVehicleNativeGunArmPresentation(bool hidden, int gunHand = 1);
 
 public:
 	WeaponManager(PlayerManager* pm, CameraController* cc, MemoryManager* mm, SettingsManager* sm) : playerManager(pm), cameraController(cc), memoryManager(mm), settingsManager(sm)
 	{
-		twoHandConfiguredHandSnapshot.store(sm != nullptr && sm->leftHandedMode != SettingsManager::Disabled ? 0 : 1, std::memory_order_relaxed);
+		const int initialHand = 1; // Physical grip selection, never the handedness preference.
+		configuredPrimaryHand.store(static_cast<int8_t>(initialHand), std::memory_order_relaxed);
+		twoHandConfiguredHandSnapshot.store(static_cast<int8_t>(initialHand), std::memory_order_relaxed);
 	};
 	enum WeaponType {
 		Unarmed = 0,
@@ -844,6 +852,7 @@ public:
 	void RestoreFreeAimWeaponHands();
 	void DiscardPlayerOwnedRuntimeState(const char* reason);
 	void SetGripState(bool leftGripHeld, bool rightGripHeld);
+	void SetConfiguredPrimaryHand(int hand);
 	bool PrepareForExplicitWeaponCycle();
 	void InitializeGripCalibration();
 	void InitializeMagneticHolster();

@@ -98,6 +98,18 @@ Write-Host "Manual archive manifest PASS"
 
 $expectedVersion = (Get-Content -LiteralPath (Join-Path $RepoRoot "RELEASE_VERSION.txt") -Raw).Trim()
 foreach ($archiveRoot in @($root, $installer.DirectoryName)) {
+    $profileRoot = Join-Path $archiveRoot "UnrealVRMod\SanAndreas"
+    if (-not (Test-Path -LiteralPath $profileRoot)) {
+        $profileRoot = Join-Path $archiveRoot "Payload\UnrealVRMod\SanAndreas"
+    }
+    $screenMode = @(Get-Content -LiteralPath (Join-Path $profileRoot "config.txt") |
+        Where-Object { $_ -match '^VR_2DScreenMode=' })
+    if ($screenMode.Count -ne 1 -or $screenMode[0] -ne 'VR_2DScreenMode=false') {
+        throw "Release must start in 3D, not saved 2D mode: $profileRoot"
+    }
+    if (Get-ChildItem -LiteralPath $profileRoot -Recurse -File -Filter 'SAVR_pause_2d_owned.flag') {
+        throw "Temporary 2D ownership state found in release: $profileRoot"
+    }
     $versionFile = Join-Path $archiveRoot "VERSION.txt"
     if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) { throw "Package VERSION.txt missing: $archiveRoot" }
     if (-not (Select-String -LiteralPath $versionFile -SimpleMatch "Version: $expectedVersion" -Quiet)) {
@@ -108,3 +120,4 @@ foreach ($archiveRoot in @($root, $installer.DirectoryName)) {
     }
 }
 Write-Host "Stable package names and VERSION.txt PASS"
+Write-Host "3D startup default and absence of temporary 2D ownership state PASS"

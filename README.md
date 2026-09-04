@@ -6,7 +6,9 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.5** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.6** - Click the control guide above to open the full-resolution image.
+
+Added left-handed mode support—toggle it in the improved quick settings.
 
 Want to walk through San Andreas instead of looking at it through a flat screen? This mod turns **Grand Theft Auto: San Andreas - The Definitive Edition** into a much clearer, more physical, and more immersive VR experience through Praydog's UEVR.
 
@@ -56,7 +58,7 @@ Open `VERSION.txt` inside an archive for its exact version and key hashes; `SHA2
 
 The Quest 3 layout is included as `Documentation/Quest3-Control-Layout.png` in both archives, displayed prominently above, and available in VR through the A+X control-guide shortcut.
 
-See [CHANGELOG.md](CHANGELOG.md) for the full v0.3.5 change list.
+See [CHANGELOG.md](CHANGELOG.md) for the full change history.
 
 ## What you get in VR
 

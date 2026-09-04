@@ -11,9 +11,11 @@
 
 class ControlGuideOverlay {
 public:
+	enum Option : uint32_t { MovementDirection, HudAutoHide, DpadControl, ControlLayout, Diagnostics, Reset3dVr, OptionCount };
+	enum ResetState : uint32_t { ResetReady, ResetQueued, ResetDone, ResetResumeGame, ResetFailed };
 	void SetVisible(bool visible);
 	void SetOptionsState(int movementOrientation, bool hudAutoHide, bool r3DpadMode, uint32_t diagnosticMode,
-		uint32_t selectedOption);
+		bool leftHandedLayout, uint32_t selectedOption, ResetState resetState);
 	bool IsVisible() const;
 	void OnDeviceReset();
 	void RenderDx12(ID3D12GraphicsCommandList* commandList, ID3D12Resource* renderTarget,
@@ -22,6 +24,7 @@ public:
 		ID3D11RenderTargetView* renderTargetView);
 
 private:
+	friend struct ControlGuidePreview; // Offline renderer uses the actual compositor for layout tests.
 	bool LoadImage();
 	bool ComposeOptionsPanel();
 	bool InitializeDx12(ID3D12Device* device, DXGI_FORMAT targetFormat);
@@ -40,6 +43,8 @@ private:
 	bool hudAutoHide = true;
 	bool r3DpadMode = false;
 	uint32_t diagnosticMode = 0;
+	bool leftHandedLayout = false;
+	ResetState reset3dState = ResetReady;
 	uint32_t selectedOption = 0;
 	bool imageLoadAttempted = false;
 	bool textureUploaded = false;

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.3.6
+
+- Added left-handed mode support—toggle it in the improved quick settings.
+
 ## v0.3.5 — More Controller Options
 
 - Added an R3 + right-stick D-pad option for controllers without thumb-rest input.
