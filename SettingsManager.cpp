@@ -167,6 +167,7 @@ void SettingsManager::FetchPluginSettings()
 	enableDirectWeaponCycle = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableDirectWeaponCycle", true);
 	enableABWeaponCycleTest = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableABWeaponCycleTest", false);
 	enableAimAlignment = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableAimAlignment", true);
+	enableRadarHeadingFix = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableRadarHeadingFix", true);
 	enableLegacyCrosshairCompensation = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableLegacyCrosshairCompensation", false);
 	enableNativeShotOriginRedirects = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableNativeShotOriginRedirects", false);
 	enableCameraProfiles = SettingsManager::GetBoolValueFromFile(pluginConfigFilePath, "EnableCameraProfiles", true);
@@ -279,6 +280,7 @@ void SettingsManager::EnsureVisibleFeatureFlagConfigValues()
 
 	addIfMissing("EnableCombatAssist", enableCombatAssist);
 	addIfMissing("EnableAimAlignment", enableAimAlignment);
+	addIfMissing("EnableRadarHeadingFix", enableRadarHeadingFix);
 	addIfMissing("EnableLegacyCrosshairCompensation", enableLegacyCrosshairCompensation);
 	addIfMissing("EnableNativeShotOriginRedirects", enableNativeShotOriginRedirects);
 	addIfMissing("EnableWeaponNoSpread", enableWeaponNoSpread);
@@ -659,6 +661,11 @@ bool SettingsManager::SetFeatureFlagFromUi(const std::string& name, bool value, 
 		liveApply = true;
 		SetBoolValueToFile(pluginConfigFilePath, "EnableAimAlignment", value);
 	}
+	else if (name == "EnableRadarHeadingFix") {
+		enableRadarHeadingFix = value;
+		liveApply = true;
+		SetBoolValueToFile(pluginConfigFilePath, "EnableRadarHeadingFix", value);
+	}
 	else if (name == "EnableLegacyCrosshairCompensation") {
 		enableLegacyCrosshairCompensation = value;
 		liveApply = true;
@@ -866,6 +873,7 @@ void SettingsManager::WriteFeatureFlagStatus(const std::string& reason)
 	writeFlag("EnableDirectWeaponCycle", enableDirectWeaponCycle, enableDirectWeaponCycle, "LiveOnConfigReload", "VR controls", "Direct weapon cycle");
 	writeFlag("EnableABWeaponCycleTest", enableABWeaponCycleTest, enableABWeaponCycleTest, "LiveOnConfigReload", "VR controls", "A/B weapon cycle test");
 	writeFlag("EnableAimAlignment", enableAimAlignment, enableAimAlignment, "LiveOnConfigReload", "Core combat feel", "Aim alignment");
+	writeFlag("EnableRadarHeadingFix", enableRadarHeadingFix, enableRadarHeadingFix, "LiveOnConfigReload", "VR comfort and camera", "Independent radar heading [test]");
 	writeFlag("EnableLegacyCrosshairCompensation", enableLegacyCrosshairCompensation, enableLegacyCrosshairCompensation, "LiveOnConfigReload", "Core combat feel", "Legacy over-the-shoulder crosshair compensation [experimental]");
 	writeFlag("EnableNativeShotOriginRedirects", enableNativeShotOriginRedirects, enableNativeShotOriginRedirects, "LiveOnConfigReload", "Core combat feel", "Experimental native shot/trail origin redirects [experimental]");
 	writeFlag("EnableCameraProfiles", enableCameraProfiles, enableCameraProfiles, "LiveOnConfigReload", "VR comfort and camera", "Camera profiles");
@@ -1386,6 +1394,7 @@ bool SettingsManager::CheckSettingsModificationAndUpdate(const std::string& file
 			"[Feature Flags :] -- Live flags can be changed in-game. Restart flags are saved here and apply on next launch.\n"
 			"EnableCombatAssist=true\n"
 			"EnableAimAlignment=true\n"
+			"EnableRadarHeadingFix=true\n"
 			"EnableLegacyCrosshairCompensation=false\n"
 			"EnableNativeShotOriginRedirects=false\n"
 			"EnableWeaponNoSpread=false\n"

@@ -29,6 +29,7 @@ public:
 	bool enableDirectWeaponCycle = true;
 	bool enableABWeaponCycleTest = false;
 	bool enableAimAlignment = true;
+	bool enableRadarHeadingFix = true;
 	bool enableLegacyCrosshairCompensation = false;
 	bool enableNativeShotOriginRedirects = false;
 	bool enableCameraProfiles = true;

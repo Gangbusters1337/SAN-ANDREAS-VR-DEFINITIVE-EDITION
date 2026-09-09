@@ -1,7 +1,8 @@
 param(
     [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$OutputRoot = (Join-Path (Split-Path -Parent $PSScriptRoot) "output"),
-    [string]$ReleaseVersion
+    [string]$ReleaseVersion,
+    [switch]$PrivateTest
 )
 
 Set-StrictMode -Version Latest
@@ -13,6 +14,7 @@ $documentation = Join-Path $RepoRoot "Documentation"
 $installerSource = Join-Path $RepoRoot "Installer"
 $supportSource = Join-Path $RepoRoot "Support"
 $releaseVersionFile = Join-Path $RepoRoot "RELEASE_VERSION.txt"
+& (Join-Path $RepoRoot 'tools\Verify-ReleasePackages.ps1') -RepoRoot $RepoRoot -InputsOnly
 $manualRoot = Join-Path $OutputRoot "manual\SAVR-Improved-Manual"
 $installerRoot = Join-Path $OutputRoot "installer\SAVR-Improved-Installer"
 
@@ -35,7 +37,8 @@ foreach ($required in @(
     (Join-Path $releaseFiles "GameSettings\GameUserSettings.ini"),
     (Join-Path $documentation "Quest3-Control-Layout.png"),
     (Join-Path $installerSource "Install-SAVR.ps1"),
-    (Join-Path $supportSource "_INTERNAL - SAVR Support Tool Script.ps1")
+    (Join-Path $supportSource "_INTERNAL - SAVR Support Tool Script.ps1"),
+    (Join-Path $supportSource "SAVR-SupportCore.ps1")
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Missing release input: $required" }
 }
@@ -56,7 +59,7 @@ function Copy-Docs([string]$Target) {
 }
 
 function Copy-Support([string]$Target) {
-    foreach ($file in @('OPEN SAVR SUPPORT TOOL.bat','_INTERNAL - SAVR Support Tool Script.ps1','SAVR Emergency Diagnostics Switch.ini')) {
+    foreach ($file in @('OPEN SAVR SUPPORT TOOL.bat','_INTERNAL - SAVR Support Tool Script.ps1','SAVR-SupportCore.ps1','SAVR Emergency Diagnostics Switch.ini')) {
         Copy-Item -LiteralPath (Join-Path $supportSource $file) -Destination (Join-Path $Target $file) -Force
     }
 }
@@ -89,6 +92,13 @@ function Write-VersionInfo([string]$Root, [string]$PackageKind, [string]$DllRela
         "All packaged-file hashes: SHA256SUMS.txt",
         "The ZIP SHA-256 is published beside the release asset; it cannot be embedded inside the ZIP it hashes."
     )
+    if ($PrivateTest) {
+        $lines += @(
+            "Build status: PRIVATE DIAGNOSTIC TEST - unreleased changes; not a Rockstar compatibility fix.",
+            "Packaged UTC: $([DateTime]::UtcNow.ToString('o'))",
+            "Test: enable Full diagnostics on startup in the support tool BEFORE injection; reproduce once, then Create support ZIP."
+        )
+    }
     Set-Content -LiteralPath (Join-Path $Root "VERSION.txt") -Encoding ASCII -Value $lines
 }
 

@@ -167,12 +167,15 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="CameraController.h" />
+    <ClInclude Include="CompatibilityDiagnostics.h" />
+    <ClInclude Include="RadarHeading.h" />
 	<ClInclude Include="ControlGuideOverlay.h" />
     <ClInclude Include="include\uevr\API.h" />
     <ClInclude Include="include\uevr\API.hpp" />
     <ClInclude Include="include\uevr\Plugin.hpp" />
     <ClInclude Include="PlayerManager.h" />
     <ClInclude Include="SettingsManager.h" />
+    <ClInclude Include="SupportPackageManager.h" />
     <ClInclude Include="MemoryManager.h" />
     <ClInclude Include="Utilities.h" />
     <ClInclude Include="WeaponManager.h" />
@@ -184,6 +187,7 @@
     <ClCompile Include="MemoryManager.cpp" />
     <ClCompile Include="PlayerManager.cpp" />
     <ClCompile Include="SettingsManager.cpp" />
+    <ClCompile Include="SupportPackageManager.cpp" />
     <ClCompile Include="Utilities.cpp" />
     <ClCompile Include="WeaponManager.cpp" />
   </ItemGroup>

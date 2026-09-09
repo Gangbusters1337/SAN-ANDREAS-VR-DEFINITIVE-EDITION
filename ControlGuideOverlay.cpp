@@ -52,7 +52,7 @@ void ControlGuideOverlay::SetVisible(bool value)
 }
 
 void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, bool useR3Dpad, uint32_t diagnostics,
-	bool leftHanded, uint32_t selected, ResetState resetState)
+	bool leftHanded, uint32_t selected, ResetState resetState, SupportPackageState supportStatus)
 {
 	std::scoped_lock lock(stateMutex);
 	selected %= OptionCount;
@@ -60,6 +60,7 @@ void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, bool u
 		&& r3DpadMode == useR3Dpad && diagnosticMode == diagnostics
 		&& leftHandedLayout == leftHanded
 		&& reset3dState == resetState
+		&& supportState == supportStatus
 		&& selectedOption == selected && !basePixels.empty())
 		return;
 	movementOrientation = orientation;
@@ -68,6 +69,7 @@ void ControlGuideOverlay::SetOptionsState(int orientation, bool autoHide, bool u
 	diagnosticMode = diagnostics;
 	leftHandedLayout = leftHanded;
 	reset3dState = resetState;
+	supportState = supportStatus;
 	selectedOption = selected;
 	if (!basePixels.empty() && ComposeOptionsPanel())
 	{
@@ -423,14 +425,15 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 	// The logical menu stick/A button follow the control layout too. A+X remains
 	// the same physical pair in either layout, so the guide's close hint is stable.
 	const std::wstring hint = std::wstring(leftHandedLayout ? L"R-STICK LEFT / RIGHT: BROWSE    X: "
-		: L"L-STICK LEFT / RIGHT: BROWSE    A: ") + (selectedOption == Reset3dVr ? L"RESET" : L"CHANGE");
+		: L"L-STICK LEFT / RIGHT: BROWSE    A: ") + (selectedOption == Reset3dVr ? L"RESET"
+			: selectedOption == CreateSupportZip ? L"CREATE" : selectedOption == OpenSupportFolder ? L"OPEN" : L"CHANGE");
 	DrawTextW(dc, hint.c_str(), -1, &hintRect,
 		DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
 
 	// Fixed center focus. Only the labels cycle, so adding options never expands
 	// the strip into the guide image. Keep names and values on separate lines.
 	const wchar_t* names[OptionCount]{ L"MOVEMENT DIRECTION", L"HUD AUTO-HIDE",
-		L"D-PAD CONTROL", L"CONTROL LAYOUT", L"DIAGNOSTICS", L"RESET 3D VR" };
+		L"D-PAD CONTROL", L"CONTROL LAYOUT", L"DIAGNOSTICS", L"RESET 3D VR", L"CREATE SUPPORT ZIP", L"OPEN ZIP FOLDER" };
 	const wchar_t* values[OptionCount]{
 		movementOrientation == 1 ? L"HEAD / HMD" : movementOrientation == 0 ? L"STANDARD" : L"CUSTOM",
 		hudAutoHide ? L"ON" : L"OFF",
@@ -440,7 +443,12 @@ bool ControlGuideOverlay::ComposeOptionsPanel()
 			: diagnosticMode == 3 ? L"FULL" : L"OFF",
 		reset3dState == ResetDone ? L"3D RESTORED" : reset3dState == ResetQueued ? L"RESETTING..."
 			: reset3dState == ResetResumeGame ? L"RESUME GAME FIRST"
-			: reset3dState == ResetFailed ? L"RESET FAILED" : L"ACTIVATE"
+			: reset3dState == ResetFailed ? L"RESET FAILED" : L"ACTIVATE",
+		supportState == SupportPackageState::Creating ? L"CREATING..."
+			: supportState == SupportPackageState::Saved ? L"SAVED IN DOCUMENTS"
+			: supportState == SupportPackageState::ToolMissing ? L"UPDATE SUPPORT TOOL"
+			: supportState == SupportPackageState::Failed ? L"FAILED - RETRY" : L"SAVE LOCALLY",
+		L"OPENS ON DESKTOP"
 	};
 	const uint32_t previous = (selectedOption + OptionCount - 1) % OptionCount;
 	const uint32_t next = (selectedOption + 1) % OptionCount;

@@ -165,9 +165,34 @@ try {
         Write-Host "Backup: $backup" -ForegroundColor Green
     }
 
+    # Release defaults are quiet, but an upgrade must not erase this user's
+    # explicitly saved logging choices. Other profile settings keep the existing
+    # installer behavior; the full pre-install profile is backed up above.
+    $profileConfig = Join-Path $ProfilePath 'UEVR_GTASADE_config.txt'
+    $savedDebugSettings = @{}
+    if (Test-Path -LiteralPath $profileConfig -PathType Leaf) {
+        foreach ($line in Get-Content -LiteralPath $profileConfig) {
+            if ($line -match '^\s*(debug\w*)\s*=\s*(true|false)\s*$') {
+                $savedDebugSettings[$Matches[1]] = $Matches[2].ToLowerInvariant()
+            }
+        }
+    }
+
     Write-Step "Installing the UEVR profile"
     New-Item -ItemType Directory -Force -Path $ProfilePath | Out-Null
-    Copy-Item -Path (Join-Path $PayloadRoot "UnrealVRMod\SanAndreas\*") -Destination $ProfilePath -Recurse -Force
+    foreach ($item in Get-ChildItem -LiteralPath (Join-Path $PayloadRoot 'UnrealVRMod\SanAndreas')) {
+        if ($item.Name -ieq 'SAVR-Recovery.ini' -and
+            (Test-Path -LiteralPath (Join-Path $ProfilePath $item.Name) -PathType Leaf)) { continue }
+        Copy-Item -LiteralPath $item.FullName -Destination $ProfilePath -Recurse -Force
+    }
+    if ($savedDebugSettings.Count -gt 0) {
+        $configLines = @(Get-Content -LiteralPath $profileConfig | ForEach-Object {
+            if ($_ -match '^\s*(debug\w*)\s*=' -and $savedDebugSettings.ContainsKey($Matches[1])) {
+                $Matches[1] + '=' + $savedDebugSettings[$Matches[1]]
+            } else { $_ }
+        })
+        [IO.File]::WriteAllLines($profileConfig, [string[]]$configLines, [Text.UTF8Encoding]::new($false))
+    }
 
     $gamePayload = Join-Path $PayloadRoot "GameFolder"
     $gameBackup = Join-Path $backupRoot ("GameFolder_{0}" -f $backupStamp)
@@ -225,8 +250,10 @@ try {
     Write-Step "Installing support and recovery tools"
     $supportHome = Join-Path $DocumentsPath "San Andreas VR"
     New-Item -ItemType Directory -Force -Path $supportHome | Out-Null
-    foreach ($supportFile in @("OPEN SAVR SUPPORT TOOL.bat", "_INTERNAL - SAVR Support Tool Script.ps1", "SAVR Emergency Diagnostics Switch.ini", "VERSION.txt")) {
+    foreach ($supportFile in @("OPEN SAVR SUPPORT TOOL.bat", "_INTERNAL - SAVR Support Tool Script.ps1", "SAVR-SupportCore.ps1", "SAVR Emergency Diagnostics Switch.ini", "VERSION.txt")) {
         $source = Join-Path $PackageRoot $supportFile
+        if ($supportFile -ieq 'SAVR Emergency Diagnostics Switch.ini' -and
+            (Test-Path -LiteralPath (Join-Path $supportHome $supportFile) -PathType Leaf)) { continue }
         if (Test-Path -LiteralPath $source -PathType Leaf) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $supportHome $supportFile) -Force
         }

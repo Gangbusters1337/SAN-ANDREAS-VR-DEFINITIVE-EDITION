@@ -35,6 +35,7 @@ private:
 	PlayerManager playerManager;
 	WeaponManager weaponManager;
 	ControlGuideOverlay controlGuideOverlay;
+	SupportPackageManager supportPackages;
 	UEVR_ActionHandle thumbRestDpadAction = nullptr;
 	UEVR_ActionHandle rightThumbRestCalibrationAction = nullptr;
 	bool thumbRestModifierActive = false;
@@ -751,6 +752,7 @@ public:
 	}
 
 	void on_dllmain_detach() override {
+		memoryManager.RestoreRadarHeadingFix();
 		FinishDiagnosticSession(true);
 		if (runtimeShutdownRequested.load(std::memory_order_acquire))
 			return;
@@ -799,6 +801,7 @@ public:
 		API::get()->log_info("%s", "VR cpp mod initializing - Codex combat assist build");
 		settingsManager.InitSettingsManager();
 		InitializeDiagnostics();
+		supportPackages.Initialize(settingsManager.GetProfileDirectory());
 		pause2dStartupRecoveryPending = !settingsManager.RecoverPluginOwnedPause2dScreenMode();
 		if (pause2dStartupRecoveryPending)
 			API::get()->log_info("%s", "[PauseUI] interrupted-session 2D recovery queued until runtime ready");
@@ -816,7 +819,9 @@ public:
 		hudUiPinned = false;
 		if (hudUiVisible && settingsManager.enableHudAutoHide)
 			ResetHudAutoHideTimer();
-		memoryManager.InitMemoryManager();
+		const bool compatibilityDiagnostics = !diagnosticForceOff && diagnosticMode == DiagnosticMode::Full;
+		memoryManager.InitMemoryManager(compatibilityDiagnostics);
+		if (compatibilityDiagnostics) API::get()->log_info("%s", "[Compatibility] startup stage=native-patches begin");
 		if (settingsManager.enableCombatAssist)
 			memoryManager.ApplyCombatAssistPatches();
 		if (settingsManager.enableDualGripAimFire)
@@ -828,11 +833,14 @@ public:
 			memoryManager.ApplyNativeThrowableMotionPatch();
 		if (settingsManager.activeManualReloadMode)
 			memoryManager.ApplyManualReloadCapturePatch();
+		if (compatibilityDiagnostics) API::get()->log_info("%s", "[Compatibility] startup stage=engine-helpers begin");
 		Utilities::InitHelperClasses();
+		if (compatibilityDiagnostics) API::get()->log_info("%s", "[Compatibility] startup stage=hand-and-holster-init begin");
 		weaponManager.InitializeGripCalibration();
 		weaponManager.InitializeMagneticHolster();
 		if (settingsManager.enableBulletTraceHidden)
 			weaponManager.HideBulletTrace();
+		if (compatibilityDiagnostics) API::get()->log_info("%s", "[Compatibility] plugin initialization complete");
 	}
 
 	void on_custom_event(const char* event_name, const char* event_data) override {
@@ -1412,6 +1420,10 @@ public:
 	}
 
 	void on_pre_engine_tick(API::UGameEngine* engine, float delta) override {
+		// A skipped/faulted tick must never leave an old radar override armed.
+		memoryManager.InvalidateRadarHeadingReference();
+		if (supportPackages.Update() && controlGuideOverlay.IsVisible())
+			RefreshControlGuideOptions();
 		if (runtimeShutdownRequested.load(std::memory_order_acquire))
 			return;
 		if (preEngineFaultLatched)
@@ -1432,6 +1444,7 @@ public:
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
+			memoryManager.InvalidateRadarHeadingReference();
 			++consecutivePreEngineFaults;
 			lifecycleRecoveryPending = true;
 			preEngineResumeAt = GetTickCount64() + 250;
@@ -1445,6 +1458,8 @@ public:
 
 	void OnPreEngineTick(API::UGameEngine* engine, float delta) {
 		PLUGIN_LOG_ONCE("Pre Engine Tick: %f", delta);
+		// Install once on the game thread, before its native radar update runs.
+		memoryManager.InstallRadarHeadingFix();
 		preEngineStage = "begin";
 		weaponManager.BeginInteractionEngineTick();
 		if (luaStateRepublishPending.exchange(false, std::memory_order_acq_rel))
@@ -1578,6 +1593,14 @@ public:
 			if (!playerManager.weaponWheelEnabled)
 			{
 				cameraController.ProcessCameraMatrix(delta);
+				// Read the current camera basis for radar only. This is independent of
+				// weapon tracking, aim alignment, grip state, and primary/secondary guns.
+				// Photo/drive-by cameras retain their native special-mode direction.
+				if (settingsManager.enableRadarHeadingFix && playerManager.isInControl
+					&& (pluginStateApplied == OnFoot || pluginStateApplied == Driving)
+					&& cameraController.currentCameraMode != CameraController::Camera
+					&& cameraController.currentCameraMode != CameraController::AimWeaponFromCar)
+					memoryManager.UpdateRadarHeadingReference(cameraController.cameraMatrixValues);
 				cameraController.ProcessHookedHeadPosition(delta);
 				const bool hasSecondWeapon = weaponManager.HasUsableWeapon(false);
 				const bool customAkimboActive = weaponManager.IsCustomAkimboActive();
@@ -2087,6 +2110,14 @@ public:
 		return true;
 	}
 
+	bool ReadDiagnosticForceOff(const std::string& path) const
+	{
+		char value[16]{};
+		GetPrivateProfileStringA("Diagnostics", "ForceOff", "false", value, sizeof(value), path.c_str());
+		// The documented external switch writes true/false; also accept numeric INIs.
+		return _stricmp(value, "true") == 0 || strcmp(value, "1") == 0;
+	}
+
 	void InitializeDiagnostics()
 	{
 		diagnosticProfileDirectory = settingsManager.GetProfileDirectory();
@@ -2107,10 +2138,8 @@ public:
 				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 			API::get()->log_warn("%s", "[SAVRDiag] previous diagnostic session ended unexpectedly; persistent StartMode retained");
 		}
-		diagnosticForceOff = GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
-			diagnosticRecoveryPath.c_str()) != 0
-			|| GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
-				diagnosticProfileRecoveryPath.c_str()) != 0;
+		diagnosticForceOff = ReadDiagnosticForceOff(diagnosticRecoveryPath)
+			|| ReadDiagnosticForceOff(diagnosticProfileRecoveryPath);
 		DiagnosticMode startMode = DiagnosticMode::Off;
 		// The top-level Documents switch is the user-facing authority. Fall back
 		// to the profile copy when it is absent or predates StartMode support.
@@ -2142,10 +2171,8 @@ public:
 		if (now >= diagnosticRecoveryCheckAt && !diagnosticRecoveryPath.empty())
 		{
 			diagnosticRecoveryCheckAt = now + DiagnosticRecoveryCheckIntervalMs;
-			const bool forceOff = GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
-				diagnosticRecoveryPath.c_str()) != 0
-				|| GetPrivateProfileIntA("Diagnostics", "ForceOff", 0,
-					diagnosticProfileRecoveryPath.c_str()) != 0;
+			const bool forceOff = ReadDiagnosticForceOff(diagnosticRecoveryPath)
+				|| ReadDiagnosticForceOff(diagnosticProfileRecoveryPath);
 			if (forceOff != diagnosticForceOff)
 			{
 				diagnosticForceOff = forceOff;
@@ -2342,7 +2369,7 @@ public:
 			settingsManager.enableR3LeftStickDpad,
 			static_cast<uint32_t>(diagnosticMode),
 			settingsManager.leftHandedMode != SettingsManager::Disabled,
-			static_cast<uint32_t>(controlGuideSelectedOption), manual3dResetStatus.load(std::memory_order_acquire));
+			static_cast<uint32_t>(controlGuideSelectedOption), manual3dResetStatus.load(std::memory_order_acquire), supportPackages.GetState());
 	}
 
 	void SetManual3dResetStatus(ControlGuideOverlay::ResetState status)
@@ -2427,6 +2454,8 @@ public:
 	{
 		if (option < 0 || option >= ControlGuideOverlay::OptionCount)
 			return;
+		if (option == ControlGuideOverlay::CreateSupportZip) { supportPackages.RequestCollect(); return; }
+		if (option == ControlGuideOverlay::OpenSupportFolder) { supportPackages.RequestOpenFolder(); return; }
 		if (option == ControlGuideOverlay::Reset3dVr)
 		{
 			QueueManual3dReset();

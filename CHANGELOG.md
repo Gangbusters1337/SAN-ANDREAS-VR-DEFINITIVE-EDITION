@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.7
+
+- Fixed minimap rotation while walking and driving.
+- Expanded and refreshed the support tool for creating debug packages, and improved the in-game quick settings.
+
 ## v0.3.6
 
 - Added left-handed mode support—toggle it in the improved quick settings.

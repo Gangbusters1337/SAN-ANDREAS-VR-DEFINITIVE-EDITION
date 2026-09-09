@@ -8,14 +8,15 @@
 #include <d3d12.h>
 #include <d3d11.h>
 #include <wrl/client.h>
+#include "SupportPackageManager.h"
 
 class ControlGuideOverlay {
 public:
-	enum Option : uint32_t { MovementDirection, HudAutoHide, DpadControl, ControlLayout, Diagnostics, Reset3dVr, OptionCount };
+	enum Option : uint32_t { MovementDirection, HudAutoHide, DpadControl, ControlLayout, Diagnostics, Reset3dVr, CreateSupportZip, OpenSupportFolder, OptionCount };
 	enum ResetState : uint32_t { ResetReady, ResetQueued, ResetDone, ResetResumeGame, ResetFailed };
 	void SetVisible(bool visible);
 	void SetOptionsState(int movementOrientation, bool hudAutoHide, bool r3DpadMode, uint32_t diagnosticMode,
-		bool leftHandedLayout, uint32_t selectedOption, ResetState resetState);
+		bool leftHandedLayout, uint32_t selectedOption, ResetState resetState, SupportPackageState supportStatus);
 	bool IsVisible() const;
 	void OnDeviceReset();
 	void RenderDx12(ID3D12GraphicsCommandList* commandList, ID3D12Resource* renderTarget,
@@ -45,6 +46,7 @@ private:
 	uint32_t diagnosticMode = 0;
 	bool leftHandedLayout = false;
 	ResetState reset3dState = ResetReady;
+	SupportPackageState supportState = SupportPackageState::Ready;
 	uint32_t selectedOption = 0;
 	bool imageLoadAttempted = false;
 	bool textureUploaded = false;

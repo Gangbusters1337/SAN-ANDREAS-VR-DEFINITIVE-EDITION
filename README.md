@@ -6,7 +6,7 @@
   </a>
 </p>
 
-> **PRE-RELEASE BETA v0.3.6** - Click the control guide above to open the full-resolution image.
+> **PRE-RELEASE BETA v0.3.7** - Click the control guide above to open the full-resolution image.
 
 Added left-handed mode support—toggle it in the improved quick settings.
 

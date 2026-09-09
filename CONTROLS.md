@@ -113,6 +113,14 @@ Control Layout is available in the A + X quick settings and SAVR's Improvements 
 
 If gameplay gets stuck on a flat 2D screen, open A + X, browse to **Reset 3D VR**, and activate it with the indicated button. It shows **3D RESTORED** when successful; close the guide with A + X to check the view. The same action is in UEVR's Improvements Settings. Resume gameplay first if you are in a pause, cutscene, or result screen. This clears only 2D mode and stale SAVR 2D guard state; camera calibration, graphics, handedness, and HUD preferences are not reset. No restart is needed.
 
+## Support tools
+
+- A + X quick settings: **Create support ZIP** collects in the background without opening a desktop window. **SAVED IN DOCUMENTS** means it is ready under `Documents\San Andreas VR\Support Packages`.
+- **Open ZIP folder** is a separate in-game action marked **OPENS ON DESKTOP**. In-game collection never opens Explorer automatically. The desktop support tool opens the folder and selects the ZIP once collection finishes.
+- The desktop **OPEN SAVR SUPPORT TOOL.bat** has **Full diagnostics on startup**. It stays enabled after restart/crash until changed. Turning this startup option off does not stop a session already logging; **Stop all diagnostics** stops and blocks logging. **Re-enable diagnostics** appears only while that emergency block is active.
+- Reports include measured game/mod identity, required-file checks, and available crash/log files. Missing, unreadable and size-limited evidence is listed explicitly. Game files and saves are not included. Binary crash dumps may contain personal data, so review packages before sharing.
+- For crashes during injection or loading: enable **Full diagnostics on startup** before launching/injecting, reproduce once, then create a ZIP. `COMPATIBILITY.txt` summarizes failed lookups and startup progress; `UEVR/SAVR_compatibility.txt` records expected versus observed native patch bytes when the plugin reaches initialization. This detects possible build/mod mismatches; it does not fix or certify support for other game builds.
+
 ## Known control issues to verify
 
 - The vehicle camera action uses UEVR's original System-button long-hold mapping to native Xbox Back/View; it does not post keyboard `V` or synthesize D-pad input.

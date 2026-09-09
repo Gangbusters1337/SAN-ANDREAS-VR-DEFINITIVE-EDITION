@@ -2,6 +2,7 @@
 [Feature Flags :] -- Edited by SA Improved Settings. Restart/reinject flags apply next session.
 EnableBodyVisibility=true
 EnableAimAlignment=true
+EnableRadarHeadingFix=true
 EnableLegacyCrosshairCompensation=false
 EnableNativeShotOriginRedirects=true
 EnableBulletTraceHidden=false
@@ -135,7 +136,7 @@ Vehicle_474_UpOffset=1.484014
 Vehicle_412_ForwardOffset=-15.336522
 Vehicle_412_RightOffset=12.874285
 Vehicle_412_UpOffset=0.000000
-DebugInputLayerProbe=true
+DebugInputLayerProbe=false
 HideWeaponSmokeWhileFiring=false
 
 Vehicle_431_ForwardOffset=-38.562222

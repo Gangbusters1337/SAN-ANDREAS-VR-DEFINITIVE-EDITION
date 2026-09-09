@@ -1,9 +1,41 @@
-param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot))
+param([string]$RepoRoot = (Split-Path -Parent $PSScriptRoot), [string]$OutputRoot = '', [switch]$InputsOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
-$output = Join-Path $RepoRoot "output"
+
+function Assert-DiagnosticsOff([string]$ProfileRoot, [string]$StartupSwitch) {
+    $config = @(Get-Content -LiteralPath (Join-Path $ProfileRoot 'UEVR_GTASADE_config.txt'))
+    $debug = @($config | Where-Object { $_ -match '^\s*debug\w*\s*=' })
+    if (!($config -match '^\s*debugMod\s*=\s*false\s*$') -or
+        @($debug | Where-Object { $_ -notmatch '=\s*false\s*$' }).Count -gt 0) {
+        throw "Release debug logging must default to false: $ProfileRoot"
+    }
+    foreach ($path in @((Join-Path $ProfileRoot 'SAVR-Recovery.ini'), $StartupSwitch)) {
+        $lines = @(Get-Content -LiteralPath $path)
+        $mode = @($lines | Where-Object { $_ -match '^\s*StartMode\s*=' })
+        $force = @($lines | Where-Object { $_ -match '^\s*ForceOff\s*=' })
+        if ($mode.Count -ne 1 -or $mode[0] -notmatch '=\s*Off\s*$' -or
+            $force.Count -ne 1 -or $force[0] -notmatch '=\s*false\s*$') {
+            throw "Release diagnostics must start Off without blocking user controls: $path"
+        }
+    }
+    $sessionState = @(Get-ChildItem -LiteralPath $ProfileRoot -Recurse -File | Where-Object {
+        $_.Name -match '^(log\.txt|SAVR_diagnostics.*\.flag|SAVR_support_.*\.ini|SAVR_compatibility\.txt)$'
+    })
+    if ($sessionState.Count) { throw "Personal diagnostic-session state found in release: $ProfileRoot" }
+}
+
+if ($InputsOnly) {
+    Assert-DiagnosticsOff (Join-Path $RepoRoot 'ReleaseFiles\UnrealVRMod\SanAndreas') `
+        (Join-Path $RepoRoot 'Support\SAVR Emergency Diagnostics Switch.ini')
+    Write-Host 'Release inputs: debug logging and startup diagnostics default Off; no personal diagnostic-session state.'
+    return
+}
+$output = if ($OutputRoot) { [IO.Path]::GetFullPath($OutputRoot) } else { Join-Path $RepoRoot "output" }
+if (!$output.StartsWith($RepoRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Verification output must stay inside RepoRoot.'
+}
 $test = Join-Path $output "clean-test"
 if (-not ([IO.Path]::GetFullPath($test).StartsWith([IO.Path]::GetFullPath($output), [StringComparison]::OrdinalIgnoreCase))) {
     throw "Unsafe test path."
@@ -16,7 +48,7 @@ Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-Installer.zip"
 $installer = Get-ChildItem -LiteralPath $installerExtract -Recurse -Filter "Install-SAVR.ps1" | Select-Object -First 1
 if (-not $installer) { throw "Installer script missing from archive." }
 
-function Test-Installer([string]$Name, [string]$Mode) {
+function Test-Installer([string]$Name, [string]$Mode, [switch]$ExistingDiagnostics) {
     $root = Join-Path $test $Name
     $profile = Join-Path $root "Roaming\UnrealVRMod\SanAndreas"
     $game = Join-Path $root "Game"
@@ -31,10 +63,39 @@ function Test-Installer([string]$Name, [string]$Mode) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $existingSettings) | Out-Null
     Set-Content -LiteralPath $existingSettings -Encoding ASCII -Value "pre-install settings sentinel"
     $existingSettingsHash = (Get-FileHash -LiteralPath $existingSettings -Algorithm SHA256).Hash
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer.FullName -Mode $Mode -ProfilePath $profile -GamePath $game -DocumentsPath $documents -NoPrompt -SkipShortcuts
-    if ($LASTEXITCODE -ne 0) { throw "$Mode installer test failed." }
+    $savedDiagnosticHashes = @{}
+    if ($ExistingDiagnostics) {
+        New-Item -ItemType Directory -Force -Path $profile,(Join-Path $documents 'San Andreas VR') | Out-Null
+        Set-Content -LiteralPath (Join-Path $profile 'UEVR_GTASADE_config.txt') -Encoding ASCII -Value @('debugMod=true','DebugInputLayerProbe=true')
+        foreach ($path in @((Join-Path $profile 'SAVR-Recovery.ini'), (Join-Path $documents 'San Andreas VR\SAVR Emergency Diagnostics Switch.ini'))) {
+            Set-Content -LiteralPath $path -Encoding ASCII -Value @('[Diagnostics]','StartMode=Full','ForceOff=true','OtherEntry=keep')
+            $savedDiagnosticHashes[$path] = (Get-FileHash -LiteralPath $path).Hash
+        }
+    }
+    # This invocation targets only fixture paths and never launches its empty EXE.
+    # Mock the process-name guard locally so a real, unrelated live installation
+    # need not be closed for file-copy tests. The production installer is unchanged.
+    function Get-Process {
+        [CmdletBinding()] param([string]$Name)
+        if ($Name -ne 'SanAndreas') { throw "Unexpected process query in fixture: $Name" }
+    }
+    & $installer.FullName -Mode $Mode -ProfilePath $profile -GamePath $game -DocumentsPath $documents -NoPrompt -SkipShortcuts
+    if (!$?) { throw "$Mode installer test failed." }
 
     $payload = Join-Path $installer.DirectoryName "Payload"
+    foreach ($supportFile in @('OPEN SAVR SUPPORT TOOL.bat','_INTERNAL - SAVR Support Tool Script.ps1','SAVR-SupportCore.ps1')) {
+        $source = Join-Path $installer.DirectoryName $supportFile
+        $installed = Join-Path (Join-Path $documents 'San Andreas VR') $supportFile
+        if (!(Test-Path -LiteralPath $installed) -or (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $installed).Hash) {
+            throw "Missing or stale installed support helper: $supportFile"
+        }
+        if ($supportFile -like '*.ps1') {
+            $profileHelper = Join-Path $profile "Support\$supportFile"
+            if (!(Test-Path -LiteralPath $profileHelper) -or (Get-FileHash -LiteralPath $source).Hash -ne (Get-FileHash -LiteralPath $profileHelper).Hash) {
+                throw "Missing or stale in-game support helper: $supportFile"
+            }
+        }
+    }
     $guardedLauncher = Join-Path $profile "SAVR-Launch.ps1"
     if (-not (Test-Path -LiteralPath $guardedLauncher -PathType Leaf)) {
         throw "Missing $Mode guarded launcher."
@@ -51,6 +112,17 @@ function Test-Installer([string]$Name, [string]$Mode) {
             $relative = $file.FullName.Substring($pair.Source.Length + 1)
             $targetFile = Join-Path $pair.Target $relative
             if (-not (Test-Path -LiteralPath $targetFile -PathType Leaf)) { throw "Missing $Mode output: $relative" }
+            if ($ExistingDiagnostics -and $pair.Target -eq $profile) {
+                if ($relative -eq 'SAVR-Recovery.ini') { continue }
+                if ($relative -eq 'UEVR_GTASADE_config.txt') {
+                    $expected = @(Get-Content -LiteralPath $file.FullName | ForEach-Object {
+                        $_ -replace '^(debugMod|DebugInputLayerProbe)=false$', '$1=true'
+                    }) -join "`n"
+                    $actual = @(Get-Content -LiteralPath $targetFile) -join "`n"
+                    if ($actual -cne $expected) { throw 'Upgrade changed settings beyond the saved debug choices.' }
+                    continue
+                }
+            }
             if ((Get-FileHash -LiteralPath $file.FullName).Hash -ne (Get-FileHash -LiteralPath $targetFile).Hash) {
                 throw "Hash mismatch in $Mode output: $relative"
             }
@@ -77,11 +149,17 @@ function Test-Installer([string]$Name, [string]$Mode) {
     if ((Get-FileHash -LiteralPath $movieBackup -Algorithm SHA256).Hash -ne $existingMovieHash) {
         throw "$Mode startup-movie backup does not match the pre-install file."
     }
-    Write-Host "$Mode clean install PASS"
+    foreach ($path in $savedDiagnosticHashes.Keys) {
+        if ((Get-FileHash -LiteralPath $path).Hash -ne $savedDiagnosticHashes[$path]) {
+            throw "Upgrade overwrote saved diagnostic preferences: $path"
+        }
+    }
+    Write-Host "$Name install PASS (existing diagnostics: $ExistingDiagnostics)"
 }
 
 Test-Installer "auto" "Auto"
 Test-Installer "manual" "Manual"
+Test-Installer "upgrade" "Manual" -ExistingDiagnostics
 
 $manualExtract = Join-Path $test "manual-extracted"
 Expand-Archive -LiteralPath (Join-Path $output "San-Andreas-VR-DE-Manual.zip") -DestinationPath $manualExtract
@@ -102,6 +180,7 @@ foreach ($archiveRoot in @($root, $installer.DirectoryName)) {
     if (-not (Test-Path -LiteralPath $profileRoot)) {
         $profileRoot = Join-Path $archiveRoot "Payload\UnrealVRMod\SanAndreas"
     }
+    Assert-DiagnosticsOff $profileRoot (Join-Path $archiveRoot 'SAVR Emergency Diagnostics Switch.ini')
     $screenMode = @(Get-Content -LiteralPath (Join-Path $profileRoot "config.txt") |
         Where-Object { $_ -match '^VR_2DScreenMode=' })
     if ($screenMode.Count -ne 1 -or $screenMode[0] -ne 'VR_2DScreenMode=false') {
@@ -121,3 +200,4 @@ foreach ($archiveRoot in @($root, $installer.DirectoryName)) {
 }
 Write-Host "Stable package names and VERSION.txt PASS"
 Write-Host "3D startup default and absence of temporary 2D ownership state PASS"
+Write-Host "Logging defaults Off and absence of personal diagnostic-session state PASS"

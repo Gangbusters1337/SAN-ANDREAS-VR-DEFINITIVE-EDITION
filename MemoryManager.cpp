@@ -9,6 +9,10 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <filesystem>
+#include <sstream>
+#include "CompatibilityDiagnostics.h"
+#include "RadarHeading.h"
 
 #include "uevr/API.hpp"
 #include "MemoryManager.h"
@@ -17,6 +21,31 @@
 DWORD PID;
 
 namespace {
+	using NativeRadarUpdate = void(__fastcall*)(void*, const RadarHeading::Direction*,
+		const RadarHeading::Direction*, const RadarHeading::Direction*, float);
+	NativeRadarUpdate gNativeRadarUpdate = nullptr;
+	std::atomic<uint64_t> gRadarHeadingSample{ RadarHeading::DisabledSample };
+	std::atomic<int> gRadarHeadingLastRoute{ -1 };
+	static_assert(std::atomic<uint64_t>::is_always_lock_free);
+
+	void __fastcall RadarUpdateWithIndependentHeading(void* radar,
+		const RadarHeading::Direction* position, const RadarHeading::Direction* playerDirection,
+		const RadarHeading::Direction* cameraDirection, float zoom) {
+		RadarHeading::Direction corrected{};
+		const bool applied = cameraDirection != nullptr
+			&& RadarHeading::ApplySample(gRadarHeadingSample.load(std::memory_order_acquire),
+				GetTickCount(), *cameraDirection, corrected);
+		const int route = applied ? 1 : 0;
+		if (gRadarHeadingLastRoute.exchange(route, std::memory_order_relaxed) != route) {
+			uevr::API::get()->log_info("[RadarHeading] native radar callback: %s",
+				applied ? "camera-matrix heading accepted (radar only)" : "native direction passthrough");
+		}
+		// Preserve the native position, player direction, zoom, and renderer. The
+		// replacement is call-local; neither the native argument nor game state changes.
+		gNativeRadarUpdate(radar, position, playerDirection,
+			applied ? &corrected : cameraDirection, zoom);
+	}
+
 	constexpr float AlmostMaxWeaponSkill = 998.0f;
 	constexpr uint32_t LongBulletRangeBits = 0x461C4000; // 10000.0f
 	constexpr float EnhancedWeaponRange = 15000.0f;
@@ -885,11 +914,90 @@ void RestoreMemory(const std::vector<MemoryBlock>& memoryBlocks) {
 	}
 }
 
-void MemoryManager::InitMemoryManager()
+void MemoryManager::InitMemoryManager(bool compatibilityDiagnostics)
 {
 	baseAddressGameEXE = GetModuleBaseAddress(nullptr);
+	// Inspect the original RVAs before rebasing or installing any native patches.
+	if (compatibilityDiagnostics) LogCompatibilityPreflight();
 	scriptSpaceAddress = baseAddressGameEXE != 0 ? baseAddressGameEXE + ScriptSpaceOffset : 0;
 	AdjustAddresses();
+}
+
+void MemoryManager::LogCompatibilityPreflight()
+{
+	if (compatibilityPreflightLogged) return;
+	compatibilityPreflightLogged = true;
+	try {
+		const auto profile = settingsManager->GetProfileDirectory();
+		std::ofstream report(std::filesystem::path(std::u8string(profile.begin(), profile.end()))
+			/ "SAVR_compatibility.txt", std::ios::trunc);
+		SYSTEMTIME utc{}; GetSystemTime(&utc);
+		report << "SAVR read-only compatibility preflight\nPID=" << GetCurrentProcessId()
+			<< " UTC=" << utc.wYear << '-' << utc.wMonth << '-' << utc.wDay << 'T'
+			<< utc.wHour << ':' << utc.wMinute << ':' << utc.wSecond << "Z\n"
+			<< "Checked before SAVR native patches. Matches do not prove complete compatibility.\n"
+			<< "Mismatches may mean another build or another mod; this report changes no patch behavior.\n"
+			<< "Actual disk EXE hash/version are collected in INSTALLATION.txt by the support tool.\n";
+		report.flush();
+		uevr::API::get()->log_info("[Compatibility] preflight begin pid=%lu report_open=%s",
+			GetCurrentProcessId(), report.good() ? "true" : "false");
+		IMAGE_DOS_HEADER dos{}; IMAGE_NT_HEADERS64 nt{};
+		const bool validImage = CompatibilityDiagnostics::Read(baseAddressGameEXE, &dos, sizeof(dos))
+			&& dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 && dos.e_lfanew < 1024 * 1024
+			&& baseAddressGameEXE <= (std::numeric_limits<uintptr_t>::max)() - static_cast<uintptr_t>(dos.e_lfanew)
+			&& CompatibilityDiagnostics::Read(baseAddressGameEXE + dos.e_lfanew, &nt, sizeof(nt))
+			&& nt.Signature == IMAGE_NT_SIGNATURE && nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+		if (!validImage) {
+			report << "PE_HEADER=unreadable-or-invalid\n"; report.flush();
+			uevr::API::get()->log_warn("%s", "[Compatibility] PE header unreadable/invalid; preflight incomplete");
+			return;
+		}
+		report << std::hex << "ImageBase=0x" << baseAddressGameEXE
+			<< " SizeOfImage=0x" << nt.OptionalHeader.SizeOfImage
+			<< " TimeDateStamp=0x" << nt.FileHeader.TimeDateStamp
+			<< " Machine=0x" << nt.FileHeader.Machine << std::dec << '\n';
+		const struct { const char* name; const std::vector<MemoryBlock>* blocks; } groups[] = {
+			{"camera-rotation", &matrixInstructionsRotationAddresses},
+			{"camera-position", &matrixInstructionsPositionAddresses},
+			{"game-camera-position", &ingameCameraPositionInstructionsAddresses},
+			{"sniper-camera-position", &ingameCameraPositionSniperAndCamWpnInstructionsAddresses},
+			{"aim-forward", &aimingForwardVectorInstructionsAddresses},
+			{"aim-up", &aimingUpVectorInstructionsAddresses},
+			{"aim-pitch", &pitchAxisAimingInstructionsAddresses},
+			{"rocket-aim", &rocketLauncherAimingVectorInstructionsAddresses},
+			{"sniper-aim", &sniperAimingVectorInstructionsAddresses},
+			{"vehicle-aim", &carAimingVectorInstructionsAddresses}
+		};
+		auto hexBytes = [](const uint8_t* bytes, size_t size) {
+			std::ostringstream out; out << std::hex << std::setfill('0');
+			for (size_t i = 0; i < size; ++i) out << std::setw(2) << static_cast<unsigned>(bytes[i]);
+			return out.str();
+		};
+		size_t checked = 0, mismatches = 0;
+		for (const auto& group : groups) {
+			for (const auto& block : *group.blocks) {
+				const auto check = CompatibilityDiagnostics::CheckPatch(baseAddressGameEXE,
+					nt.OptionalHeader.SizeOfImage, block.address, block.bytes.data(), block.bytes.size());
+				++checked; if (!check.matches) ++mismatches;
+				report << group.name << " RVA=0x" << std::hex << block.address << std::dec
+					<< " size=" << block.size << " status=" << check.status
+					<< " expected=" << hexBytes(block.bytes.data(), block.bytes.size())
+					<< " observed=" << hexBytes(check.observed.data(), check.observedSize)
+					<< " protection=0x" << std::hex << check.protection << std::dec << '\n';
+				if (!check.matches && mismatches <= 12)
+					uevr::API::get()->log_warn("[Compatibility] %s RVA=0x%llX status=%s expected=%s observed=%s",
+						group.name, static_cast<unsigned long long>(block.address), check.status,
+						hexBytes(block.bytes.data(), block.bytes.size()).c_str(),
+						hexBytes(check.observed.data(), check.observedSize).c_str());
+			}
+			report.flush();
+		}
+		report << "COMPLETE checked=" << checked << " mismatches=" << mismatches << '\n'; report.flush();
+		uevr::API::get()->log_info("[Compatibility] preflight complete checked=%llu mismatches=%llu report_saved=%s; diagnostic-only",
+			static_cast<unsigned long long>(checked), static_cast<unsigned long long>(mismatches), report.good() ? "true" : "false");
+	} catch (...) {
+		uevr::API::get()->log_warn("%s", "[Compatibility] report could not be completed; diagnostic-only");
+	}
 }
 
 bool MemoryManager::ReadPhoneRingingState(bool& ringing)
@@ -1182,6 +1290,113 @@ bool MemoryManager::InstallRuntimeArrayCallbackHook(const char* name, uintptr_t 
 				return std::vector<uint8_t>{};
 			return code;
 		});
+}
+
+bool MemoryManager::InstallRadarHeadingFix() {
+	if (radarHeadingHookAttempted)
+		return radarHeadingPatch.applied;
+	radarHeadingHookAttempted = true;
+	InvalidateRadarHeadingReference();
+	using namespace CompatibilityDiagnostics;
+	IMAGE_DOS_HEADER dos{};
+	IMAGE_NT_HEADERS64 nt{};
+	if (!Read(baseAddressGameEXE, &dos, sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE
+		|| dos.e_lfanew <= 0 || dos.e_lfanew > 0x100000
+		|| !Read(baseAddressGameEXE + dos.e_lfanew, &nt, sizeof(nt))
+		|| nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64
+		|| nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC
+		|| nt.OptionalHeader.SizeOfImage != RadarHeading::ImageSize
+		|| nt.FileHeader.TimeDateStamp != RadarHeading::ImageTimestamp) {
+		uevr::API::get()->log_warn("%s", "[RadarHeading] disabled: unvalidated executable identity");
+		return false;
+	}
+	const auto call = CheckPatch(baseAddressGameEXE, RadarHeading::ImageSize, RadarHeading::CallRva,
+		RadarHeading::OriginalCall.data(), RadarHeading::OriginalCall.size());
+	const auto source = CheckPatch(baseAddressGameEXE, RadarHeading::ImageSize, RadarHeading::SourceRva,
+		RadarHeading::OriginalSource.data(), RadarHeading::OriginalSource.size());
+	const auto consumer = CheckPatch(baseAddressGameEXE, RadarHeading::ImageSize, RadarHeading::ConsumerRva,
+		RadarHeading::OriginalConsumer.data(), RadarHeading::OriginalConsumer.size());
+	const auto entry = CheckPatch(baseAddressGameEXE, RadarHeading::ImageSize, RadarHeading::RendererRva,
+		RadarHeading::OriginalRendererEntry.data(), RadarHeading::OriginalRendererEntry.size());
+	if (!call.matches || !source.matches || !consumer.matches || !entry.matches) {
+		uevr::API::get()->log_warn("[RadarHeading] disabled: call=%s source=%s renderer=%s entry=%s",
+			call.status, source.status, consumer.status, entry.status);
+		return false;
+	}
+
+	const uintptr_t target = baseAddressGameEXE + RadarHeading::CallRva;
+	void* relay = AllocateNear(target, 14);
+	if (relay == nullptr) {
+		uevr::API::get()->log_warn("%s", "[RadarHeading] disabled: relay allocation failed");
+		return false;
+	}
+	// A CALL to an absolute JMP relay preserves the native Win64 ABI, including
+	// the fifth (zoom) argument on the stack. No displaced instructions are replayed.
+	std::array<uint8_t, 14> relayCode{ 0xFF, 0x25, 0, 0, 0, 0 };
+	const uintptr_t callback = reinterpret_cast<uintptr_t>(&RadarUpdateWithIndependentHeading);
+	std::memcpy(relayCode.data() + 6, &callback, sizeof(callback));
+	std::memcpy(relay, relayCode.data(), relayCode.size());
+	FlushInstructionCache(GetCurrentProcess(), relay, relayCode.size());
+	DWORD previousProtect = 0;
+	if (!VirtualProtect(relay, relayCode.size(), PAGE_EXECUTE_READ, &previousProtect)) {
+		VirtualFree(relay, 0, MEM_RELEASE);
+		return false;
+	}
+	std::vector<uint8_t> callBytes;
+	if (!AppendRelJmp(callBytes, target, reinterpret_cast<uintptr_t>(relay))) {
+		VirtualFree(relay, 0, MEM_RELEASE);
+		return false;
+	}
+	callBytes[0] = 0xE8;
+	gNativeRadarUpdate = reinterpret_cast<NativeRadarUpdate>(baseAddressGameEXE + RadarHeading::RendererRva);
+	radarHeadingPatch = {};
+	radarHeadingPatch.name = "Independent radar heading";
+	radarHeadingPatch.address = target;
+	radarHeadingPatch.overwriteSize = RadarHeading::OriginalCall.size();
+	radarHeadingPatch.originalBytes.assign(RadarHeading::OriginalCall.begin(), RadarHeading::OriginalCall.end());
+	radarHeadingPatch.codeCave = relay;
+	radarHeadingPatch.codeCaveSize = relayCode.size();
+	if (!WriteProcessBytes(target, callBytes)) {
+		VirtualFree(relay, 0, MEM_RELEASE);
+		radarHeadingPatch = {};
+		uevr::API::get()->log_warn("%s", "[RadarHeading] disabled: callsite write failed");
+		return false;
+	}
+	radarHeadingPatch.applied = true;
+	uevr::API::get()->log_info("%s", "[RadarHeading] validated radar-only callsite installed RVA=0x11C1E27; no camera/aim writes");
+	return true;
+}
+
+void MemoryManager::UpdateRadarHeadingReference(const float* cameraMatrix) {
+	const uint64_t sample = radarHeadingPatch.applied && cameraMatrix != nullptr
+		? RadarHeading::MakeSample(cameraMatrix[4], cameraMatrix[5], GetTickCount())
+		: RadarHeading::DisabledSample;
+	gRadarHeadingSample.store(sample, std::memory_order_release);
+}
+
+void MemoryManager::InvalidateRadarHeadingReference() {
+	gRadarHeadingSample.store(RadarHeading::DisabledSample, std::memory_order_release);
+}
+
+void MemoryManager::RestoreRadarHeadingFix() {
+	InvalidateRadarHeadingReference();
+	if (!radarHeadingPatch.applied)
+		return;
+	std::vector<uint8_t> ourCall;
+	if (!AppendRelJmp(ourCall, radarHeadingPatch.address, reinterpret_cast<uintptr_t>(radarHeadingPatch.codeCave)))
+		return;
+	ourCall[0] = 0xE8;
+	std::array<uint8_t, 5> observed{};
+	if (!CompatibilityDiagnostics::Read(radarHeadingPatch.address, observed.data(), observed.size())
+		|| std::memcmp(observed.data(), ourCall.data(), observed.size()) != 0
+		|| !WriteProcessBytes(radarHeadingPatch.address, radarHeadingPatch.originalBytes)) {
+		uevr::API::get()->log_warn("%s", "[RadarHeading] restore skipped: callsite changed or unreadable; passthrough retained");
+		return;
+	}
+	radarHeadingPatch.applied = false;
+	// Do not free an executable relay while a render callback could be in flight.
+	// It contains only a JMP; its one allocation is reclaimed with the process.
+	uevr::API::get()->log_info("%s", "[RadarHeading] native radar call restored");
 }
 
 void MemoryManager::AdjustAddresses() {

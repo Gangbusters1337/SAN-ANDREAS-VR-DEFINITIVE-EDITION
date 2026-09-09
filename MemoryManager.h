@@ -48,9 +48,15 @@ private:
 		bool applied = false;
 	};
 
+	// Independent of combat-assist toggles and their patch collection.
+	RuntimePatch radarHeadingPatch;
+	bool radarHeadingHookAttempted = false;
+
 	uintptr_t GetModuleBaseAddress(LPCTSTR moduleName);
 	uintptr_t GetModuleSize() const;
 	void AdjustAddresses();
+	void LogCompatibilityPreflight();
+	bool compatibilityPreflightLogged = false;
 	uintptr_t FindPattern(const std::vector<int>& pattern) const;
 	std::vector<uintptr_t> FindPatterns(const std::vector<int>& pattern) const;
 	void* AllocateNear(uintptr_t target, size_t size) const;
@@ -387,7 +393,11 @@ public:
 	uintptr_t weaponWheelDisplayedAddress = 0x507C580;
 	//uintptr_t cutscenePlayingAddress = 0x53E254C;
 
-	void InitMemoryManager();
+	void InitMemoryManager(bool compatibilityDiagnostics = false);
+	bool InstallRadarHeadingFix();
+	void UpdateRadarHeadingReference(const float* cameraMatrix);
+	void InvalidateRadarHeadingReference();
+	void RestoreRadarHeadingFix();
 	void ToggleAllMemoryInstructions(bool enableOriginalInstructions);
 	void ToggleHeliCanonCameraModMemoryInstructions(bool enableOriginalInstructions);
 	void NopVehicleRelatedMemoryInstructions();
